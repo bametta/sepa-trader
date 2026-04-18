@@ -5,7 +5,7 @@ import AccountSummary from './components/AccountSummary'
 import PositionCard from './components/PositionCard'
 import { OpenOrdersTable, TradeHistoryTable } from './components/OrdersTable'
 import SettingsPanel from './components/SettingsPanel'
-import { fetchPositions, updateSetting } from './api/client'
+import { fetchPositions, updateSetting, fetchSettings } from './api/client'
 
 const TABS = ['Positions', 'Orders', 'History', 'Settings']
 
@@ -17,8 +17,8 @@ export default function App() {
   const { data: positions = [], isLoading, isError: posError } = useQuery('positions', fetchPositions)
 
   async function handleModeChange() {
-    const { data: settings } = await import('./api/client').then(m => ({ data: null }))
-    const current = positions.length ? 'paper' : 'paper'
+    const settingsRes = await fetchSettings()
+    const current = settingsRes?.trading_mode || 'paper'
     const next    = current === 'paper' ? 'live' : 'paper'
     if (!confirm(`Switch to ${next.toUpperCase()} trading mode?`)) return
     await updateSetting('trading_mode', next)
