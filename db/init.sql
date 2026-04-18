@@ -40,7 +40,8 @@ INSERT INTO settings (key, value) VALUES
     ('risk_pct',           '2.0'),
     ('stop_loss_pct',      '8.0'),
     ('max_positions',      '10'),
-    ('monitor_interval',   '60')
+    ('monitor_interval',   '60'),
+    ('webhook_secret',     '')
 ON CONFLICT (key) DO NOTHING;
 
 CREATE INDEX ON signal_log (symbol, created_at DESC);
