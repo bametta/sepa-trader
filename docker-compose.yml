@@ -3,6 +3,7 @@ version: "3.9"
 services:
   db:
     image: postgres:16-alpine
+    hostname: sepa-postgres
     restart: unless-stopped
     environment:
       POSTGRES_DB: sepa
@@ -36,7 +37,7 @@ services:
       redis:
         condition: service_started
     environment:
-      DATABASE_URL: postgresql://sepa:${DB_PASSWORD}@db:5432/sepa
+      DATABASE_URL: postgresql://sepa:${DB_PASSWORD}@sepa-postgres:5432/sepa
       REDIS_URL: redis://redis:6379
       ALPACA_PAPER_KEY: ${ALPACA_PAPER_KEY}
       ALPACA_PAPER_SECRET: ${ALPACA_PAPER_SECRET}
