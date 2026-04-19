@@ -10,17 +10,17 @@ ma150_col   = input.color(color.new(#AB47BC, 0), "EMA 150", group=grp1)
 ma200_col   = input.color(color.new(#F44336, 0), "EMA 200", group=grp1)
 
 grp2 = "Strategy Settings"
-risk_pct    = input.float(1.0,   "Risk % per Trade",         group=grp2, step=0.5)
-account_size= input.float(10000, "Account Size ($)",          group=grp2, step=1000)
-stop_pct    = input.float(7.5,   "Stop Loss % below entry",   group=grp2, step=0.5)
-atr_len     = input.int(14,      "ATR Length",                group=grp2)
-vol_avg_len = input.int(50,      "Volume Avg Length",         group=grp2)
-vol_surge   = input.float(40.0,  "Volume Surge % for Signal", group=grp2)
+risk_pct     = input.float(1.0,   "Risk % per Trade",         group=grp2, step=0.5)
+account_size = input.float(10000, "Account Size ($)",          group=grp2, step=1000)
+stop_pct     = input.float(7.5,   "Stop Loss % below entry",   group=grp2, step=0.5)
+atr_len      = input.int(14,      "ATR Length",                group=grp2)
+vol_avg_len  = input.int(50,      "Volume Avg Length",         group=grp2)
+vol_surge    = input.float(40.0,  "Volume Surge % for Signal", group=grp2)
 
 grp3 = "Signals"
-show_entries   = input.bool(true, "Show Breakout Entries",   group=grp3)
-show_pullbacks = input.bool(true, "Show Pullback to MA",      group=grp3)
-show_stops     = input.bool(true, "Show Stop/Target Levels",  group=grp3)
+show_entries   = input.bool(true, "Show Breakout Entries",  group=grp3)
+show_pullbacks = input.bool(true, "Show Pullback to MA",     group=grp3)
+show_stops     = input.bool(true, "Show Stop/Target Levels", group=grp3)
 
 grp4 = "Webhook (SEPA Trader NAS)"
 webhook_enabled = input.bool(false, "Enable Webhook Alerts", group=grp4)
@@ -56,12 +56,11 @@ t6 = ema200 > ema200[22]
 t7 = close  >= high52 * 0.75
 t8 = close  >= low52  * 1.30
 
-trend_score = (t1 ? 1 : 0) + (t2 ? 1 : 0) + (t3 ? 1 : 0) + (t4 ? 1 : 0) +
-              (t5 ? 1 : 0) + (t6 ? 1 : 0) + (t7 ? 1 : 0) + (t8 ? 1 : 0)
+trend_score = (t1 ? 1 : 0) + (t2 ? 1 : 0) + (t3 ? 1 : 0) + (t4 ? 1 : 0) + (t5 ? 1 : 0) + (t6 ? 1 : 0) + (t7 ? 1 : 0) + (t8 ? 1 : 0)
 in_stage2   = trend_score >= 7
 
 // ─── RSI ─────────────────────────────────────────────────────────────────────
-rsi14 = ta.rsi(close, 14)
+rsi14  = ta.rsi(close, 14)
 rsi_ok = rsi14 > 40 and rsi14 < 70
 
 // ─── PULLBACK TO MA DETECTION ────────────────────────────────────────────────
@@ -71,12 +70,10 @@ near_ema50 = math.abs(close - ema50) / ema50 * 100 <= 3.0
 pullback_ema20 = show_pullbacks and in_stage2 and near_ema20 and close > low[1] and rsi_ok
 pullback_ema50 = show_pullbacks and in_stage2 and near_ema50 and close > low[1] and rsi_ok and not near_ema20
 
-// ─── BREAKOUT ENTRY SIGNAL ───────────────────────────────────────────────────
-pivot_high = ta.highest(high, 20)[1]
-breakout   = show_entries and in_stage2 and close > pivot_high and vol_surging and close > ema50
-
-// ─── STAGE 2 LOST (for existing positions) ───────────────────────────────────
-stage2_lost = ta.crossunder(trend_score, 7)
+// ─── BREAKOUT & STAGE 2 LOST SIGNALS ─────────────────────────────────────────
+pivot_high  = ta.highest(high, 20)[1]
+breakout    = show_entries and in_stage2 and close > pivot_high and vol_surging and close > ema50
+stage2_lost = trend_score < 7 and trend_score[1] >= 7
 
 // ─── ENTRY, STOP, TARGETS ────────────────────────────────────────────────────
 entry_price = close
@@ -87,19 +84,12 @@ risk_dollar = account_size * (risk_pct / 100)
 shares      = math.floor(risk_dollar / (entry_price - stop_price))
 
 // ─── PLOT SIGNALS ────────────────────────────────────────────────────────────
-plotshape(pullback_ema20, title="Pullback EMA20", location=location.belowbar,
-     style=shape.triangleup, color=color.new(#00E5FF, 0), size=size.small, text="PB20")
+plotshape(pullback_ema20, title="Pullback EMA20", location=location.belowbar, style=shape.triangleup, color=color.new(#00E5FF, 0), size=size.small, text="PB20")
+plotshape(pullback_ema50, title="Pullback EMA50", location=location.belowbar, style=shape.triangleup, color=color.new(#FF9800, 0), size=size.small, text="PB50")
+plotshape(breakout,       title="Breakout",       location=location.belowbar, style=shape.arrowup,    color=color.new(#00FF00, 0), size=size.normal, text="BUY")
+plotshape(stage2_lost,    title="Stage2Lost",      location=location.abovebar, style=shape.arrowdown,  color=color.new(#F44336, 0), size=size.normal, text="EXIT")
 
-plotshape(pullback_ema50, title="Pullback EMA50", location=location.belowbar,
-     style=shape.triangleup, color=color.new(#FF9800, 0), size=size.small, text="PB50")
-
-plotshape(breakout, title="Breakout", location=location.belowbar,
-     style=shape.arrowup, color=color.new(#00FF00, 0), size=size.normal, text="BUY")
-
-plotshape(stage2_lost, title="Stage 2 Lost", location=location.abovebar,
-     style=shape.arrowdown, color=color.new(#F44336, 0), size=size.normal, text="EXIT")
-
-// ─── STOP / TARGET LINES ON MOST RECENT SIGNAL ───────────────────────────────
+// ─── STOP / TARGET LINES ─────────────────────────────────────────────────────
 var line stop_line = na
 var line t1_line   = na
 var line t2_line   = na
@@ -110,43 +100,30 @@ if signal_fired
         line.delete(stop_line)
         line.delete(t1_line)
         line.delete(t2_line)
-    stop_line := line.new(bar_index, stop_price, bar_index + 15, stop_price,
-         color=color.red,   width=2, style=line.style_dashed)
-    t1_line   := line.new(bar_index, target1,    bar_index + 15, target1,
-         color=color.green, width=1, style=line.style_dashed)
-    t2_line   := line.new(bar_index, target2,    bar_index + 15, target2,
-         color=color.green, width=2, style=line.style_dashed)
+    stop_line := line.new(bar_index, stop_price, bar_index + 15, stop_price, color=color.red,   width=2, style=line.style_dashed)
+    t1_line   := line.new(bar_index, target1,    bar_index + 15, target1,    color=color.green, width=1, style=line.style_dashed)
+    t2_line   := line.new(bar_index, target2,    bar_index + 15, target2,    color=color.green, width=2, style=line.style_dashed)
 
 // ─── WEBHOOK ALERTS ──────────────────────────────────────────────────────────
-// In TradingView: Alerts → Create Alert → select this indicator
-// Set Webhook URL to: https://sepatrader.bametta.com/api/webhook/tradingview
-// Set message to: (leave blank — Pine Script sends it automatically)
+wSym   = syminfo.ticker
+wPrice = str.tostring(close, "#.00")
+wVol   = str.tostring(volume, "#")
+wScore = str.tostring(trend_score)
 
-_ticker = syminfo.ticker
-_price  = str.tostring(close,  "#.00")
-_vol    = str.tostring(volume, "#")
-_score  = str.tostring(trend_score)
+if webhook_enabled and barstate.isconfirmed and breakout
+    alert('{"symbol":"' + wSym + '","signal":"BREAKOUT","price":' + wPrice + ',"volume":' + wVol + ',"score":' + wScore + ',"secret":"' + webhook_secret + '"}', alert.freq_once_per_bar_close)
 
-if webhook_enabled
-    if breakout
-        alert('{"symbol":"' + _ticker + '","signal":"BREAKOUT","price":' + _price + ',"volume":' + _vol + ',"score":' + _score + ',"secret":"' + webhook_secret + '"}', alert.freq_once_per_bar_close)
-    if pullback_ema20
-        alert('{"symbol":"' + _ticker + '","signal":"PULLBACK_EMA20","price":' + _price + ',"volume":' + _vol + ',"score":' + _score + ',"secret":"' + webhook_secret + '"}', alert.freq_once_per_bar_close)
-    if pullback_ema50
-        alert('{"symbol":"' + _ticker + '","signal":"PULLBACK_EMA50","price":' + _price + ',"volume":' + _vol + ',"score":' + _score + ',"secret":"' + webhook_secret + '"}', alert.freq_once_per_bar_close)
-    if stage2_lost
-        alert('{"symbol":"' + _ticker + '","signal":"NO_SETUP","price":' + _price + ',"volume":' + _vol + ',"score":' + _score + ',"secret":"' + webhook_secret + '"}', alert.freq_once_per_bar_close)
+if webhook_enabled and barstate.isconfirmed and pullback_ema20
+    alert('{"symbol":"' + wSym + '","signal":"PULLBACK_EMA20","price":' + wPrice + ',"volume":' + wVol + ',"score":' + wScore + ',"secret":"' + webhook_secret + '"}', alert.freq_once_per_bar_close)
 
-// ─── ALERT CONDITIONS (for manual TradingView alert setup) ───────────────────
-alertcondition(breakout,      "SEPA Breakout",      "Breakout signal on " + syminfo.ticker)
-alertcondition(pullback_ema20,"SEPA Pullback EMA20","Pullback to EMA20 on " + syminfo.ticker)
-alertcondition(pullback_ema50,"SEPA Pullback EMA50","Pullback to EMA50 on " + syminfo.ticker)
-alertcondition(stage2_lost,   "SEPA Stage2 Lost",   "Stage 2 lost on " + syminfo.ticker)
+if webhook_enabled and barstate.isconfirmed and pullback_ema50
+    alert('{"symbol":"' + wSym + '","signal":"PULLBACK_EMA50","price":' + wPrice + ',"volume":' + wVol + ',"score":' + wScore + ',"secret":"' + webhook_secret + '"}', alert.freq_once_per_bar_close)
+
+if webhook_enabled and barstate.isconfirmed and stage2_lost
+    alert('{"symbol":"' + wSym + '","signal":"NO_SETUP","price":' + wPrice + ',"volume":' + wVol + ',"score":' + wScore + ',"secret":"' + webhook_secret + '"}', alert.freq_once_per_bar_close)
 
 // ─── DASHBOARD TABLE ─────────────────────────────────────────────────────────
-var table dash = table.new(position.top_right, 2, 14,
-     bgcolor=color.new(#1E1E2E, 5), border_width=1,
-     border_color=color.new(color.gray, 50))
+var table dash = table.new(position.top_right, 2, 14, bgcolor=color.new(#1E1E2E, 5), border_width=1, border_color=color.new(color.gray, 50))
 
 c_green = #00C853
 c_red   = #F44336
@@ -157,48 +134,39 @@ f(cond)  => cond ? "YES" : "NO"
 fc(cond) => cond ? c_green : c_red
 
 if barstate.islast
-    table.cell(dash, 0, 0, "MINERVINI SEPA SYSTEM",
-         text_color=color.white, text_size=size.small,
-         bgcolor=color.new(#3D5AFE, 30), text_halign=text.align_center)
-    table.cell(dash, 1, 0, syminfo.ticker,
-         text_color=c_gold, text_size=size.small,
-         bgcolor=color.new(#3D5AFE, 30), text_halign=text.align_center)
+    table.cell(dash, 0, 0, "MINERVINI SEPA SYSTEM", text_color=color.white, text_size=size.small, bgcolor=color.new(#3D5AFE, 30), text_halign=text.align_center)
+    table.cell(dash, 1, 0, syminfo.ticker,           text_color=c_gold,      text_size=size.small, bgcolor=color.new(#3D5AFE, 30), text_halign=text.align_center)
     table.cell(dash, 0, 1, "Price > EMA50",      text_color=c_gray, text_size=size.tiny)
-    table.cell(dash, 1, 1, f(t1),                 text_color=fc(t1), text_size=size.tiny)
+    table.cell(dash, 1, 1, f(t1),                text_color=fc(t1), text_size=size.tiny)
     table.cell(dash, 0, 2, "Price > EMA150",     text_color=c_gray, text_size=size.tiny)
-    table.cell(dash, 1, 2, f(t2),                 text_color=fc(t2), text_size=size.tiny)
+    table.cell(dash, 1, 2, f(t2),                text_color=fc(t2), text_size=size.tiny)
     table.cell(dash, 0, 3, "Price > EMA200",     text_color=c_gray, text_size=size.tiny)
-    table.cell(dash, 1, 3, f(t3),                 text_color=fc(t3), text_size=size.tiny)
+    table.cell(dash, 1, 3, f(t3),                text_color=fc(t3), text_size=size.tiny)
     table.cell(dash, 0, 4, "EMA50 > EMA150",     text_color=c_gray, text_size=size.tiny)
-    table.cell(dash, 1, 4, f(t4),                 text_color=fc(t4), text_size=size.tiny)
+    table.cell(dash, 1, 4, f(t4),                text_color=fc(t4), text_size=size.tiny)
     table.cell(dash, 0, 5, "EMA150 > EMA200",    text_color=c_gray, text_size=size.tiny)
-    table.cell(dash, 1, 5, f(t5),                 text_color=fc(t5), text_size=size.tiny)
+    table.cell(dash, 1, 5, f(t5),                text_color=fc(t5), text_size=size.tiny)
     table.cell(dash, 0, 6, "EMA200 Trending Up", text_color=c_gray, text_size=size.tiny)
-    table.cell(dash, 1, 6, f(t6),                 text_color=fc(t6), text_size=size.tiny)
+    table.cell(dash, 1, 6, f(t6),                text_color=fc(t6), text_size=size.tiny)
     table.cell(dash, 0, 7, "Within 25% of 52wH", text_color=c_gray, text_size=size.tiny)
-    table.cell(dash, 1, 7, f(t7),                 text_color=fc(t7), text_size=size.tiny)
+    table.cell(dash, 1, 7, f(t7),                text_color=fc(t7), text_size=size.tiny)
     table.cell(dash, 0, 8, "30%+ above 52wL",    text_color=c_gray, text_size=size.tiny)
-    table.cell(dash, 1, 8, f(t8),                 text_color=fc(t8), text_size=size.tiny)
+    table.cell(dash, 1, 8, f(t8),                text_color=fc(t8), text_size=size.tiny)
     score_col = trend_score >= 7 ? c_green : trend_score >= 5 ? c_gold : c_red
-    table.cell(dash, 0, 9, "TREND SCORE",
-         text_color=color.white, text_size=size.tiny,
-         bgcolor=color.new(#263238, 20))
-    table.cell(dash, 1, 9, str.tostring(trend_score) + "/8",
-         text_color=score_col, text_size=size.small,
-         bgcolor=color.new(#263238, 20))
+    table.cell(dash, 0, 9, "TREND SCORE",         text_color=color.white, text_size=size.tiny,  bgcolor=color.new(#263238, 20))
+    table.cell(dash, 1, 9, str.tostring(trend_score) + "/8", text_color=score_col, text_size=size.small, bgcolor=color.new(#263238, 20))
     stage_txt = in_stage2 ? "STAGE 2 - BUY ZONE" : trend_score >= 5 ? "DEVELOPING" : "AVOID"
     stage_col = in_stage2 ? c_green : trend_score >= 5 ? c_gold : c_red
-    table.cell(dash, 0, 10, "STAGE",    text_color=color.white, text_size=size.tiny)
-    table.cell(dash, 1, 10, stage_txt,  text_color=stage_col,   text_size=size.tiny)
+    table.cell(dash, 0, 10, "STAGE",   text_color=color.white, text_size=size.tiny)
+    table.cell(dash, 1, 10, stage_txt, text_color=stage_col,   text_size=size.tiny)
     vol_ratio = math.round(volume / vol_avg * 100)
     vol_txt   = vol_surging ? "SURGE +" + str.tostring(vol_ratio - 100) + "%" : str.tostring(vol_ratio) + "% of avg"
     vol_col   = vol_surging ? c_green : c_gray
-    table.cell(dash, 0, 11, "Volume",  text_color=c_gray,  text_size=size.tiny)
-    table.cell(dash, 1, 11, vol_txt,    text_color=vol_col, text_size=size.tiny)
+    table.cell(dash, 0, 11, "Volume", text_color=c_gray,  text_size=size.tiny)
+    table.cell(dash, 1, 11, vol_txt,  text_color=vol_col, text_size=size.tiny)
     rsi_txt = str.tostring(math.round(rsi14 * 10) / 10)
     rsi_col = rsi14 > 70 ? c_red : rsi14 < 40 ? c_red : c_green
     table.cell(dash, 0, 12, "RSI (14)", text_color=c_gray,  text_size=size.tiny)
     table.cell(dash, 1, 12, rsi_txt,    text_color=rsi_col, text_size=size.tiny)
-    table.cell(dash, 0, 13, "Shares @ 1% risk", text_color=c_gray,  text_size=size.tiny)
-    table.cell(dash, 1, 13, str.tostring(shares) + " sh",
-         text_color=color.white, text_size=size.tiny)
+    table.cell(dash, 0, 13, "Shares @ 1% risk",           text_color=c_gray,      text_size=size.tiny)
+    table.cell(dash, 1, 13, str.tostring(shares) + " sh", text_color=color.white, text_size=size.tiny)
