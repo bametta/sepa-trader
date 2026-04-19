@@ -126,21 +126,16 @@ _ticker = syminfo.ticker
 _price  = str.tostring(close,  "#.00")
 _vol    = str.tostring(volume, "#")
 _score  = str.tostring(trend_score)
-_secret = webhook_secret
-
-_payload(sig) =>
-    '{"symbol":"' + _ticker + '","signal":"' + sig + '","price":' + _price +
-    ',"volume":' + _vol + ',"score":' + _score + ',"secret":"' + _secret + '"}'
 
 if webhook_enabled
     if breakout
-        alert(_payload("BREAKOUT"), alert.freq_once_per_bar_close)
+        alert('{"symbol":"' + _ticker + '","signal":"BREAKOUT","price":' + _price + ',"volume":' + _vol + ',"score":' + _score + ',"secret":"' + webhook_secret + '"}', alert.freq_once_per_bar_close)
     if pullback_ema20
-        alert(_payload("PULLBACK_EMA20"), alert.freq_once_per_bar_close)
+        alert('{"symbol":"' + _ticker + '","signal":"PULLBACK_EMA20","price":' + _price + ',"volume":' + _vol + ',"score":' + _score + ',"secret":"' + webhook_secret + '"}', alert.freq_once_per_bar_close)
     if pullback_ema50
-        alert(_payload("PULLBACK_EMA50"), alert.freq_once_per_bar_close)
+        alert('{"symbol":"' + _ticker + '","signal":"PULLBACK_EMA50","price":' + _price + ',"volume":' + _vol + ',"score":' + _score + ',"secret":"' + webhook_secret + '"}', alert.freq_once_per_bar_close)
     if stage2_lost
-        alert(_payload("NO_SETUP"), alert.freq_once_per_bar_close)
+        alert('{"symbol":"' + _ticker + '","signal":"NO_SETUP","price":' + _price + ',"volume":' + _vol + ',"score":' + _score + ',"secret":"' + webhook_secret + '"}', alert.freq_once_per_bar_close)
 
 // ─── ALERT CONDITIONS (for manual TradingView alert setup) ───────────────────
 alertcondition(breakout,      "SEPA Breakout",      "Breakout signal on " + syminfo.ticker)
