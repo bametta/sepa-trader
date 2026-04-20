@@ -1,7 +1,7 @@
-from fastapi import APIRouter, Depends, BackgroundTasks
+from fastapi import APIRouter, Depends
 from sqlalchemy import text
 from sqlalchemy.orm import Session
-from ..database import get_db
+from ..database import get_db, get_setting
 from ..sepa_analyzer import analyze
 from ..trader import run_monitor
 
@@ -14,17 +14,29 @@ def analyze_symbol(symbol: str):
 
 
 @router.get("/history")
-def signal_history(symbol: str = None, limit: int = 100, db: Session = Depends(get_db)):
-    q = "SELECT symbol, signal, score, price, mode, created_at FROM signal_log"
-    params: dict = {"l": limit}
+def signal_history(
+    symbol: str = None,
+    limit: int = 100,
+    db: Session = Depends(get_db),
+):
+    """Signal history scoped to the active trading mode."""
+    mode   = get_setting(db, "trading_mode", "paper")
+    q      = "SELECT symbol, signal, score, price, mode, created_at FROM signal_log WHERE mode = :mode"
+    params = {"l": limit, "mode": mode}
     if symbol:
-        q += " WHERE symbol = :sym"
+        q += " AND symbol = :sym"
         params["sym"] = symbol.upper()
     q += " ORDER BY created_at DESC LIMIT :l"
     rows = db.execute(text(q), params).fetchall()
     return [
-        {"symbol": r[0], "signal": r[1], "score": r[2],
-         "price": float(r[3]) if r[3] else None, "mode": r[4], "timestamp": str(r[5])}
+        {
+            "symbol":    r[0],
+            "signal":    r[1],
+            "score":     r[2],
+            "price":     float(r[3]) if r[3] else None,
+            "mode":      r[4],
+            "timestamp": str(r[5]),
+        }
         for r in rows
     ]
 

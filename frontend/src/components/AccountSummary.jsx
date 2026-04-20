@@ -16,7 +16,7 @@ function fmt(n, sign=false) {
 }
 
 export default function AccountSummary({ onModeChange }) {
-  const { data, isLoading, isError } = useQuery('account', fetchAccount)
+  const { data, isLoading, isError } = useQuery('account', () => fetchAccount())
 
   if (isLoading) return <div className="bg-card rounded-xl p-6 animate-pulse h-28" />
   if (isError || !data) return (
@@ -26,12 +26,22 @@ export default function AccountSummary({ onModeChange }) {
   )
 
   const pnlColor = data.day_pnl >= 0 ? 'text-emerald-400' : 'text-red-400'
+  const isPaper  = data.mode === 'paper'
 
   return (
-    <div className="bg-card border border-border rounded-xl p-6">
+    <div className={`bg-card border rounded-xl p-6 ${
+      isPaper ? 'border-border' : 'border-orange-500/40 shadow-lg shadow-orange-900/10'
+    }`}>
       <div className="flex items-center justify-between mb-4">
-        <h2 className="text-lg font-semibold text-slate-100">Account Overview</h2>
-        <ModeBadge mode={data.mode} onModeChange={onModeChange} />
+        <div className="flex items-center gap-3">
+          <h2 className="text-lg font-semibold text-slate-100">Account Overview</h2>
+          {!isPaper && (
+            <span className="text-[10px] font-bold px-2 py-0.5 rounded bg-orange-500/20 text-orange-400 border border-orange-500/40 uppercase tracking-wider">
+              Live Account
+            </span>
+          )}
+        </div>
+        <ModeSwitch mode={data.mode} onSwitch={onModeChange} />
       </div>
       <div className="grid grid-cols-2 sm:grid-cols-4 gap-6">
         <Stat label="Portfolio"    value={fmt(data.portfolio_value)} />
@@ -45,19 +55,20 @@ export default function AccountSummary({ onModeChange }) {
   )
 }
 
-function ModeBadge({ mode, onModeChange }) {
+function ModeSwitch({ mode, onSwitch }) {
   const isPaper = mode === 'paper'
   return (
     <div className="flex items-center gap-2">
-      <span className={`text-xs font-bold px-3 py-1 rounded-full border ${
+      <div className={`flex items-center gap-1.5 text-xs font-bold px-3 py-1 rounded-full border ${
         isPaper
           ? 'bg-blue-500/20 text-blue-400 border-blue-500/40'
           : 'bg-orange-500/20 text-orange-400 border-orange-500/40'
       }`}>
+        <span className={`w-1.5 h-1.5 rounded-full ${isPaper ? 'bg-blue-400' : 'bg-orange-400'}`} />
         {isPaper ? 'PAPER' : 'LIVE'}
-      </span>
+      </div>
       <button
-        onClick={onModeChange}
+        onClick={() => onSwitch && onSwitch(isPaper ? 'live' : 'paper')}
         className="text-xs text-slate-400 hover:text-slate-200 underline transition-colors"
       >
         switch

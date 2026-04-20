@@ -23,7 +23,7 @@ def analyze_picks(db: Session, picks: list[dict], closed_position: dict | None =
     if not api_key:
         raise ValueError("Claude API key not configured in Settings.")
 
-    model = get_setting(db, "claude_model", "claude-opus-4-7")
+    model = get_setting(db, "claude_model", "claude-sonnet-4-5")
 
     parts = []
     if closed_position:
@@ -73,14 +73,27 @@ def log_analysis(db: Session, trigger: str, symbol: str | None, analysis_text: s
     db.commit()
 
 
-def get_latest_analyses(db: Session, limit: int = 20) -> list[dict]:
-    rows = db.execute(
-        text("""
-            SELECT id, trigger, symbol, analysis, mode, created_at
-            FROM ai_analysis_log
-            ORDER BY created_at DESC
-            LIMIT :l
-        """),
-        {"l": limit},
-    ).fetchall()
+def get_latest_analyses(db: Session, limit: int = 20, mode: str | None = None) -> list[dict]:
+    """Return recent analyses. If mode is provided, filters to that mode only."""
+    if mode:
+        rows = db.execute(
+            text("""
+                SELECT id, trigger, symbol, analysis, mode, created_at
+                FROM ai_analysis_log
+                WHERE mode = :mode
+                ORDER BY created_at DESC
+                LIMIT :l
+            """),
+            {"l": limit, "mode": mode},
+        ).fetchall()
+    else:
+        rows = db.execute(
+            text("""
+                SELECT id, trigger, symbol, analysis, mode, created_at
+                FROM ai_analysis_log
+                ORDER BY created_at DESC
+                LIMIT :l
+            """),
+            {"l": limit},
+        ).fetchall()
     return [dict(r._mapping) for r in rows]

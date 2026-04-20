@@ -47,22 +47,23 @@ def _run_migrations():
                 fetched_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )
         """))
-        # Seed new settings (idempotent)
         db.execute(text("""
             INSERT INTO settings (key, value) VALUES
-                ('screener_auto_run',      'true'),
-                ('screener_schedule_day',  '6'),
-                ('screener_schedule_time', '20:00'),
-                ('screener_price_min',     '0'),
-                ('screener_price_max',     '0'),
-                ('screener_top_n',         '10'),
-                ('screener_min_score',     '0'),
-                ('screener_vol_surge_pct', '40'),
-                ('screener_ema20_pct',     '2.0'),
-                ('screener_ema50_pct',     '3.0'),
-                ('claude_api_key',         ''),
-                ('claude_model',           'claude-opus-4-7'),
-                ('positions_snapshot',     '')
+                ('screener_auto_run',          'true'),
+                ('screener_schedule_day',       '6'),
+                ('screener_schedule_time',      '20:00'),
+                ('screener_price_min',          '0'),
+                ('screener_price_max',          '0'),
+                ('screener_top_n',              '10'),
+                ('screener_min_score',          '0'),
+                ('screener_vol_surge_pct',      '40'),
+                ('screener_ema20_pct',          '2.0'),
+                ('screener_ema50_pct',          '3.0'),
+                ('claude_api_key',              ''),
+                ('claude_model',                'claude-sonnet-4-5'),
+                -- Mode-scoped position snapshots — never share state between accounts
+                ('positions_snapshot_paper',    ''),
+                ('positions_snapshot_live',     '')
             ON CONFLICT (key) DO NOTHING
         """))
         db.commit()

@@ -22,35 +22,36 @@ def _size_position(portfolio_value: float, price: float, risk_pct: float, stop_p
     return risk_dollars / stop_dollars
 
 
-def _get_weekly_plan_exits(db: Session, symbol: str) -> tuple[float, float]:
-    """Return (stop_price, target1) from the current week's plan for a symbol. (0, 0) if missing."""
+def _get_weekly_plan_exits(db: Session, symbol: str, mode: str) -> tuple[float, float]:
+    """
+    Return (stop_price, target1) for a symbol from the most recent weekly plan
+    for the given mode. Falls back to historical if not in current week.
+    Returns (0.0, 0.0) if no record found.
+    """
     row = db.execute(
         text("""
             SELECT stop_price, target1
             FROM weekly_plan
             WHERE symbol = :sym
-              AND week_start = (SELECT MAX(week_start) FROM weekly_plan)
+              AND mode = :mode
+            ORDER BY week_start DESC
             LIMIT 1
         """),
-        {"sym": symbol},
+        {"sym": symbol, "mode": mode},
     ).fetchone()
     if not row:
         return 0.0, 0.0
     return float(row[0] or 0), float(row[1] or 0)
 
 
-def _classify_exit_orders(open_orders_by_symbol: dict) -> tuple[set[str], set[str]]:
+def _classify_exit_orders(open_orders_by_symbol: dict) -> tuple[set[str], dict]:
     """
-    Inspect open orders per symbol and return two sets:
-      - oco_covered:      symbols that have a proper OCO or bracket exit in place
-      - orphan_order_ids: order IDs of standalone sell orders that need to be
-                          cancelled before placing an OCO (they block the stop leg)
-
-    An OCO/bracket order has order_class of 'oco', 'bracket', or 'oto'.
-    A standalone sell (limit or stop without a paired leg) is an orphan.
+    Inspect open orders per symbol and return:
+      - oco_covered:      symbols with a proper OCO or bracket exit in place
+      - orphan_order_ids: symbol -> [order_ids] for standalone sells to cancel
     """
     oco_covered      = set()
-    orphan_order_ids = {}   # symbol -> [order_id, ...]
+    orphan_order_ids = {}
 
     for sym, orders in open_orders_by_symbol.items():
         for o in orders:
@@ -62,10 +63,9 @@ def _classify_exit_orders(open_orders_by_symbol: dict) -> tuple[set[str], set[st
 
             if is_sell and is_oco:
                 oco_covered.add(sym)
-                break   # fully covered — no need to inspect further
+                break
 
             if is_sell and not is_oco:
-                # Orphaned standalone sell — needs to be cancelled
                 orphan_order_ids.setdefault(sym, []).append(str(o.id))
 
     return oco_covered, orphan_order_ids
@@ -78,13 +78,10 @@ def _ensure_exit_orders(
     mode: str,
 ):
     """
-    For every live position that does NOT have a proper OCO exit order:
-      1. Cancel any orphaned standalone sell orders (they prevent the stop leg)
-      2. Look up stop/target from the weekly plan
+    For every live position without a proper OCO exit:
+      1. Cancel orphaned standalone sell orders
+      2. Look up stop/target from the mode-scoped weekly plan
       3. Place a fresh OCO exit order
-
-    This repairs positions broken by the old DAY TIF bug or the previous
-    two-independent-orders approach.
     """
     oco_covered, orphan_order_ids = _classify_exit_orders(open_orders_by_symbol)
     client = alp.get_client(mode)
@@ -93,32 +90,31 @@ def _ensure_exit_orders(
         sym = pos.symbol
 
         if sym in oco_covered:
-            continue  # OCO already in place — nothing to do
+            continue
 
-        # Cancel any orphaned standalone sell orders first
         orphans = orphan_order_ids.get(sym, [])
         for oid in orphans:
             try:
                 client.cancel_order_by_id(oid)
-                logger.info("Exit guard: cancelled orphaned sell order %s for %s", oid, sym)
+                logger.info("Exit guard: cancelled orphaned sell order %s for %s [%s]", oid, sym, mode)
             except Exception as exc:
                 logger.warning("Exit guard: could not cancel order %s for %s: %s", oid, sym, exc)
 
-        qty  = float(pos.qty)
-        stop, target = _get_weekly_plan_exits(db, sym)
+        qty        = float(pos.qty)
+        stop, target = _get_weekly_plan_exits(db, sym, mode)
 
         if stop <= 0 or target <= 0:
             logger.warning(
-                "Exit guard: %s has no OCO exit but weekly plan has no stop/target "
-                "— skipping. Use 'Set Stop / Target' on the position card.", sym
+                "Exit guard: %s has no OCO exit but weekly plan has no stop/target [%s] "
+                "— skipping. Use 'Set Stop / Target' on the position card.", sym, mode
             )
             continue
 
         try:
             alp.place_oca_exit(sym, qty, stop, target, mode)
             logger.info(
-                "Exit guard: placed OCO exit for %s qty=%.0f stop=$%.2f target=$%.2f",
-                sym, qty, stop, target,
+                "Exit guard: placed OCO exit for %s qty=%.0f stop=$%.2f target=$%.2f [%s]",
+                sym, qty, stop, target, mode,
             )
         except Exception as exc:
             logger.error("Exit guard: failed to place OCO exit for %s: %s", sym, exc)
@@ -140,9 +136,6 @@ async def run_monitor(db: Session):
         day_pnl   = float(acct.equity) - float(acct.last_equity)
 
         # ── Exit guard ────────────────────────────────────────────────────────
-        # Runs every cycle while market is open. Cancels orphaned standalone
-        # sell orders and replaces them with proper OCO exits. Also catches
-        # positions with no exit orders at all.
         if market_open:
             try:
                 open_orders_by_symbol = alp.get_open_orders_by_symbol(mode)
@@ -194,15 +187,15 @@ async def run_monitor(db: Session):
                     price = result["price"]
                     qty   = _size_position(portfolio, price, risk_pct, stop_pct)
                     if qty >= 1:
-                        stop, target = _get_weekly_plan_exits(db, sym)
+                        stop, target = _get_weekly_plan_exits(db, sym, mode)
                         try:
                             if stop > 0 and target > 0:
                                 alp.place_bracket_buy(sym, qty, stop, target, mode)
                             else:
                                 alp.place_market_buy(sym, qty, mode)
                                 logger.warning(
-                                    "Watchlist buy %s: no stop/target in weekly plan — "
-                                    "plain market buy, no exit orders attached.", sym
+                                    "Watchlist buy %s: no stop/target in %s weekly plan — "
+                                    "plain market buy, no exit orders attached.", sym, mode
                                 )
                             _log_trade(db, sym, "BUY", qty, price, "BREAKOUT", mode)
                             new_breakouts.append(sym)

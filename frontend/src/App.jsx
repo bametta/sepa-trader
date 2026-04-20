@@ -6,24 +6,45 @@ import PositionCard from './components/PositionCard'
 import { OpenOrdersTable, AlpacaHistoryTable } from './components/OrdersTable'
 import SettingsPanel from './components/SettingsPanel'
 import WeeklyPlan from './components/WeeklyPlan'
-import { fetchPositions, updateSetting, fetchSettings } from './api/client'
+import { fetchPositions, updateSetting } from './api/client'
 
 const TABS = ['Positions', 'Orders', 'History', 'Weekly Plan', 'Settings']
 
 export default function App() {
-  const [tab, setTab]     = useState('Positions')
-  const [lastRun]         = useState(new Date())
-  const qc                = useQueryClient()
+  const [tab, setTab]           = useState('Positions')
+  const [switching, setSwitching] = useState(false)
+  const qc                      = useQueryClient()
 
-  const { data: positions = [], isLoading, isError: posError } = useQuery('positions', fetchPositions)
+  const { data: positions = [], isLoading, isError: posError } = useQuery(
+    'positions',
+    () => fetchPositions(),
+    { refetchInterval: 30000 }
+  )
 
-  async function handleModeChange() {
-    const settingsRes = await fetchSettings()
-    const current = settingsRes?.trading_mode || 'paper'
-    const next    = current === 'paper' ? 'live' : 'paper'
-    if (!confirm(`Switch to ${next.toUpperCase()} trading mode?`)) return
-    await updateSetting('trading_mode', next)
-    qc.invalidateQueries()
+  async function handleModeChange(newMode) {
+    if (switching) return
+
+    // Extra confirmation gate for switching TO live
+    if (newMode === 'live') {
+      const confirmed = window.confirm(
+        '⚠️ Switch to LIVE trading?\n\n' +
+        'Real money will be used. Ensure your live Alpaca credentials are set in .env ' +
+        'and that you have reviewed your positions and exit orders.\n\n' +
+        'Press OK to confirm.'
+      )
+      if (!confirmed) return
+    }
+
+    setSwitching(true)
+    try {
+      await updateSetting('trading_mode', newMode)
+      // Invalidate everything — positions, orders, account, weekly plan all change per mode
+      await qc.invalidateQueries()
+    } catch (err) {
+      alert(`Failed to switch mode: ${err?.response?.data?.detail || err.message}`)
+    } finally {
+      setSwitching(false)
+    }
   }
 
   const urgent    = positions.filter(p => p.signal === 'NO_SETUP')
@@ -31,9 +52,21 @@ export default function App() {
 
   return (
     <div className="min-h-screen bg-surface">
-      <Navbar lastRun={lastRun} />
+      <Navbar onModeChange={handleModeChange} />
+
+      {/* Switching overlay — blocks interaction during mode transition */}
+      {switching && (
+        <div className="fixed inset-0 bg-black/60 z-50 flex items-center justify-center">
+          <div className="bg-card border border-border rounded-xl px-8 py-6 text-center space-y-2">
+            <div className="w-6 h-6 border-2 border-accent border-t-transparent rounded-full animate-spin mx-auto" />
+            <p className="text-slate-200 text-sm font-medium">Switching trading mode…</p>
+            <p className="text-slate-500 text-xs">Refreshing all data for the new account</p>
+          </div>
+        </div>
+      )}
 
       <main className="max-w-7xl mx-auto px-4 sm:px-6 py-6 space-y-6">
+
         {/* Alert banners */}
         {urgent.length > 0 && (
           <div className="bg-red-500/10 border border-red-500/30 rounded-xl px-5 py-3 flex items-center gap-3">

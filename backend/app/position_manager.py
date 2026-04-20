@@ -20,7 +20,7 @@ def _size_qty(portfolio: float, entry: float, stop: float, risk_pct: float, stop
 def run_monday_open(db: Session):
     """
     Called every Monday at 9:35 ET. Fills available position slots from the
-    current week's PENDING picks (ordered by rank). Respects max_positions.
+    current week's PENDING picks for the active mode. Respects max_positions.
     """
     mode      = get_setting(db, "trading_mode", "paper")
     auto_exec = get_setting(db, "auto_execute", "true").lower() == "true"
@@ -45,16 +45,19 @@ def run_monday_open(db: Session):
         text("""
             SELECT symbol, entry_price, stop_price, target1
             FROM weekly_plan
-            WHERE week_start = (SELECT MAX(week_start) FROM weekly_plan)
+            WHERE week_start = (
+                SELECT MAX(week_start) FROM weekly_plan WHERE mode = :mode
+            )
+              AND mode = :mode
               AND status = 'PENDING'
             ORDER BY rank ASC
             LIMIT :slots
         """),
-        {"slots": slots},
+        {"slots": slots, "mode": mode},
     ).fetchall()
 
     if not rows:
-        logger.info("Monday open: no PENDING picks.")
+        logger.info("Monday open: no PENDING picks for mode=%s.", mode)
         return
 
     try:
@@ -90,7 +93,6 @@ def run_monday_open(db: Session):
                     sym, qty, entry, stop, target,
                 )
             else:
-                # Fallback: no stop/target in plan — plain market buy
                 alp.place_market_buy(sym, qty, mode)
                 logger.info(
                     "Monday open: market buy %s qty=%.0f @ ~$%.2f (no bracket — missing stop/target)",
@@ -101,9 +103,12 @@ def run_monday_open(db: Session):
                 text("""
                     UPDATE weekly_plan SET status = 'EXECUTED'
                     WHERE symbol = :sym
-                      AND week_start = (SELECT MAX(week_start) FROM weekly_plan)
+                      AND mode = :mode
+                      AND week_start = (
+                          SELECT MAX(week_start) FROM weekly_plan WHERE mode = :mode
+                      )
                 """),
-                {"sym": sym},
+                {"sym": sym, "mode": mode},
             )
             db.execute(
                 text("""
@@ -122,7 +127,7 @@ def run_monday_open(db: Session):
 def check_post_close(db: Session):
     """
     Called in each monitor cycle. Compares current positions against the saved
-    snapshot to detect newly closed positions, then:
+    mode-scoped snapshot to detect newly closed positions, then:
       1. Runs Claude analysis (if API key configured)
       2. Auto-executes the next PENDING pick into the freed slot (if auto_execute)
     """
@@ -134,20 +139,22 @@ def check_post_close(db: Session):
         logger.error("check_post_close: cannot fetch positions: %s", exc)
         return
 
+    # Mode-scoped snapshot key — paper and live never share state
+    snapshot_key = f"positions_snapshot_{mode}"
     snap_row = db.execute(
-        text("SELECT value FROM settings WHERE key = 'positions_snapshot'")
+        text("SELECT value FROM settings WHERE key = :k"),
+        {"k": snapshot_key},
     ).fetchone()
     prev = set(snap_row[0].split(",")) if snap_row and snap_row[0] else set()
 
-    # Persist updated snapshot
-    set_setting(db, "positions_snapshot", ",".join(sorted(current)))
+    set_setting(db, snapshot_key, ",".join(sorted(current)))
     db.commit()
 
     closed = prev - current
     if not closed:
         return
 
-    logger.info("Detected closed positions: %s", closed)
+    logger.info("[%s] Detected closed positions: %s", mode, closed)
     api_key   = get_setting(db, "claude_api_key", "")
     auto_exec = get_setting(db, "auto_execute", "true").lower() == "true"
     max_pos   = int(get_setting(db, "max_positions", "10"))
@@ -158,7 +165,6 @@ def check_post_close(db: Session):
 
         if auto_exec and len(current) < max_pos:
             _execute_next_pick(db, mode, current)
-            # Refresh current set after potential buy
             try:
                 current = {p.symbol for p in alp.get_positions(mode)}
             except Exception:
@@ -173,9 +179,13 @@ def _run_claude_analysis(db: Session, closed_sym: str, mode: str):
             text("""
                 SELECT symbol, score, signal, entry_price, stop_price, target1, status, rationale
                 FROM weekly_plan
-                WHERE week_start = (SELECT MAX(week_start) FROM weekly_plan)
+                WHERE week_start = (
+                    SELECT MAX(week_start) FROM weekly_plan WHERE mode = :mode
+                )
+                  AND mode = :mode
                 ORDER BY rank ASC
-            """)
+            """),
+            {"mode": mode},
         ).fetchall()
 
         picks = [dict(r._mapping) for r in picks_rows]
@@ -183,11 +193,11 @@ def _run_claude_analysis(db: Session, closed_sym: str, mode: str):
         entry_row = db.execute(
             text("""
                 SELECT price FROM trade_log
-                WHERE symbol = :s AND action = 'BUY'
+                WHERE symbol = :s AND action = 'BUY' AND mode = :mode
                 ORDER BY created_at DESC
                 LIMIT 1
             """),
-            {"s": closed_sym},
+            {"s": closed_sym, "mode": mode},
         ).fetchone()
 
         closed_ctx = {
@@ -198,7 +208,7 @@ def _run_claude_analysis(db: Session, closed_sym: str, mode: str):
 
         analysis = analyze_picks(db, picks, closed_position=closed_ctx)
         log_analysis(db, "post_close", closed_sym, analysis, mode)
-        logger.info("Claude analysis saved for post-close of %s.", closed_sym)
+        logger.info("Claude analysis saved for post-close of %s [%s].", closed_sym, mode)
 
     except Exception as exc:
         logger.warning("Claude analysis failed for %s: %s", closed_sym, exc)
@@ -209,15 +219,19 @@ def _execute_next_pick(db: Session, mode: str, held: set):
         text("""
             SELECT symbol, entry_price, stop_price, target1
             FROM weekly_plan
-            WHERE week_start = (SELECT MAX(week_start) FROM weekly_plan)
+            WHERE week_start = (
+                SELECT MAX(week_start) FROM weekly_plan WHERE mode = :mode
+            )
+              AND mode = :mode
               AND status = 'PENDING'
             ORDER BY rank ASC
             LIMIT 1
-        """)
+        """),
+        {"mode": mode},
     ).fetchone()
 
     if not row:
-        logger.info("Post-close: no PENDING picks left.")
+        logger.info("Post-close: no PENDING picks left for mode=%s.", mode)
         return
 
     sym    = row[0]
@@ -245,23 +259,26 @@ def _execute_next_pick(db: Session, mode: str, held: set):
         if stop > 0 and target > 0:
             alp.place_bracket_buy(sym, qty, stop, target, mode)
             logger.info(
-                "Post-close auto-buy: bracket %s qty=%.0f stop=$%.2f target=$%.2f",
-                sym, qty, stop, target,
+                "Post-close auto-buy: bracket %s qty=%.0f stop=$%.2f target=$%.2f [%s]",
+                sym, qty, stop, target, mode,
             )
         else:
             alp.place_market_buy(sym, qty, mode)
             logger.info(
-                "Post-close auto-buy: market %s qty=%.0f (no bracket — missing stop/target)",
-                sym, qty,
+                "Post-close auto-buy: market %s qty=%.0f (no bracket — missing stop/target) [%s]",
+                sym, qty, mode,
             )
 
         db.execute(
             text("""
                 UPDATE weekly_plan SET status = 'EXECUTED'
                 WHERE symbol = :sym
-                  AND week_start = (SELECT MAX(week_start) FROM weekly_plan)
+                  AND mode = :mode
+                  AND week_start = (
+                      SELECT MAX(week_start) FROM weekly_plan WHERE mode = :mode
+                  )
             """),
-            {"sym": sym},
+            {"sym": sym, "mode": mode},
         )
         db.execute(
             text("""
