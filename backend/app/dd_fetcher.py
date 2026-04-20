@@ -34,23 +34,52 @@ def _refresh_session() -> tuple[str, dict]:
         timeout=15,
     )
     try:
-        # Seed the cookie jar with a ticker page — sets A1/A3 auth cookies
-        client.get("https://finance.yahoo.com/quote/SPY/")
-        time.sleep(0.8)  # let Yahoo set cookies before crumb call
+        # Step 1: fc.yahoo.com sets initial tracking cookies Yahoo requires
+        try:
+            client.get("https://fc.yahoo.com")
+            time.sleep(0.3)
+        except Exception:
+            pass  # non-fatal — best effort
 
-        # Try query2 first, fall back to query1
+        # Step 2: Finance home with full browser-like headers to get A1/A3 cookies
+        client.get(
+            "https://finance.yahoo.com/",
+            headers={
+                **_COMMON_HEADERS,
+                "Accept": (
+                    "text/html,application/xhtml+xml,application/xml;"
+                    "q=0.9,image/webp,*/*;q=0.8"
+                ),
+                "Accept-Encoding": "gzip, deflate, br",
+                "Connection": "keep-alive",
+                "Upgrade-Insecure-Requests": "1",
+            },
+        )
+        time.sleep(1.5)  # give Yahoo time to fully set session cookies
+
+        # Step 3: Crumb — try query2 first, fall back to query1
+        r = None
         for host in ("query2", "query1"):
             r = client.get(
                 f"https://{host}.finance.yahoo.com/v1/test/getcrumb",
-                headers={**_COMMON_HEADERS, "Accept": "*/*"},
+                headers={
+                    **_COMMON_HEADERS,
+                    "Accept": "text/plain, */*; q=0.01",
+                    "Referer": "https://finance.yahoo.com/",
+                },
             )
             crumb = r.text.strip()
             if crumb and len(crumb) <= 40 and "<" not in crumb and "{" not in crumb:
-                logger.info("Crumb acquired via %s", host)
+                logger.info("Crumb acquired via %s: %s…", host, crumb[:6])
                 return crumb, dict(client.cookies)
-            logger.warning("Bad crumb from %s: %s", host, r.text[:80])
+            logger.warning(
+                "Bad crumb from %s (status=%s): %s", host, r.status_code, r.text[:120]
+            )
 
-        raise RuntimeError(f"Could not obtain valid crumb. Last response: {r.text[:120]}")
+        raise RuntimeError(
+            f"Could not obtain valid crumb after trying both hosts. "
+            f"Last response: {r.text[:120] if r else 'no response'}"
+        )
     finally:
         client.close()
 
@@ -78,7 +107,11 @@ def _fetch_summary(symbol: str) -> dict:
 
     url = f"https://query1.finance.yahoo.com/v10/finance/quoteSummary/{symbol}"
     params = {"modules": _MODULES, "crumb": _crumb, "lang": "en-US", "region": "US"}
-    headers = {**_COMMON_HEADERS, "Accept": "application/json"}
+    headers = {
+        **_COMMON_HEADERS,
+        "Accept": "application/json",
+        "Referer": "https://finance.yahoo.com/",
+    }
 
     resp = httpx.get(
         url,
