@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { useQuery, useQueryClient } from 'react-query'
-import { fetchWeeklyPlan, runScreener, updatePlanStatus } from '../api/client'
+import { fetchWeeklyPlan, runScreener, syncTradingView, updatePlanStatus } from '../api/client'
 
 const SIGNAL_STYLE = {
   BREAKOUT:      'bg-emerald-500/20 text-emerald-300 border border-emerald-500/30',
@@ -19,8 +19,9 @@ const STATUS_STYLE = {
 
 export default function WeeklyPlan() {
   const qc = useQueryClient()
-  const [running, setRunning] = useState(false)
-  const [runMsg, setRunMsg]   = useState(null)
+  const [running, setRunning]   = useState(false)
+  const [syncing, setSyncing]   = useState(false)
+  const [runMsg, setRunMsg]     = useState(null)
 
   const { data: plan = [], isLoading, isError } = useQuery('weeklyPlan', fetchWeeklyPlan, {
     refetchInterval: 30000,
@@ -43,6 +44,21 @@ export default function WeeklyPlan() {
     }
   }
 
+  async function handleSyncTV() {
+    setSyncing(true)
+    setRunMsg(null)
+    try {
+      const res = await syncTradingView()
+      setRunMsg(res.message || `Syncing ${res.symbols?.length || ''} symbols to TradingView weekly_picks…`)
+      setTimeout(() => setRunMsg(null), 8000)
+    } catch (err) {
+      const msg = err?.response?.data?.detail || 'TradingView sync failed — check TV credentials in Settings.'
+      setRunMsg(msg)
+    } finally {
+      setSyncing(false)
+    }
+  }
+
   async function handleStatus(symbol, status) {
     await updatePlanStatus(symbol, status)
     qc.invalidateQueries('weeklyPlan')
@@ -62,13 +78,23 @@ export default function WeeklyPlan() {
             <p className="text-xs text-slate-500 mt-0.5">Week of {weekStart}</p>
           )}
         </div>
-        <button
-          onClick={handleRunScreener}
-          disabled={running}
-          className="px-4 py-1.5 rounded-lg text-sm font-medium bg-accent hover:bg-indigo-500 text-white disabled:opacity-50 transition-colors"
-        >
-          {running ? 'Running…' : 'Run Screener'}
-        </button>
+        <div className="flex gap-2">
+          <button
+            onClick={handleSyncTV}
+            disabled={syncing || plan.length === 0}
+            className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-700 hover:bg-slate-600 text-slate-200 disabled:opacity-40 transition-colors"
+            title="Push current plan to TradingView weekly_picks watchlist"
+          >
+            {syncing ? 'Syncing…' : 'Sync TV'}
+          </button>
+          <button
+            onClick={handleRunScreener}
+            disabled={running}
+            className="px-4 py-1.5 rounded-lg text-sm font-medium bg-accent hover:bg-indigo-500 text-white disabled:opacity-50 transition-colors"
+          >
+            {running ? 'Running…' : 'Run Screener'}
+          </button>
+        </div>
       </div>
 
       {runMsg && (
