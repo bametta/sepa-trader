@@ -1,6 +1,9 @@
 import { useState, useEffect, useRef } from 'react'
 import { useQuery, useQueryClient } from 'react-query'
-import { fetchWeeklyPlan, fetchScreenerStatus, runScreener, syncTradingView, updatePlanStatus } from '../api/client'
+import {
+  fetchWeeklyPlan, fetchWeeklyDD, fetchScreenerStatus,
+  runScreener, syncTradingView, updatePlanStatus,
+} from '../api/client'
 
 const SIGNAL_STYLE = {
   BREAKOUT:       'bg-emerald-500/20 text-emerald-300 border border-emerald-500/30',
@@ -17,35 +20,59 @@ const STATUS_STYLE = {
   SKIPPED:  'bg-slate-600 text-slate-400 line-through',
 }
 
+function fmtCap(n) {
+  if (!n) return '—'
+  if (n >= 1e12) return `$${(n / 1e12).toFixed(1)}T`
+  if (n >= 1e9)  return `$${(n / 1e9).toFixed(1)}B`
+  if (n >= 1e6)  return `$${(n / 1e6).toFixed(0)}M`
+  return `$${n}`
+}
+function fmtPct(n) {
+  if (n == null) return '—'
+  const v = (n * 100).toFixed(1)
+  return n >= 0 ? `+${v}%` : `${v}%`
+}
+function pctColor(n) {
+  if (n == null) return 'text-slate-400'
+  return n >= 0.10 ? 'text-emerald-400' : n >= 0 ? 'text-slate-300' : 'text-red-400'
+}
+
 export default function WeeklyPlan() {
   const qc = useQueryClient()
   const [running, setRunning] = useState(false)
   const [syncing, setSyncing] = useState(false)
   const [msg, setMsg]         = useState(null)
-  const [msgType, setMsgType] = useState('info') // info | error
+  const [msgType, setMsgType] = useState('info')
   const prevStatusRef         = useRef(null)
 
-  // Plan data — refetch frequently when screener is running
   const { data: plan = [], isLoading, isError } = useQuery('weeklyPlan', fetchWeeklyPlan, {
     refetchInterval: 30000,
   })
 
-  // Status — poll every 5s while running, every 60s otherwise
   const { data: status } = useQuery('screenerStatus', fetchScreenerStatus, {
     refetchInterval: (data) => data?.status === 'running' ? 5000 : 60000,
   })
 
-  // React to screener status transitions
+  const weekStart = plan[0]?.week_start
+  const {
+    data: ddList = [],
+    isFetching: ddLoading,
+    refetch: refetchDD,
+  } = useQuery(
+    ['weeklyDD', weekStart],
+    fetchWeeklyDD,
+    { enabled: plan.length > 0, staleTime: 6 * 60 * 60 * 1000, refetchOnWindowFocus: false },
+  )
+  const ddMap = Object.fromEntries(ddList.map(d => [d.symbol, d]))
+
   useEffect(() => {
     const prev = prevStatusRef.current
     const curr = status?.status
     prevStatusRef.current = curr
-
     if (prev === 'running' && curr === 'done') {
       setRunning(false)
       qc.invalidateQueries('weeklyPlan')
-      const summary = status?.last_run_summary || `Screener complete — ${status?.count ?? 0} stocks selected.`
-      setMsg(summary)
+      setMsg(status?.last_run_summary || `Screener complete — ${status?.count ?? 0} stocks selected.`)
       setMsgType('info')
     } else if (prev === 'running' && curr === 'error') {
       setRunning(false)
@@ -54,7 +81,6 @@ export default function WeeklyPlan() {
     }
   }, [status?.status])
 
-  // Keep running=true in sync with DB status on mount (e.g. page reload mid-run)
   useEffect(() => {
     if (status?.status === 'running' && !running) setRunning(true)
   }, [status?.status])
@@ -64,7 +90,7 @@ export default function WeeklyPlan() {
     setRunning(true)
     try {
       await runScreener()
-      setMsg('Scanning ~120 stocks… this takes 1–3 minutes.')
+      setMsg('Scanning stocks via TradingView… usually completes in under 30 seconds.')
       setMsgType('info')
     } catch (err) {
       setRunning(false)
@@ -94,21 +120,30 @@ export default function WeeklyPlan() {
     qc.invalidateQueries('weeklyPlan')
   }
 
-  const weekStart = plan[0]?.week_start
-    ? new Date(plan[0].week_start).toLocaleDateString('en-US', {
+  const weekLabel = weekStart
+    ? new Date(weekStart).toLocaleDateString('en-US', {
         month: 'short', day: 'numeric', year: 'numeric', timeZone: 'UTC',
       })
     : null
 
   return (
     <div className="space-y-4">
-      {/* Header */}
       <div className="flex items-center justify-between">
         <div>
           <h3 className="text-base font-semibold text-slate-100">Weekly Trading Plan</h3>
-          {weekStart && <p className="text-xs text-slate-500 mt-0.5">Week of {weekStart}</p>}
+          {weekLabel && <p className="text-xs text-slate-500 mt-0.5">Week of {weekLabel}</p>}
         </div>
         <div className="flex gap-2">
+          {plan.length > 0 && (
+            <button
+              onClick={() => refetchDD()}
+              disabled={ddLoading}
+              className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-700 hover:bg-slate-600 text-slate-200 disabled:opacity-40 transition-colors"
+              title="Refresh due-diligence data"
+            >
+              {ddLoading ? 'Loading DD…' : 'Refresh DD'}
+            </button>
+          )}
           <button
             onClick={handleSyncTV}
             disabled={syncing || plan.length === 0}
@@ -122,15 +157,12 @@ export default function WeeklyPlan() {
             disabled={running}
             className="px-4 py-1.5 rounded-lg text-sm font-medium bg-accent hover:bg-indigo-500 text-white disabled:opacity-50 transition-colors flex items-center gap-2"
           >
-            {running && (
-              <span className="inline-block w-3 h-3 border-2 border-white border-t-transparent rounded-full animate-spin" />
-            )}
+            {running && <span className="inline-block w-3 h-3 border-2 border-white border-t-transparent rounded-full animate-spin" />}
             {running ? 'Scanning…' : 'Run Screener'}
           </button>
         </div>
       </div>
 
-      {/* Message banner */}
       {msg && (
         <div className={`border rounded-xl px-4 py-2.5 text-sm ${
           msgType === 'error'
@@ -141,14 +173,12 @@ export default function WeeklyPlan() {
         </div>
       )}
 
-      {/* Last-run summary bar (shown when not showing an active message) */}
       {!msg && !running && status?.last_run_summary && (
         <div className="bg-slate-800/50 border border-border rounded-xl px-4 py-2 text-xs text-slate-400">
           {status.last_run_summary}
         </div>
       )}
 
-      {/* Content */}
       {isLoading ? (
         <div className="space-y-3">
           {[...Array(5)].map((_, i) => (
@@ -169,21 +199,21 @@ export default function WeeklyPlan() {
           ) : (
             <>
               <p className="font-medium">No weekly plan yet.</p>
-              <p className="text-xs">
-                {status?.last_run_summary
-                  ? status.last_run_summary
-                  : 'Click "Run Screener" to scan stocks. Runs automatically every Sunday at 8 PM ET.'}
-              </p>
-              {status?.error && (
-                <p className="text-xs text-red-400 mt-2">Last error: {status.error}</p>
-              )}
+              <p className="text-xs">{status?.last_run_summary || 'Click "Run Screener" to scan stocks.'}</p>
+              {status?.error && <p className="text-xs text-red-400 mt-2">Last error: {status.error}</p>}
             </>
           )}
         </div>
       ) : (
         <div className="space-y-3">
           {plan.map(row => (
-            <PlanCard key={row.symbol} row={row} onStatusChange={handleStatus} />
+            <PlanCard
+              key={row.symbol}
+              row={row}
+              dd={ddMap[row.symbol]}
+              ddLoading={ddLoading}
+              onStatusChange={handleStatus}
+            />
           ))}
         </div>
       )}
@@ -191,8 +221,9 @@ export default function WeeklyPlan() {
   )
 }
 
-function PlanCard({ row, onStatusChange }) {
+function PlanCard({ row, dd, ddLoading, onStatusChange }) {
   const [expanded, setExpanded] = useState(false)
+  const [ddOpen, setDdOpen]     = useState(false)
 
   const signalCls = SIGNAL_STYLE[row.signal] || SIGNAL_STYLE.STAGE2_WATCH
   const statusCls = STATUS_STYLE[row.status] || STATUS_STYLE.PENDING
@@ -210,12 +241,17 @@ function PlanCard({ row, onStatusChange }) {
           {row.rank}
         </span>
         <div className="flex-1 min-w-0">
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-2 flex-wrap">
             <span className="font-semibold text-slate-100">{row.symbol}</span>
             <span className={`text-xs px-1.5 py-0.5 rounded-md ${signalCls}`}>{row.signal}</span>
+            {dd && !dd.error && dd.sector && (
+              <span className="text-xs px-1.5 py-0.5 rounded-md bg-slate-700/60 text-slate-400 hidden sm:inline">
+                {dd.sector}
+              </span>
+            )}
           </div>
           <div className="flex items-center gap-3 mt-0.5 text-xs text-slate-400">
-            <span>Score <strong className="text-slate-200">{row.score}/8</strong></span>
+            <span>Score <strong className="text-slate-200">{row.score}/6</strong></span>
             <span>Entry <strong className="text-slate-200">${Number(row.entry_price).toFixed(2)}</strong></span>
             <span>Stop <strong className="text-red-400">${Number(row.stop_price).toFixed(2)}</strong></span>
             <span>R:R <strong className="text-emerald-400">{rr}x</strong></span>
@@ -230,34 +266,119 @@ function PlanCard({ row, onStatusChange }) {
       {expanded && (
         <div className="border-t border-border px-4 py-3 space-y-3">
           <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 text-xs">
-            <Stat label="Entry"        value={`$${Number(row.entry_price).toFixed(2)}`} />
-            <Stat label="Stop"         value={`$${Number(row.stop_price).toFixed(2)}`}  color="text-red-400" />
-            <Stat label="Target 1 (2R)"value={`$${Number(row.target1).toFixed(2)}`}    color="text-emerald-400" />
-            <Stat label="Target 2 (3R)"value={`$${Number(row.target2).toFixed(2)}`}    color="text-emerald-300" />
-            <Stat label="Shares"       value={row.position_size} />
-            <Stat label="Risk $"       value={`$${Number(row.risk_amount).toFixed(0)}`} />
-            <Stat label="Mode"         value={row.mode?.toUpperCase()} />
-            <Stat label="R:R"          value={`${rr}x`} />
+            <Stat label="Entry"         value={`$${Number(row.entry_price).toFixed(2)}`} />
+            <Stat label="Stop"          value={`$${Number(row.stop_price).toFixed(2)}`}  color="text-red-400" />
+            <Stat label="Target 1 (2R)" value={`$${Number(row.target1).toFixed(2)}`}    color="text-emerald-400" />
+            <Stat label="Target 2 (3R)" value={`$${Number(row.target2).toFixed(2)}`}    color="text-emerald-300" />
+            <Stat label="Shares"        value={row.position_size} />
+            <Stat label="Risk $"        value={`$${Number(row.risk_amount).toFixed(0)}`} />
+            <Stat label="Mode"          value={row.mode?.toUpperCase()} />
+            <Stat label="R:R"           value={`${rr}x`} />
           </div>
+
           {row.rationale && (
             <p className="text-xs text-slate-400 leading-relaxed">{row.rationale}</p>
           )}
+
           <div className="flex gap-2 pt-1">
             {['PENDING', 'EXECUTED', 'PARTIAL', 'SKIPPED'].map(s => (
               <button
                 key={s}
                 onClick={() => onStatusChange(row.symbol, s)}
                 className={`text-xs px-2 py-1 rounded-md transition-colors ${
-                  row.status === s
-                    ? 'bg-accent text-white'
-                    : 'bg-slate-700 text-slate-400 hover:bg-slate-600'
+                  row.status === s ? 'bg-accent text-white' : 'bg-slate-700 text-slate-400 hover:bg-slate-600'
                 }`}
               >
                 {s}
               </button>
             ))}
           </div>
+
+          <button
+            onClick={() => setDdOpen(o => !o)}
+            className="flex items-center gap-1.5 text-xs text-indigo-400 hover:text-indigo-300"
+          >
+            <span className={`transition-transform inline-block ${ddOpen ? 'rotate-90' : ''}`}>▶</span>
+            {ddOpen ? 'Hide' : 'Show'} Due Diligence
+          </button>
+
+          {ddOpen && <DDPanel dd={dd} loading={ddLoading} symbol={row.symbol} />}
         </div>
+      )}
+    </div>
+  )
+}
+
+function DDPanel({ dd, loading, symbol }) {
+  if (loading) {
+    return (
+      <div className="bg-slate-800/60 rounded-xl p-4 text-xs text-slate-400 animate-pulse">
+        Loading due-diligence data for {symbol}…
+      </div>
+    )
+  }
+  if (!dd) {
+    return (
+      <div className="bg-slate-800/60 rounded-xl p-4 text-xs text-slate-500">
+        DD not yet loaded — click "Refresh DD" in the header.
+      </div>
+    )
+  }
+  if (dd.error) {
+    return (
+      <div className="bg-slate-800/60 rounded-xl p-4 text-xs text-red-400">
+        DD error: {dd.error}
+      </div>
+    )
+  }
+
+  const metrics = [
+    { label: 'Market Cap',           value: fmtCap(dd.market_cap) },
+    { label: 'P/E TTM',              value: dd.pe_ttm?.toFixed(1)     ?? '—' },
+    { label: 'Fwd P/E',              value: dd.forward_pe?.toFixed(1)  ?? '—' },
+    { label: 'EPS TTM',              value: dd.eps_ttm != null ? `$${dd.eps_ttm.toFixed(2)}` : '—' },
+    { label: 'Rev Growth',           value: fmtPct(dd.revenue_growth),  color: pctColor(dd.revenue_growth)  },
+    { label: 'EPS Growth',           value: fmtPct(dd.earnings_growth), color: pctColor(dd.earnings_growth) },
+    { label: 'Gross Margin',         value: dd.gross_margin != null ? `${(dd.gross_margin * 100).toFixed(1)}%` : '—' },
+    { label: 'Net Margin',           value: dd.net_margin   != null ? `${(dd.net_margin   * 100).toFixed(1)}%` : '—' },
+    { label: 'ROE',                  value: dd.roe          != null ? `${(dd.roe          * 100).toFixed(1)}%` : '—' },
+    { label: 'Debt / Equity',        value: dd.debt_to_equity?.toFixed(1) ?? '—' },
+  ]
+
+  return (
+    <div className="bg-slate-800/60 border border-slate-700/50 rounded-xl p-4 space-y-3">
+      <div>
+        <p className="text-sm font-semibold text-slate-100">{dd.name}</p>
+        <p className="text-xs text-slate-400 mt-0.5">
+          {[dd.sector, dd.industry].filter(Boolean).join(' · ')}
+        </p>
+      </div>
+
+      <div className="grid grid-cols-2 sm:grid-cols-5 gap-2">
+        {metrics.map(m => (
+          <div key={m.label} className="bg-slate-900/50 rounded-lg px-2 py-1.5">
+            <div className="text-slate-500 text-[10px] leading-tight mb-0.5">{m.label}</div>
+            <div className={`text-xs font-medium ${m.color || 'text-slate-200'}`}>{m.value}</div>
+          </div>
+        ))}
+      </div>
+
+      {dd.analyst_label && dd.analyst_label !== 'N/A' && (
+        <div className="flex items-center gap-2 text-xs">
+          <span className="text-slate-500">Analyst consensus:</span>
+          <span className={`font-semibold ${dd.analyst_css || 'text-slate-300'}`}>
+            {dd.analyst_label}
+          </span>
+          {dd.analyst_count && (
+            <span className="text-slate-600">({dd.analyst_count} analysts)</span>
+          )}
+        </div>
+      )}
+
+      {dd.description && (
+        <p className="text-xs text-slate-500 leading-relaxed border-t border-slate-700/50 pt-2">
+          {dd.description}{dd.description.length >= 500 ? '…' : ''}
+        </p>
       )}
     </div>
   )

@@ -36,6 +36,23 @@ def get_screener_status(db: Session = Depends(get_db)):
     }
 
 
+@router.get("/dd")
+def get_weekly_dd(db: Session = Depends(get_db)):
+    """Fetch due-diligence data for every symbol in the current week's plan."""
+    rows = db.execute(
+        text("""
+            SELECT symbol FROM weekly_plan
+            WHERE week_start = (SELECT MAX(week_start) FROM weekly_plan)
+            ORDER BY rank ASC
+        """)
+    ).fetchall()
+    symbols = [r[0] for r in rows]
+    if not symbols:
+        return []
+    from ..dd_fetcher import fetch_dd_batch
+    return fetch_dd_batch(symbols)
+
+
 @router.get("/history")
 def get_plan_history(db: Session = Depends(get_db)):
     rows = db.execute(
