@@ -101,10 +101,8 @@ def run_screener(db: Session, mode: str = None) -> list[dict]:
     risk_pct = float(get_setting(db, "risk_pct", "2.0"))
     stop_pct = float(get_setting(db, "stop_loss_pct", "8.0"))
 
-    # Try to get portfolio value from Alpaca; fall back to settings
     account = _get_portfolio_value(mode)
 
-    # Get universe
     universe_raw = get_setting(db, "screener_universe", "")
     universe = (
         [s.strip().upper() for s in universe_raw.split(",") if s.strip()]
@@ -114,32 +112,46 @@ def run_screener(db: Session, mode: str = None) -> list[dict]:
 
     logger.info("Screener: scanning %d symbols (mode=%s)...", len(universe), mode)
 
-    # Parallel analysis
+    # Parallel analysis (cap workers at 5 to avoid Yahoo Finance rate-limiting)
     results_map: dict[str, dict] = {}
-    with ThreadPoolExecutor(max_workers=10) as executor:
+    with ThreadPoolExecutor(max_workers=5) as executor:
         futures = {executor.submit(_analyze_safe, sym): sym for sym in universe}
         for future in as_completed(futures):
             sym, result = future.result()
             results_map[sym] = result
 
-    # Filter: need score >= 6 and a valid price
-    candidates = []
-    for sym, result in results_map.items():
-        score = result.get("score", 0)
-        price = result.get("price")
-        if score >= 6 and price:
-            candidates.append({"symbol": sym, **result})
-
-    # Sort: score DESC, then vol_surge as tiebreaker
-    candidates.sort(
+    # Build scored list (exclude errors and missing prices)
+    all_scored = [
+        {"symbol": sym, **result}
+        for sym, result in results_map.items()
+        if result.get("price") and result.get("signal") not in ("ERROR", "INSUFFICIENT_DATA")
+    ]
+    all_scored.sort(
         key=lambda x: (x["score"], int(bool(x.get("vol_surge"))), int(bool(x.get("above_pivot")))),
         reverse=True,
     )
-    top10 = candidates[:10]
 
-    if not top10:
-        logger.warning("Screener: no candidates found with score >= 6")
-        return []
+    errors   = sum(1 for r in results_map.values() if r.get("signal") in ("ERROR", "INSUFFICIENT_DATA"))
+    top_score = all_scored[0]["score"] if all_scored else 0
+
+    # Adaptive threshold: prefer >= 7 (true stage 2), step down if needed
+    for min_score in (7, 6, 5, 4):
+        candidates = [c for c in all_scored if c["score"] >= min_score]
+        if len(candidates) >= 5:
+            break
+
+    top10 = candidates[:10] if candidates else []
+
+    summary_msg = (
+        f"Screener: scanned {len(universe)}, "
+        f"errors {errors}, "
+        f"scored {len(all_scored)}, "
+        f"qualifying (>={min_score if candidates else 4}) {len(candidates)}, "
+        f"selected {len(top10)}. "
+        f"Top score: {top_score}/8."
+    )
+    logger.info(summary_msg)
+    _log_alert(db, "INFO", summary_msg)
 
     week_start   = _next_monday()
     risk_dollars = account * (risk_pct / 100)
@@ -171,30 +183,37 @@ def run_screener(db: Session, mode: str = None) -> list[dict]:
             "mode":          mode,
         })
 
+    # Always save (even empty) so last-run info is queryable
     _save_plan(db, plan_rows, week_start.isoformat(), mode)
+    set_setting(db, "screener_last_run", summary_msg)
 
-    # Update watchlist so the hourly monitor targets these stocks during the week
-    top_symbols   = [r["symbol"] for r in plan_rows]
-    watchlist_csv = ",".join(top_symbols)
-    set_setting(db, "watchlist", watchlist_csv)
+    if plan_rows:
+        top_symbols   = [r["symbol"] for r in plan_rows]
+        set_setting(db, "watchlist", ",".join(top_symbols))
 
-    # Sync to TradingView weekly_picks watchlist if credentials are set
-    tv_user = get_setting(db, "tv_username", "")
-    tv_pass = get_setting(db, "tv_password", "")
-    if tv_user and tv_pass:
-        from .tradingview_client import update_weekly_picks
-        result = update_weekly_picks(tv_user, tv_pass, top_symbols)
-        if result["ok"]:
-            logger.info("TradingView weekly_picks watchlist %s.", result["action"])
-        else:
-            logger.warning("TradingView sync failed: %s", result["error"])
+        tv_user = get_setting(db, "tv_username", "")
+        tv_pass = get_setting(db, "tv_password", "")
+        if tv_user and tv_pass:
+            from .tradingview_client import update_weekly_picks
+            tv_result = update_weekly_picks(tv_user, tv_pass, top_symbols)
+            if tv_result["ok"]:
+                logger.info("TradingView weekly_picks %s.", tv_result["action"])
+            else:
+                logger.warning("TradingView sync failed: %s", tv_result["error"])
 
-    logger.info(
-        "Screener complete. Week of %s. Plan: %s",
-        week_start,
-        top_symbols,
-    )
+    logger.info("Screener complete. Week of %s. Plan: %s", week_start, [r["symbol"] for r in plan_rows])
     return plan_rows
+
+
+def _log_alert(db: Session, level: str, message: str):
+    try:
+        db.execute(
+            text("INSERT INTO alert_log (level, message) VALUES (:l, :m)"),
+            {"l": level, "m": message},
+        )
+        db.commit()
+    except Exception:
+        pass
 
 
 def _get_portfolio_value(mode: str) -> float:
