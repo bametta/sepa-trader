@@ -14,19 +14,17 @@ logger = logging.getLogger(__name__)
 
 SCAN_URL = "https://scanner.tradingview.com/america/scan"
 
-# Indicators we need for Minervini 8-point SEPA scoring.
-# EMA150: TradingView scanner may return null; we fall back to interpolating
-# between EMA100 and EMA200 if needed.
+# Confirmed-valid TradingView scanner columns (no EMA150 — not a standard TV field;
+# no bracket notation — not supported; High.1Y/Low.1Y for 52-week range).
 _COLS = [
     "close",
     "EMA20",
     "EMA50",
-    "EMA100",           # fallback if EMA150 unavailable
-    "EMA150",
+    "EMA100",                   # proxy for EMA150 (interpolated with EMA200)
     "EMA200",
-    "EMA200[1]",        # yesterday's EMA200 — trend-direction check
-    "52W.High",
-    "52W.Low",
+    "SMA200",                   # EMA200 > SMA200 → EMA200 is rising (trend check)
+    "High.1Y",                  # 52-week high
+    "Low.1Y",                   # 52-week low
     "volume",
     "average_volume_30d_calc",
 ]
@@ -99,15 +97,18 @@ def _score_sepa(symbol: str, v: dict) -> dict:
     e50      = v.get("EMA50") or 0
     e100     = v.get("EMA100") or 0
     e200     = v.get("EMA200") or 0
-    e200_1   = v.get("EMA200[1]") or e200
-    w52h     = v.get("52W.High") or 0
-    w52l     = v.get("52W.Low") or 0
+    sma200   = v.get("SMA200") or 0
+    w52h     = v.get("High.1Y") or 0
+    w52l     = v.get("Low.1Y") or 0
     vol      = v.get("volume") or 0
     vol_avg  = v.get("average_volume_30d_calc") or 1
 
-    # EMA150: use TradingView value if available, otherwise interpolate
-    e150_raw = v.get("EMA150")
-    e150 = e150_raw if e150_raw else ((e100 * 0.5 + e200 * 0.5) if e100 and e200 else 0)
+    # EMA150 not a standard TV field — interpolate between EMA100 and EMA200
+    e150 = (e100 * 0.5 + e200 * 0.5) if e100 and e200 else 0
+
+    # Criterion 6: EMA200 rising — EMA200 > SMA200 means recent closes are
+    # pulling the exponential average above the simple one (upward momentum)
+    e200_rising = bool(e200 and sma200 and e200 > sma200)
 
     score = sum([
         bool(e50  and close > e50),
@@ -115,7 +116,7 @@ def _score_sepa(symbol: str, v: dict) -> dict:
         bool(e200 and close > e200),
         bool(e50  and e150 and e50  > e150),
         bool(e150 and e200 and e150 > e200),
-        bool(e200 and e200_1 and e200 > e200_1),
+        e200_rising,
         bool(w52h and close >= w52h * 0.75),
         bool(w52l and close >= w52l * 1.30),
     ])
