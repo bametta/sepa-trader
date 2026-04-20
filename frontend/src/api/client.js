@@ -16,4 +16,7 @@ export const fetchWeeklyDD      = () => api.get('/screener/dd').then(r => r.data
 export const fetchScreenerStatus= () => api.get('/screener/status').then(r => r.data)
 export const runScreener        = () => api.post('/screener/run').then(r => r.data)
 export const syncTradingView    = () => api.post('/screener/sync-tradingview').then(r => r.data)
-export const updatePlanStatus   = (symbol, status) => api.patch(`/screener/weekly-plan/${symbol}/status`, { status }).then(r => r.data)
+export const updatePlanStatus      = (symbol, status) => api.patch(`/screener/weekly-plan/${symbol}/status`, { status }).then(r => r.data)
+export const fetchAlpacaHistory    = (limit=100) => api.get(`/orders/alpaca-history?limit=${limit}`).then(r => r.data)
+export const fetchAnalyses         = (limit=20) => api.get(`/screener/analysis?limit=${limit}`).then(r => r.data)
+export const runAnalysis           = () => api.post('/screener/analysis/run').then(r => r.data)

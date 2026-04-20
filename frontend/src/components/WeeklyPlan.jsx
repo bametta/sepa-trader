@@ -3,6 +3,7 @@ import { useQuery, useQueryClient } from 'react-query'
 import {
   fetchWeeklyPlan, fetchWeeklyDD, fetchScreenerStatus,
   runScreener, syncTradingView, updatePlanStatus,
+  fetchAnalyses, runAnalysis,
 } from '../api/client'
 
 const SIGNAL_STYLE = {
@@ -39,11 +40,12 @@ function pctColor(n) {
 
 export default function WeeklyPlan() {
   const qc = useQueryClient()
-  const [running, setRunning] = useState(false)
-  const [syncing, setSyncing] = useState(false)
-  const [msg, setMsg]         = useState(null)
-  const [msgType, setMsgType] = useState('info')
-  const prevStatusRef         = useRef(null)
+  const [running, setRunning]       = useState(false)
+  const [syncing, setSyncing]       = useState(false)
+  const [analyzing, setAnalyzing]   = useState(false)
+  const [msg, setMsg]               = useState(null)
+  const [msgType, setMsgType]       = useState('info')
+  const prevStatusRef               = useRef(null)
 
   const { data: plan = [], isLoading, isError } = useQuery('weeklyPlan', fetchWeeklyPlan, {
     refetchInterval: 30000,
@@ -52,6 +54,10 @@ export default function WeeklyPlan() {
   const { data: status } = useQuery('screenerStatus', fetchScreenerStatus, {
     refetchInterval: (data) => data?.status === 'running' ? 5000 : 60000,
   })
+
+  const { data: analyses = [], refetch: refetchAnalyses } = useQuery(
+    'aiAnalyses', fetchAnalyses, { staleTime: 60000, refetchOnWindowFocus: false },
+  )
 
   const weekStart = plan[0]?.week_start
   const {
@@ -120,6 +126,23 @@ export default function WeeklyPlan() {
     qc.invalidateQueries('weeklyPlan')
   }
 
+  async function handleRunAnalysis() {
+    setAnalyzing(true)
+    setMsg(null)
+    try {
+      await runAnalysis()
+      await refetchAnalyses()
+      setMsg('AI analysis complete.')
+      setMsgType('info')
+      setTimeout(() => setMsg(null), 5000)
+    } catch (err) {
+      setMsg(err?.response?.data?.detail || 'Analysis failed — check Claude API key in Settings.')
+      setMsgType('error')
+    } finally {
+      setAnalyzing(false)
+    }
+  }
+
   const weekLabel = weekStart
     ? new Date(weekStart).toLocaleDateString('en-US', {
         month: 'short', day: 'numeric', year: 'numeric', timeZone: 'UTC',
@@ -144,6 +167,15 @@ export default function WeeklyPlan() {
               {ddLoading ? 'Loading DD…' : 'Refresh DD'}
             </button>
           )}
+          <button
+            onClick={handleRunAnalysis}
+            disabled={analyzing || plan.length === 0}
+            className="px-3 py-1.5 rounded-lg text-sm font-medium bg-violet-700 hover:bg-violet-600 text-slate-200 disabled:opacity-40 transition-colors flex items-center gap-1.5"
+            title="Run Claude AI analysis on picks"
+          >
+            {analyzing && <span className="inline-block w-3 h-3 border-2 border-slate-300 border-t-transparent rounded-full animate-spin" />}
+            {analyzing ? 'Analyzing…' : 'AI Analysis'}
+          </button>
           <button
             onClick={handleSyncTV}
             disabled={syncing || plan.length === 0}
@@ -214,6 +246,22 @@ export default function WeeklyPlan() {
               ddLoading={ddLoading}
               onStatusChange={handleStatus}
             />
+          ))}
+        </div>
+      )}
+
+      {analyses.length > 0 && (
+        <div className="space-y-2">
+          <h4 className="text-sm font-semibold text-slate-400 uppercase tracking-wider">AI Analysis Log</h4>
+          {analyses.map(a => (
+            <div key={a.id} className="bg-card border border-violet-500/20 rounded-xl p-4 space-y-2">
+              <div className="flex items-center gap-2 text-xs text-slate-500">
+                <span className="bg-violet-500/20 text-violet-300 px-1.5 py-0.5 rounded capitalize">{a.trigger}</span>
+                {a.symbol && <span className="font-medium text-slate-300">{a.symbol}</span>}
+                <span className="ml-auto">{new Date(a.created_at).toLocaleString()}</span>
+              </div>
+              <pre className="text-xs text-slate-300 leading-relaxed whitespace-pre-wrap font-sans">{a.analysis}</pre>
+            </div>
           ))}
         </div>
       )}

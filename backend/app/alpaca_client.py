@@ -35,6 +35,10 @@ def get_open_orders(mode: str = "paper"):
     return get_client(mode).get_orders(GetOrdersRequest(status=QueryOrderStatus.OPEN))
 
 
+def get_all_orders(mode: str = "paper", limit: int = 100):
+    return get_client(mode).get_orders(GetOrdersRequest(status=QueryOrderStatus.ALL, limit=limit))
+
+
 def get_clock(mode: str = "paper"):
     return get_client(mode).get_clock()
 

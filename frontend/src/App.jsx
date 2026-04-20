@@ -3,7 +3,7 @@ import { useQuery, useQueryClient } from 'react-query'
 import Navbar from './components/Navbar'
 import AccountSummary from './components/AccountSummary'
 import PositionCard from './components/PositionCard'
-import { OpenOrdersTable, TradeHistoryTable } from './components/OrdersTable'
+import { OpenOrdersTable, AlpacaHistoryTable } from './components/OrdersTable'
 import SettingsPanel from './components/SettingsPanel'
 import WeeklyPlan from './components/WeeklyPlan'
 import { fetchPositions, updateSetting, fetchSettings } from './api/client'
@@ -99,8 +99,8 @@ export default function App() {
           </div>
         )}
 
-        {tab === 'Orders'      && <OpenOrdersTable />}
-        {tab === 'History'     && <TradeHistoryTable />}
+        {tab === 'Orders'      && <div className="space-y-6"><OpenOrdersTable /><AlpacaHistoryTable /></div>}
+        {tab === 'History'     && <AlpacaHistoryTable />}
         {tab === 'Weekly Plan' && <WeeklyPlan />}
         {tab === 'Settings'    && <SettingsPanel />}
       </main>

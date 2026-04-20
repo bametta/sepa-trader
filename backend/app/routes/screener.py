@@ -137,6 +137,39 @@ def sync_tradingview(background_tasks: BackgroundTasks, db: Session = Depends(ge
             "message": f"Syncing {len(symbols)} symbols to TradingView weekly_picks."}
 
 
+@router.get("/analysis")
+def get_analyses(limit: int = 20, db: Session = Depends(get_db)):
+    """Return recent Claude AI analyses."""
+    from ..claude_analyst import get_latest_analyses
+    return get_latest_analyses(db, limit=limit)
+
+
+@router.post("/analysis/run")
+def trigger_analysis(db: Session = Depends(get_db)):
+    """Manually trigger a Claude analysis of the current week's picks."""
+    from ..claude_analyst import analyze_picks, log_analysis
+    mode = db.execute(text("SELECT value FROM settings WHERE key='trading_mode'")).scalar() or "paper"
+    picks_rows = db.execute(
+        text("""
+            SELECT symbol, score, signal, entry_price, stop_price, target1, status, rationale
+            FROM weekly_plan
+            WHERE week_start = (SELECT MAX(week_start) FROM weekly_plan)
+            ORDER BY rank ASC
+        """)
+    ).fetchall()
+    if not picks_rows:
+        from fastapi import HTTPException
+        raise HTTPException(404, "No weekly plan found.")
+    picks = [dict(r._mapping) for r in picks_rows]
+    try:
+        analysis = analyze_picks(db, picks)
+        log_analysis(db, "manual", None, analysis, mode)
+        return {"analysis": analysis}
+    except ValueError as exc:
+        from fastapi import HTTPException
+        raise HTTPException(400, str(exc))
+
+
 @router.patch("/weekly-plan/{symbol}/status")
 def update_plan_status(symbol: str, body: dict, db: Session = Depends(get_db)):
     status = body.get("status", "PENDING")

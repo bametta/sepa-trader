@@ -18,6 +18,8 @@ EDITABLE_KEYS = {
     "screener_auto_run", "screener_schedule_day", "screener_schedule_time",
     # TradingView
     "tv_username", "tv_password",
+    # AI Analysis
+    "claude_api_key", "claude_model",
 }
 
 

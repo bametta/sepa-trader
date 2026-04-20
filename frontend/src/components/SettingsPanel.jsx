@@ -49,6 +49,13 @@ const SECTIONS = [
       { key: 'webhook_secret', label: 'Webhook Secret',       type: 'password' },
     ],
   },
+  {
+    title: 'AI Analysis (Claude)',
+    fields: [
+      { key: 'claude_api_key', label: 'Anthropic API Key', type: 'password', span: true },
+      { key: 'claude_model',   label: 'Model ID (e.g. claude-opus-4-7)', type: 'text' },
+    ],
+  },
 ]
 
 export default function SettingsPanel() {

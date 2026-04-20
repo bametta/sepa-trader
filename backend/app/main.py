@@ -30,7 +30,17 @@ def _run_migrations():
                 created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )
         """))
-        # Seed any new settings keys (idempotent — DO NOTHING on conflict)
+        db.execute(text("""
+            CREATE TABLE IF NOT EXISTS ai_analysis_log (
+                id         SERIAL PRIMARY KEY,
+                trigger    VARCHAR(30) NOT NULL,
+                symbol     VARCHAR(10),
+                analysis   TEXT NOT NULL,
+                mode       VARCHAR(10) NOT NULL DEFAULT 'paper',
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+        """))
+        # Seed new settings (idempotent)
         db.execute(text("""
             INSERT INTO settings (key, value) VALUES
                 ('screener_auto_run',      'true'),
@@ -42,7 +52,10 @@ def _run_migrations():
                 ('screener_min_score',     '0'),
                 ('screener_vol_surge_pct', '40'),
                 ('screener_ema20_pct',     '2.0'),
-                ('screener_ema50_pct',     '3.0')
+                ('screener_ema50_pct',     '3.0'),
+                ('claude_api_key',         ''),
+                ('claude_model',           'claude-opus-4-7'),
+                ('positions_snapshot',     '')
             ON CONFLICT (key) DO NOTHING
         """))
         db.commit()

@@ -18,6 +18,19 @@ async def _monitor_job():
     db = SessionLocal()
     try:
         await run_monitor(db)
+        # Detect closed positions and optionally refill slots / run Claude analysis
+        from .position_manager import check_post_close
+        check_post_close(db)
+    finally:
+        db.close()
+
+
+async def _monday_open_job():
+    """Fires once on Monday at 9:35 ET to fill position slots from the weekly plan."""
+    db = SessionLocal()
+    try:
+        from .position_manager import run_monday_open
+        run_monday_open(db)
     finally:
         db.close()
 
@@ -88,6 +101,13 @@ def start_scheduler():
         _monitor_job,
         CronTrigger(day_of_week="mon-fri", hour="9-15", minute="30,0", timezone="America/New_York"),
         id="sepa_monitor",
+        replace_existing=True,
+    )
+    # Monday 9:35 AM ET — fill position slots from the weekly plan
+    scheduler.add_job(
+        _monday_open_job,
+        CronTrigger(day_of_week="mon", hour=9, minute=35, timezone="America/New_York"),
+        id="monday_open",
         replace_existing=True,
     )
     # Watchdog checks every minute whether it's time to run the screener.
