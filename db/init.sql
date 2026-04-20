@@ -61,7 +61,9 @@ INSERT INTO settings (key, value) VALUES
     ('max_positions',      '10'),
     ('monitor_interval',   '60'),
     ('webhook_secret',     ''),
-    ('screener_universe',  '')
+    ('screener_universe',  ''),
+    ('tv_username',        ''),
+    ('tv_password',        '')
 ON CONFLICT (key) DO NOTHING;
 
 CREATE INDEX ON signal_log   (symbol, created_at DESC);
