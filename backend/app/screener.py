@@ -7,6 +7,8 @@ Runs in parallel (10 workers) using the same analyze() function as the hourly
 monitor for consistency.
 """
 import logging
+import random
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, timedelta
 
@@ -59,13 +61,22 @@ def _next_monday() -> date:
     return today + timedelta(days=days_ahead)
 
 
-def _analyze_safe(symbol: str) -> tuple[str, dict]:
-    try:
-        result = analyze(symbol)
-        return symbol, result
-    except Exception as exc:
-        logger.warning("screener: %s failed: %s", symbol, exc)
-        return symbol, {"signal": "ERROR", "score": 0, "price": None, "error": str(exc)}
+def _analyze_safe(symbol: str, retries: int = 2) -> tuple[str, dict]:
+    for attempt in range(retries + 1):
+        try:
+            time.sleep(random.uniform(0.3, 0.8))  # gentle throttle per request
+            result = analyze(symbol)
+            # INSUFFICIENT_DATA from an empty Yahoo response — worth retrying
+            if result.get("signal") == "INSUFFICIENT_DATA" and attempt < retries:
+                time.sleep(random.uniform(3, 6) * (attempt + 1))
+                continue
+            return symbol, result
+        except Exception as exc:
+            if attempt < retries:
+                time.sleep(random.uniform(3, 6) * (attempt + 1))
+                continue
+            logger.warning("screener: %s failed after %d attempts: %s", symbol, retries + 1, exc)
+            return symbol, {"signal": "ERROR", "score": 0, "price": None, "error": str(exc)}
 
 
 def _generate_rationale(symbol: str, result: dict) -> str:
@@ -112,9 +123,9 @@ def run_screener(db: Session, mode: str = None) -> list[dict]:
 
     logger.info("Screener: scanning %d symbols (mode=%s)...", len(universe), mode)
 
-    # Parallel analysis (cap workers at 5 to avoid Yahoo Finance rate-limiting)
+    # Parallel analysis — 3 workers keeps Yahoo Finance from rate-limiting
     results_map: dict[str, dict] = {}
-    with ThreadPoolExecutor(max_workers=5) as executor:
+    with ThreadPoolExecutor(max_workers=3) as executor:
         futures = {executor.submit(_analyze_safe, sym): sym for sym in universe}
         for future in as_completed(futures):
             sym, result = future.result()
