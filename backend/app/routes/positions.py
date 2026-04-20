@@ -4,6 +4,7 @@ from sqlalchemy.orm import Session
 from ..database import get_db, get_setting
 from .. import alpaca_client as alp
 from ..sepa_analyzer import analyze
+import time
 
 router = APIRouter(prefix="/api/positions", tags=["positions"])
 
@@ -18,8 +19,8 @@ def positions(db: Session = Depends(get_db)):
 
     symbols = [p.symbol for p in raw]
 
-    # Scoped to current mode — DISTINCT ON returns most recent row per symbol
-    # for this mode, falling back to historical if not in current week.
+    # DISTINCT ON returns the most recent weekly_plan row per symbol —
+    # current week if it exists, otherwise falls back to the latest historical entry.
     plan_rows = db.execute(
         text("""
             SELECT DISTINCT ON (symbol)
@@ -128,7 +129,8 @@ def set_exit_levels(
 ):
     """
     Save stop_price and target1 to the current mode's weekly plan.
-    Exit guard places the OCO on the next monitor cycle.
+    The exit guard will detect the change on the next monitor cycle and
+    replace the existing OCO with the updated levels.
     """
     symbol = symbol.upper()
     mode   = get_setting(db, "trading_mode", "paper")
@@ -144,8 +146,11 @@ def place_exits_now(
     db: Session = Depends(get_db),
 ):
     """
-    Save levels to the current mode's weekly plan AND immediately place
-    a live OCO on Alpaca. Cancels orphaned standalone sell orders first.
+    Save levels to the current mode's weekly plan AND immediately replace
+    any existing exit orders on Alpaca with a fresh OCO at the new levels.
+
+    Cancels ALL open sell orders for the symbol first (including existing OCOs)
+    so Alpaca doesn't reject the new order as an oversell.
     """
     symbol = symbol.upper()
     mode   = get_setting(db, "trading_mode", "paper")
@@ -160,19 +165,22 @@ def place_exits_now(
 
     qty = float(pos.qty)
 
-    # Cancel orphaned standalone sell orders before placing OCO
+    # Cancel ALL open sell orders — including any existing OCO.
+    # Without this, Alpaca rejects the new OCO as an oversell.
     try:
-        open_orders = alp.get_open_orders_by_symbol(mode)
-        client      = alp.get_client(mode)
-        for o in open_orders.get(symbol, []):
-            side        = str(getattr(o, 'side', '') or '').lower()
-            order_class = str(getattr(o, 'order_class', '') or '').lower()
-            is_oco      = any(kw in order_class for kw in ('oco', 'bracket', 'oto'))
-            if 'sell' in side and not is_oco:
-                client.cancel_order_by_id(str(o.id))
-    except Exception:
+        cancelled = alp.cancel_symbol_exit_orders(symbol, mode)
+        if cancelled:
+            time.sleep(0.6)   # let Alpaca fully process cancellations
+    except Exception as exc:
+        # Non-fatal — attempt the new OCO anyway
         pass
 
     alp.place_oca_exit(symbol, qty, stop, target, mode)
-    return {"status": "ok", "symbol": symbol, "qty": qty,
-            "stop": stop, "target": target, "mode": mode}
+    return {
+        "status": "ok",
+        "symbol": symbol,
+        "qty":    qty,
+        "stop":   stop,
+        "target": target,
+        "mode":   mode,
+    }
