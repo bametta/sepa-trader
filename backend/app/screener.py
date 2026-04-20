@@ -174,13 +174,25 @@ def run_screener(db: Session, mode: str = None) -> list[dict]:
     _save_plan(db, plan_rows, week_start.isoformat(), mode)
 
     # Update watchlist so the hourly monitor targets these stocks during the week
-    watchlist_csv = ",".join(r["symbol"] for r in plan_rows)
+    top_symbols   = [r["symbol"] for r in plan_rows]
+    watchlist_csv = ",".join(top_symbols)
     set_setting(db, "watchlist", watchlist_csv)
+
+    # Sync to TradingView weekly_picks watchlist if credentials are set
+    tv_user = get_setting(db, "tv_username", "")
+    tv_pass = get_setting(db, "tv_password", "")
+    if tv_user and tv_pass:
+        from .tradingview_client import update_weekly_picks
+        result = update_weekly_picks(tv_user, tv_pass, top_symbols)
+        if result["ok"]:
+            logger.info("TradingView weekly_picks watchlist %s.", result["action"])
+        else:
+            logger.warning("TradingView sync failed: %s", result["error"])
 
     logger.info(
         "Screener complete. Week of %s. Plan: %s",
         week_start,
-        [r["symbol"] for r in plan_rows],
+        top_symbols,
     )
     return plan_rows
 
