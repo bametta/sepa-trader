@@ -3,19 +3,15 @@ Sunday screener: scans a configurable universe of stocks using the Minervini
 8-point SEPA criteria, selects top 10 candidates, generates a weekly trading
 plan, and saves it to the weekly_plan table.
 
-Runs in parallel (10 workers) using the same analyze() function as the hourly
-monitor for consistency.
+Uses TradingView's scanner API — all symbols fetched in one batch request.
 """
 import logging
-import random
-import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, timedelta
 
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from .sepa_analyzer import analyze
+from .tv_analyzer import batch_analyze
 from .database import get_setting, set_setting
 
 logger = logging.getLogger(__name__)
@@ -61,23 +57,6 @@ def _next_monday() -> date:
     return today + timedelta(days=days_ahead)
 
 
-def _analyze_safe(symbol: str, retries: int = 2) -> tuple[str, dict]:
-    for attempt in range(retries + 1):
-        try:
-            time.sleep(random.uniform(0.3, 0.8))  # gentle throttle per request
-            result = analyze(symbol)
-            # INSUFFICIENT_DATA from an empty Yahoo response — worth retrying
-            if result.get("signal") == "INSUFFICIENT_DATA" and attempt < retries:
-                time.sleep(random.uniform(3, 6) * (attempt + 1))
-                continue
-            return symbol, result
-        except Exception as exc:
-            if attempt < retries:
-                time.sleep(random.uniform(3, 6) * (attempt + 1))
-                continue
-            logger.warning("screener: %s failed after %d attempts: %s", symbol, retries + 1, exc)
-            return symbol, {"signal": "ERROR", "score": 0, "price": None, "error": str(exc)}
-
 
 def _generate_rationale(symbol: str, result: dict) -> str:
     score  = result.get("score", 0)
@@ -121,15 +100,10 @@ def run_screener(db: Session, mode: str = None) -> list[dict]:
         else DEFAULT_UNIVERSE
     )
 
-    logger.info("Screener: scanning %d symbols (mode=%s)...", len(universe), mode)
+    logger.info("Screener: scanning %d symbols via TradingView (mode=%s)...", len(universe), mode)
 
-    # Parallel analysis — 3 workers keeps Yahoo Finance from rate-limiting
-    results_map: dict[str, dict] = {}
-    with ThreadPoolExecutor(max_workers=3) as executor:
-        futures = {executor.submit(_analyze_safe, sym): sym for sym in universe}
-        for future in as_completed(futures):
-            sym, result = future.result()
-            results_map[sym] = result
+    # Single batch call — all symbols in one TradingView scanner request
+    results_map = batch_analyze(universe)
 
     # Build scored list (exclude errors and missing prices)
     all_scored = [
