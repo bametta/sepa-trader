@@ -28,16 +28,40 @@ _cookies: dict = {}
 
 def _refresh_session() -> tuple[str, dict]:
     """Establish a Yahoo Finance session and return (crumb, cookies)."""
-    with httpx.Client(headers=_COMMON_HEADERS, follow_redirects=True, timeout=15) as c:
-        c.get("https://finance.yahoo.com/")
-        r = c.get(
-            "https://query1.finance.yahoo.com/v1/test/getcrumb",
-            headers={**_COMMON_HEADERS, "Accept": "*/*"},
-        )
-        crumb = r.text.strip()
-        if not crumb or len(crumb) > 40 or "<" in crumb:
-            raise RuntimeError(f"Bad crumb response: {r.text[:100]}")
-        return crumb, dict(c.cookies)
+    client = httpx.Client(
+        headers=_COMMON_HEADERS,
+        follow_redirects=True,
+        timeout=15,
+    )
+    try:
+        # Seed the cookie jar with a ticker page — sets A1/A3 auth cookies
+        client.get("https://finance.yahoo.com/quote/SPY/")
+        time.sleep(0.8)  # let Yahoo set cookies before crumb call
+
+        # Try query2 first, fall back to query1
+        for host in ("query2", "query1"):
+            r = client.get(
+                f"https://{host}.finance.yahoo.com/v1/test/getcrumb",
+                headers={**_COMMON_HEADERS, "Accept": "*/*"},
+            )
+            crumb = r.text.strip()
+            if crumb and len(crumb) <= 40 and "<" not in crumb and "{" not in crumb:
+                logger.info("Crumb acquired via %s", host)
+                return crumb, dict(client.cookies)
+            logger.warning("Bad crumb from %s: %s", host, r.text[:80])
+
+        raise RuntimeError(f"Could not obtain valid crumb. Last response: {r.text[:120]}")
+    finally:
+        client.close()
+
+
+def _force_refresh():
+    """Clear stale session state and re-authenticate."""
+    global _crumb, _cookies
+    _crumb = None
+    _cookies = {}
+    _crumb, _cookies = _refresh_session()
+    logger.info("Yahoo Finance session refreshed (crumb: %s…)", _crumb[:6])
 
 
 def _ensure_session():
@@ -56,15 +80,27 @@ def _fetch_summary(symbol: str) -> dict:
     params = {"modules": _MODULES, "crumb": _crumb, "lang": "en-US", "region": "US"}
     headers = {**_COMMON_HEADERS, "Accept": "application/json"}
 
-    resp = httpx.get(url, params=params, headers=headers, cookies=_cookies,
-                     timeout=15, follow_redirects=True)
+    resp = httpx.get(
+        url,
+        params=params,
+        headers=headers,
+        cookies=_cookies,
+        timeout=15,
+        follow_redirects=True,
+    )
 
     if resp.status_code == 401:
         logger.info("Yahoo Finance session expired — refreshing.")
-        _crumb, _cookies = _refresh_session()
+        _force_refresh()
         params["crumb"] = _crumb
-        resp = httpx.get(url, params=params, headers=headers, cookies=_cookies,
-                         timeout=15, follow_redirects=True)
+        resp = httpx.get(
+            url,
+            params=params,
+            headers=headers,
+            cookies=_cookies,
+            timeout=15,
+            follow_redirects=True,
+        )
 
     resp.raise_for_status()
     qs = resp.json().get("quoteSummary", {})
