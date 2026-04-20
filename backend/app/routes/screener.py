@@ -37,8 +37,14 @@ def get_screener_status(db: Session = Depends(get_db)):
 
 
 @router.get("/dd")
-def get_weekly_dd(db: Session = Depends(get_db)):
-    """Fetch due-diligence data for every symbol in the current week's plan."""
+def get_weekly_dd(refresh: bool = False, db: Session = Depends(get_db)):
+    """
+    Return DD for the current week's plan.
+    Results are cached in dd_cache for 7 days to avoid rate limits.
+    Pass ?refresh=true to force a fresh fetch.
+    """
+    import json as _json
+
     rows = db.execute(
         text("""
             SELECT symbol FROM weekly_plan
@@ -49,8 +55,42 @@ def get_weekly_dd(db: Session = Depends(get_db)):
     symbols = [r[0] for r in rows]
     if not symbols:
         return []
+
+    cache_map: dict = {}
+    if not refresh:
+        cached = db.execute(
+            text("""
+                SELECT symbol, data FROM dd_cache
+                WHERE symbol = ANY(:syms)
+                  AND fetched_at > NOW() - INTERVAL '7 days'
+            """),
+            {"syms": symbols},
+        ).fetchall()
+        cache_map = {r[0]: _json.loads(r[1]) for r in cached}
+
+        if len(cache_map) == len(symbols):
+            return [cache_map[s] for s in symbols]
+
+    missing = [s for s in symbols if s not in cache_map]
     from ..dd_fetcher import fetch_dd_batch
-    return fetch_dd_batch(symbols)
+    fresh = fetch_dd_batch(missing)
+
+    for item in fresh:
+        if not item.get("error"):
+            db.execute(
+                text("""
+                    INSERT INTO dd_cache (symbol, data)
+                    VALUES (:sym, :data)
+                    ON CONFLICT (symbol) DO UPDATE
+                      SET data = EXCLUDED.data, fetched_at = NOW()
+                """),
+                {"sym": item["symbol"], "data": _json.dumps(item)},
+            )
+    db.commit()
+
+    fresh_map = {f["symbol"]: f for f in fresh}
+    return [cache_map.get(s) or fresh_map.get(s, {"symbol": s, "error": "not found"})
+            for s in symbols]
 
 
 @router.get("/history")

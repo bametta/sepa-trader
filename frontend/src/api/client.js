@@ -13,6 +13,7 @@ export const closePosition     = (sym) => api.delete(`/positions/${sym}`).then(r
 export const analyzeSymbol     = (sym) => api.get(`/signals/analyze/${sym}`).then(r => r.data)
 export const fetchWeeklyPlan    = () => api.get('/screener/weekly-plan').then(r => r.data)
 export const fetchWeeklyDD      = () => api.get('/screener/dd').then(r => r.data)
+export const forceRefreshDD     = () => api.get('/screener/dd?refresh=true').then(r => r.data)
 export const fetchScreenerStatus= () => api.get('/screener/status').then(r => r.data)
 export const runScreener        = () => api.post('/screener/run').then(r => r.data)
 export const syncTradingView    = () => api.post('/screener/sync-tradingview').then(r => r.data)

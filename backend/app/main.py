@@ -40,6 +40,13 @@ def _run_migrations():
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )
         """))
+        db.execute(text("""
+            CREATE TABLE IF NOT EXISTS dd_cache (
+                symbol     VARCHAR(10) PRIMARY KEY,
+                data       TEXT NOT NULL,
+                fetched_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+        """))
         # Seed new settings (idempotent)
         db.execute(text("""
             INSERT INTO settings (key, value) VALUES

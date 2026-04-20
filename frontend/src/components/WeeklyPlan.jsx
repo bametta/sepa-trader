@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef } from 'react'
 import { useQuery, useQueryClient } from 'react-query'
 import {
-  fetchWeeklyPlan, fetchWeeklyDD, fetchScreenerStatus,
+  fetchWeeklyPlan, fetchWeeklyDD, forceRefreshDD, fetchScreenerStatus,
   runScreener, syncTradingView, updatePlanStatus,
   fetchAnalyses, runAnalysis,
 } from '../api/client'
@@ -70,6 +70,11 @@ export default function WeeklyPlan() {
     { enabled: plan.length > 0, staleTime: 6 * 60 * 60 * 1000, refetchOnWindowFocus: false },
   )
   const ddMap = Object.fromEntries(ddList.map(d => [d.symbol, d]))
+
+  async function handleRefreshDD() {
+    await forceRefreshDD()      // fetches fresh data + updates server-side cache
+    qc.invalidateQueries(['weeklyDD', weekStart])  // re-fetch via normal cached route
+  }
 
   useEffect(() => {
     const prev = prevStatusRef.current
@@ -159,10 +164,10 @@ export default function WeeklyPlan() {
         <div className="flex gap-2">
           {plan.length > 0 && (
             <button
-              onClick={() => refetchDD()}
+              onClick={handleRefreshDD}
               disabled={ddLoading}
               className="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-700 hover:bg-slate-600 text-slate-200 disabled:opacity-40 transition-colors"
-              title="Refresh due-diligence data"
+              title="Force-fetch fresh DD from stockanalysis.com"
             >
               {ddLoading ? 'Loading DD…' : 'Refresh DD'}
             </button>
