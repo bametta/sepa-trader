@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { useQuery, useQueryClient } from 'react-query'
-import { fetchWeeklyPlan, runScreener, syncTradingView, updatePlanStatus } from '../api/client'
+import { fetchWeeklyPlan, fetchScreenerStatus, runScreener, syncTradingView, updatePlanStatus } from '../api/client'
 
 const SIGNAL_STYLE = {
   BREAKOUT:      'bg-emerald-500/20 text-emerald-300 border border-emerald-500/30',
@@ -25,6 +25,9 @@ export default function WeeklyPlan() {
 
   const { data: plan = [], isLoading, isError } = useQuery('weeklyPlan', fetchWeeklyPlan, {
     refetchInterval: 30000,
+  })
+  const { data: status } = useQuery('screenerStatus', fetchScreenerStatus, {
+    refetchInterval: 15000,
   })
 
   async function handleRunScreener() {
@@ -103,6 +106,18 @@ export default function WeeklyPlan() {
         </div>
       )}
 
+      {/* Last run summary */}
+      {!runMsg && status?.last_run_summary && (
+        <div className="bg-slate-800/50 border border-border rounded-xl px-4 py-2.5 text-xs text-slate-400">
+          <span className="text-slate-500">Last run: </span>{status.last_run_summary}
+          {status.last_run_at && (
+            <span className="text-slate-600 ml-2">
+              · {new Date(status.last_run_at).toLocaleString()}
+            </span>
+          )}
+        </div>
+      )}
+
       {isLoading ? (
         <div className="space-y-3">
           {[...Array(5)].map((_, i) => (
@@ -114,9 +129,15 @@ export default function WeeklyPlan() {
           Failed to load weekly plan — check backend logs.
         </div>
       ) : plan.length === 0 ? (
-        <div className="bg-card border border-border rounded-xl p-12 text-center text-slate-500">
-          <p className="mb-2">No weekly plan yet.</p>
-          <p className="text-xs">Click "Run Screener" to generate this week's top 10 candidates, or wait for the automatic Sunday 8 PM run.</p>
+        <div className="bg-card border border-border rounded-xl p-12 text-center text-slate-500 space-y-2">
+          <p className="font-medium">No qualifying stocks found.</p>
+          {status?.last_run_summary
+            ? <p className="text-xs">{status.last_run_summary}</p>
+            : <p className="text-xs">Click "Run Screener" to scan the universe. Runs automatically every Sunday at 8 PM ET.</p>
+          }
+          <p className="text-xs text-slate-600">
+            In a weak market fewer stocks meet Stage 2 criteria — the screener will lower its threshold automatically.
+          </p>
         </div>
       ) : (
         <div className="space-y-3">
