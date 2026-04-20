@@ -2,7 +2,6 @@ from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import (
     MarketOrderRequest,
     LimitOrderRequest,
-    StopOrderRequest,
     GetOrdersRequest,
     StopLossRequest,
     TakeProfitRequest,
@@ -52,7 +51,9 @@ def get_open_orders_by_symbol(mode: str = "paper") -> dict[str, list]:
 
 
 def get_all_orders(mode: str = "paper", limit: int = 100):
-    return get_client(mode).get_orders(GetOrdersRequest(status=QueryOrderStatus.ALL, limit=limit))
+    return get_client(mode).get_orders(
+        GetOrdersRequest(status=QueryOrderStatus.ALL, limit=limit)
+    )
 
 
 def get_clock(mode: str = "paper"):
@@ -115,38 +116,23 @@ def place_oca_exit(
     mode: str = "paper",
 ):
     """
-    Place stop-loss and take-profit SELL orders for an EXISTING open position.
-    Used by the exit guard in run_monitor() to repair positions that are missing
-    exit legs (e.g. bracket legs that expired due to the DAY TIF bug).
+    Place a single OCO (One-Cancels-Other) sell order for an existing position.
+    Creates a limit sell (take profit) and stop sell (stop loss) as linked legs.
+    When one fills, Alpaca automatically cancels the other.
 
-    Both orders are GTC and independent. When one fills, close_position() or
-    the monitor's check_post_close() will cancel the orphaned leg automatically.
-
-    Alpaca does not allow bracket legs to be attached post-entry, so this is
-    the correct approach for existing positions.
+    Using OCO instead of two independent orders avoids Alpaca rejecting the
+    second order for exceeding position size.
     """
-    client = get_client(mode)
-    qty    = round(qty, 0)
-
-    stop_req = StopOrderRequest(
+    req = LimitOrderRequest(
         symbol=symbol,
-        qty=qty,
-        side=OrderSide.SELL,
-        time_in_force=TimeInForce.GTC,
-        stop_price=round(stop_price, 2),
-    )
-
-    limit_req = LimitOrderRequest(
-        symbol=symbol,
-        qty=qty,
+        qty=round(qty, 0),
         side=OrderSide.SELL,
         time_in_force=TimeInForce.GTC,
         limit_price=round(target_price, 2),
+        order_class=OrderClass.OCO,
+        stop_loss=StopLossRequest(stop_price=round(stop_price, 2)),
     )
-
-    stop_order  = client.submit_order(stop_req)
-    limit_order = client.submit_order(limit_req)
-    return stop_order, limit_order
+    return get_client(mode).submit_order(req)
 
 
 def close_position(symbol: str, mode: str = "paper"):
