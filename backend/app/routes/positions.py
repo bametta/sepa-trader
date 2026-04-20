@@ -12,9 +12,39 @@ router = APIRouter(prefix="/api/positions", tags=["positions"])
 def positions(db: Session = Depends(get_db)):
     mode = get_setting(db, "trading_mode", "paper")
     raw  = alp.get_positions(mode)
-    out  = []
+
+    if not raw:
+        return []
+
+    symbols = [p.symbol for p in raw]
+
+    # DISTINCT ON returns the most recent weekly_plan row per symbol —
+    # current week if it exists, otherwise falls back to the latest historical entry.
+    plan_rows = db.execute(
+        text("""
+            SELECT DISTINCT ON (symbol)
+                symbol, stop_price, target1, target2, week_start
+            FROM weekly_plan
+            WHERE symbol = ANY(:syms)
+            ORDER BY symbol, week_start DESC
+        """),
+        {"syms": symbols},
+    ).fetchall()
+
+    plan_map = {
+        r[0]: {
+            "stop_price": float(r[1]) if r[1] else None,
+            "target1":    float(r[2]) if r[2] else None,
+            "target2":    float(r[3]) if r[3] else None,
+            "plan_week":  str(r[4])   if r[4] else None,
+        }
+        for r in plan_rows
+    }
+
+    out = []
     for p in raw:
         signal_data = analyze(p.symbol)
+        plan        = plan_map.get(p.symbol, {})
         out.append({
             "symbol":          p.symbol,
             "qty":             float(p.qty),
@@ -29,6 +59,10 @@ def positions(db: Session = Depends(get_db)):
             "ema50":           signal_data.get("ema50"),
             "week52_high":     signal_data.get("week52_high"),
             "week52_low":      signal_data.get("week52_low"),
+            "stop_price":      plan.get("stop_price"),
+            "target1":         plan.get("target1"),
+            "target2":         plan.get("target2"),
+            "plan_week":       plan.get("plan_week"),
         })
     return out
 
@@ -48,13 +82,12 @@ def set_exit_levels(
     db: Session = Depends(get_db),
 ):
     """
-    Set or update stop_price and target1 for a symbol in the current week's plan.
-    If the symbol has no weekly_plan row yet, inserts one marked EXECUTED so the
-    exit guard can pick it up on the next monitor cycle.
+    Save stop_price and target1 to the current week's plan.
+    Inserts a stub row if no row exists for this symbol this week.
+    Exit guard will place the OCO on the next monitor cycle.
     """
     symbol = symbol.upper()
 
-    # Check if row exists
     existing = db.execute(
         text("""
             SELECT id FROM weekly_plan
@@ -75,16 +108,13 @@ def set_exit_levels(
             {"stop": stop, "target": target, "sym": symbol},
         )
     else:
-        # Position exists in Alpaca but not in weekly_plan — insert a stub row
         db.execute(
             text("""
                 INSERT INTO weekly_plan
                     (week_start, symbol, rank, score, entry_price, stop_price, target1, status, mode)
                 VALUES (
                     (SELECT COALESCE(MAX(week_start), CURRENT_DATE) FROM weekly_plan),
-                    :sym, 99, 0,
-                    (SELECT avg_entry_price FROM positions WHERE symbol = :sym LIMIT 1),
-                    :stop, :target, 'EXECUTED',
+                    :sym, 99, 0, 0, :stop, :target, 'EXECUTED',
                     (SELECT value FROM settings WHERE key = 'trading_mode' LIMIT 1)
                 )
             """),
@@ -93,3 +123,78 @@ def set_exit_levels(
 
     db.commit()
     return {"status": "ok", "symbol": symbol, "stop": stop, "target": target}
+
+
+@router.post("/{symbol}/place-exits")
+def place_exits_now(
+    symbol: str,
+    stop: float,
+    target: float,
+    db: Session = Depends(get_db),
+):
+    """
+    Save levels to weekly_plan AND immediately place a live OCO on Alpaca.
+    Cancels any orphaned standalone sell orders first.
+    Used by the 'Place Now' path in PositionCard.
+    """
+    symbol = symbol.upper()
+    mode   = get_setting(db, "trading_mode", "paper")
+
+    # Persist levels so exit guard stays in sync
+    existing = db.execute(
+        text("""
+            SELECT id FROM weekly_plan
+            WHERE symbol = :sym
+              AND week_start = (SELECT MAX(week_start) FROM weekly_plan)
+        """),
+        {"sym": symbol},
+    ).fetchone()
+
+    if existing:
+        db.execute(
+            text("""
+                UPDATE weekly_plan
+                SET stop_price = :stop, target1 = :target
+                WHERE symbol = :sym
+                  AND week_start = (SELECT MAX(week_start) FROM weekly_plan)
+            """),
+            {"stop": stop, "target": target, "sym": symbol},
+        )
+    else:
+        db.execute(
+            text("""
+                INSERT INTO weekly_plan
+                    (week_start, symbol, rank, score, entry_price, stop_price, target1, status, mode)
+                VALUES (
+                    (SELECT COALESCE(MAX(week_start), CURRENT_DATE) FROM weekly_plan),
+                    :sym, 99, 0, 0, :stop, :target, 'EXECUTED',
+                    (SELECT value FROM settings WHERE key = 'trading_mode' LIMIT 1)
+                )
+            """),
+            {"sym": symbol, "stop": stop, "target": target},
+        )
+    db.commit()
+
+    # Confirm position is still open
+    positions = alp.get_positions(mode)
+    pos = next((p for p in positions if p.symbol == symbol), None)
+    if not pos:
+        return {"status": "error", "detail": f"No open position found for {symbol}"}
+
+    qty = float(pos.qty)
+
+    # Cancel orphaned standalone sell orders before placing OCO
+    try:
+        open_orders = alp.get_open_orders_by_symbol(mode)
+        client      = alp.get_client(mode)
+        for o in open_orders.get(symbol, []):
+            side        = str(getattr(o, 'side', '') or '').lower()
+            order_class = str(getattr(o, 'order_class', '') or '').lower()
+            is_oco      = any(kw in order_class for kw in ('oco', 'bracket', 'oto'))
+            if 'sell' in side and not is_oco:
+                client.cancel_order_by_id(str(o.id))
+    except Exception:
+        pass
+
+    alp.place_oca_exit(symbol, qty, stop, target, mode)
+    return {"status": "ok", "symbol": symbol, "qty": qty, "stop": stop, "target": target}
