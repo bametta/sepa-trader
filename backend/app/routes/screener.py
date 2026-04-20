@@ -1,14 +1,17 @@
+import traceback
+import logging
+
 from fastapi import APIRouter, Depends, BackgroundTasks
 from sqlalchemy import text
 from sqlalchemy.orm import Session
-from ..database import get_db, SessionLocal
+from ..database import get_db, SessionLocal, get_setting, set_setting
 
+log = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/screener", tags=["screener"])
 
 
 @router.get("/weekly-plan")
 def get_weekly_plan(db: Session = Depends(get_db)):
-    """Return the most recent weekly plan (latest week_start)."""
     rows = db.execute(
         text("""
             SELECT week_start, symbol, rank, score, signal,
@@ -24,26 +27,17 @@ def get_weekly_plan(db: Session = Depends(get_db)):
 
 @router.get("/status")
 def get_screener_status(db: Session = Depends(get_db)):
-    """Return the last screener run summary."""
-    from ..database import get_setting
-    last_run = get_setting(db, "screener_last_run", "")
-    # Also return the most recent alert_log entry from screener
-    row = db.execute(
-        text("""
-            SELECT message, created_at FROM alert_log
-            WHERE message LIKE 'Screener:%'
-            ORDER BY created_at DESC LIMIT 1
-        """)
-    ).fetchone()
+    """Return current screener state and last-run summary."""
     return {
-        "last_run_summary": last_run or (dict(row._mapping)["message"] if row else None),
-        "last_run_at": dict(row._mapping)["created_at"].isoformat() if row else None,
+        "status":          get_setting(db, "screener_status",   "idle"),
+        "error":           get_setting(db, "screener_error",    ""),
+        "last_run_summary":get_setting(db, "screener_last_run", ""),
+        "count":           int(get_setting(db, "screener_count", "0") or "0"),
     }
 
 
 @router.get("/history")
 def get_plan_history(db: Session = Depends(get_db)):
-    """Return distinct week_start dates for the plan history dropdown."""
     rows = db.execute(
         text("SELECT DISTINCT week_start, COUNT(*) as cnt FROM weekly_plan GROUP BY week_start ORDER BY week_start DESC LIMIT 12")
     ).fetchall()
@@ -57,9 +51,7 @@ def get_plan_for_week(week_start: str, db: Session = Depends(get_db)):
             SELECT week_start, symbol, rank, score, signal,
                    entry_price, stop_price, target1, target2,
                    position_size, risk_amount, rationale, status, mode, created_at
-            FROM weekly_plan
-            WHERE week_start = :w
-            ORDER BY rank ASC
+            FROM weekly_plan WHERE week_start = :w ORDER BY rank ASC
         """),
         {"w": week_start},
     ).fetchall()
@@ -68,27 +60,35 @@ def get_plan_for_week(week_start: str, db: Session = Depends(get_db)):
 
 @router.post("/run")
 def trigger_screener(background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
-    """Trigger the screener immediately (runs in background)."""
+    """Start the screener in the background. Poll GET /status to track progress."""
+    set_setting(db, "screener_status", "running")
+    set_setting(db, "screener_error",  "")
+
     def _run():
         db2 = SessionLocal()
         try:
             from ..screener import run_screener
-            run_screener(db2)
+            results = run_screener(db2)
+            set_setting(db2, "screener_status", "done")
+            set_setting(db2, "screener_count",  str(len(results)))
         except Exception as exc:
-            import logging
-            logging.getLogger(__name__).error("Screener run failed: %s", exc)
+            err_msg = f"{exc}\n{traceback.format_exc()}"
+            log.error("Screener background task failed:\n%s", err_msg)
+            db3 = SessionLocal()
+            try:
+                set_setting(db3, "screener_status", "error")
+                set_setting(db3, "screener_error",  str(exc)[:500])
+            finally:
+                db3.close()
         finally:
             db2.close()
 
     background_tasks.add_task(_run)
-    return {"status": "screener_started", "message": "Screener running in background. Check /weekly-plan in ~2 minutes."}
+    return {"status": "running"}
 
 
 @router.post("/sync-tradingview")
 def sync_tradingview(background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
-    """Push the current weekly plan symbols to TradingView weekly_picks watchlist."""
-    from ..database import get_setting
-
     tv_user = get_setting(db, "tv_username", "")
     tv_pass = get_setting(db, "tv_password", "")
     if not tv_user or not tv_pass:
@@ -109,25 +109,19 @@ def sync_tradingview(background_tasks: BackgroundTasks, db: Session = Depends(ge
 
     def _sync():
         from ..tradingview_client import update_weekly_picks
-        import logging
-        log = logging.getLogger(__name__)
         result = update_weekly_picks(tv_user, tv_pass, symbols)
         if result["ok"]:
-            log.info("Manual TV sync: weekly_picks %s (%d symbols).", result["action"], result["count"])
+            log.info("TV sync: weekly_picks %s (%d symbols).", result["action"], result["count"])
         else:
-            log.error("Manual TV sync failed: %s", result["error"])
+            log.error("TV sync failed: %s", result["error"])
 
     background_tasks.add_task(_sync)
-    return {
-        "status": "sync_started",
-        "symbols": symbols,
-        "message": f"Syncing {len(symbols)} symbols to TradingView weekly_picks watchlist.",
-    }
+    return {"status": "sync_started", "symbols": symbols,
+            "message": f"Syncing {len(symbols)} symbols to TradingView weekly_picks."}
 
 
 @router.patch("/weekly-plan/{symbol}/status")
 def update_plan_status(symbol: str, body: dict, db: Session = Depends(get_db)):
-    """Mark a plan entry as EXECUTED, SKIPPED, etc."""
     status = body.get("status", "PENDING")
     if status not in ("PENDING", "EXECUTED", "PARTIAL", "SKIPPED"):
         from fastapi import HTTPException
