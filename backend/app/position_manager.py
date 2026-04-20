@@ -43,7 +43,7 @@ def run_monday_open(db: Session):
 
     rows = db.execute(
         text("""
-            SELECT symbol, entry_price, stop_price
+            SELECT symbol, entry_price, stop_price, target1
             FROM weekly_plan
             WHERE week_start = (SELECT MAX(week_start) FROM weekly_plan)
               AND status = 'PENDING'
@@ -69,7 +69,11 @@ def run_monday_open(db: Session):
     held = {p.symbol for p in positions}
 
     for row in rows:
-        sym, entry, stop = row[0], float(row[1] or 0), float(row[2] or 0)
+        sym    = row[0]
+        entry  = float(row[1] or 0)
+        stop   = float(row[2] or 0)
+        target = float(row[3] or 0)
+
         if sym in held or entry <= 0:
             continue
 
@@ -79,7 +83,20 @@ def run_monday_open(db: Session):
             continue
 
         try:
-            alp.place_market_buy(sym, qty, mode)
+            if stop > 0 and target > 0:
+                alp.place_bracket_buy(sym, qty, stop, target, mode)
+                logger.info(
+                    "Monday open: bracket buy %s qty=%.0f entry=~$%.2f stop=$%.2f target=$%.2f",
+                    sym, qty, entry, stop, target,
+                )
+            else:
+                # Fallback: no stop/target in plan — plain market buy
+                alp.place_market_buy(sym, qty, mode)
+                logger.info(
+                    "Monday open: market buy %s qty=%.0f @ ~$%.2f (no bracket — missing stop/target)",
+                    sym, qty, entry,
+                )
+
             db.execute(
                 text("""
                     UPDATE weekly_plan SET status = 'EXECUTED'
@@ -89,12 +106,15 @@ def run_monday_open(db: Session):
                 {"sym": sym},
             )
             db.execute(
-                text("INSERT INTO trade_log (symbol, action, qty, price, trigger, mode) VALUES (:s,'BUY',:q,:p,'MONDAY_OPEN',:m)"),
+                text("""
+                    INSERT INTO trade_log (symbol, action, qty, price, trigger, mode)
+                    VALUES (:s, 'BUY', :q, :p, 'MONDAY_OPEN', :m)
+                """),
                 {"s": sym, "q": qty, "p": entry, "m": mode},
             )
             db.commit()
             held.add(sym)
-            logger.info("Monday open: bought %s qty=%.0f @ ~$%.2f", sym, qty, entry)
+
         except Exception as exc:
             logger.error("Monday open: buy failed for %s: %s", sym, exc)
 
@@ -161,19 +181,25 @@ def _run_claude_analysis(db: Session, closed_sym: str, mode: str):
         picks = [dict(r._mapping) for r in picks_rows]
 
         entry_row = db.execute(
-            text("SELECT price FROM trade_log WHERE symbol=:s AND action='BUY' ORDER BY created_at DESC LIMIT 1"),
+            text("""
+                SELECT price FROM trade_log
+                WHERE symbol = :s AND action = 'BUY'
+                ORDER BY created_at DESC
+                LIMIT 1
+            """),
             {"s": closed_sym},
         ).fetchone()
 
         closed_ctx = {
-            "symbol": closed_sym,
+            "symbol":      closed_sym,
             "entry_price": float(entry_row[0]) if entry_row else None,
-            "reason": "position closed (stop hit or target reached)",
+            "reason":      "position closed (stop hit or target reached)",
         }
 
         analysis = analyze_picks(db, picks, closed_position=closed_ctx)
         log_analysis(db, "post_close", closed_sym, analysis, mode)
         logger.info("Claude analysis saved for post-close of %s.", closed_sym)
+
     except Exception as exc:
         logger.warning("Claude analysis failed for %s: %s", closed_sym, exc)
 
@@ -181,7 +207,7 @@ def _run_claude_analysis(db: Session, closed_sym: str, mode: str):
 def _execute_next_pick(db: Session, mode: str, held: set):
     row = db.execute(
         text("""
-            SELECT symbol, entry_price, stop_price
+            SELECT symbol, entry_price, stop_price, target1
             FROM weekly_plan
             WHERE week_start = (SELECT MAX(week_start) FROM weekly_plan)
               AND status = 'PENDING'
@@ -194,7 +220,11 @@ def _execute_next_pick(db: Session, mode: str, held: set):
         logger.info("Post-close: no PENDING picks left.")
         return
 
-    sym, entry, stop = row[0], float(row[1] or 0), float(row[2] or 0)
+    sym    = row[0]
+    entry  = float(row[1] or 0)
+    stop   = float(row[2] or 0)
+    target = float(row[3] or 0)
+
     if sym in held or entry <= 0:
         return
 
@@ -212,7 +242,19 @@ def _execute_next_pick(db: Session, mode: str, held: set):
         return
 
     try:
-        alp.place_market_buy(sym, qty, mode)
+        if stop > 0 and target > 0:
+            alp.place_bracket_buy(sym, qty, stop, target, mode)
+            logger.info(
+                "Post-close auto-buy: bracket %s qty=%.0f stop=$%.2f target=$%.2f",
+                sym, qty, stop, target,
+            )
+        else:
+            alp.place_market_buy(sym, qty, mode)
+            logger.info(
+                "Post-close auto-buy: market %s qty=%.0f (no bracket — missing stop/target)",
+                sym, qty,
+            )
+
         db.execute(
             text("""
                 UPDATE weekly_plan SET status = 'EXECUTED'
@@ -222,10 +264,13 @@ def _execute_next_pick(db: Session, mode: str, held: set):
             {"sym": sym},
         )
         db.execute(
-            text("INSERT INTO trade_log (symbol, action, qty, price, trigger, mode) VALUES (:s,'BUY',:q,:p,'POST_CLOSE',:m)"),
+            text("""
+                INSERT INTO trade_log (symbol, action, qty, price, trigger, mode)
+                VALUES (:s, 'BUY', :q, :p, 'POST_CLOSE', :m)
+            """),
             {"s": sym, "q": qty, "p": entry, "m": mode},
         )
         db.commit()
-        logger.info("Post-close auto-buy: %s qty=%.0f", sym, qty)
+
     except Exception as exc:
         logger.error("Post-close auto-buy failed for %s: %s", sym, exc)
