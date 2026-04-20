@@ -13,4 +13,5 @@ export const closePosition     = (sym) => api.delete(`/positions/${sym}`).then(r
 export const analyzeSymbol     = (sym) => api.get(`/signals/analyze/${sym}`).then(r => r.data)
 export const fetchWeeklyPlan   = () => api.get('/screener/weekly-plan').then(r => r.data)
 export const runScreener       = () => api.post('/screener/run').then(r => r.data)
+export const syncTradingView   = () => api.post('/screener/sync-tradingview').then(r => r.data)
 export const updatePlanStatus  = (symbol, status) => api.patch(`/screener/weekly-plan/${symbol}/status`, { status }).then(r => r.data)
