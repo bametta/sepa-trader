@@ -22,6 +22,25 @@ def get_weekly_plan(db: Session = Depends(get_db)):
     return [dict(r._mapping) for r in rows]
 
 
+@router.get("/status")
+def get_screener_status(db: Session = Depends(get_db)):
+    """Return the last screener run summary."""
+    from ..database import get_setting
+    last_run = get_setting(db, "screener_last_run", "")
+    # Also return the most recent alert_log entry from screener
+    row = db.execute(
+        text("""
+            SELECT message, created_at FROM alert_log
+            WHERE message LIKE 'Screener:%'
+            ORDER BY created_at DESC LIMIT 1
+        """)
+    ).fetchone()
+    return {
+        "last_run_summary": last_run or (dict(row._mapping)["message"] if row else None),
+        "last_run_at": dict(row._mapping)["created_at"].isoformat() if row else None,
+    }
+
+
 @router.get("/history")
 def get_plan_history(db: Session = Depends(get_db)):
     """Return distinct week_start dates for the plan history dropdown."""
