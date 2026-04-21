@@ -117,8 +117,11 @@ function Dashboard() {
                 ))}
               </div>
             ) : posError ? (
-              <div className="bg-card border border-red-500/30 rounded-xl p-12 text-center text-red-400 text-sm">
-                Failed to load positions — check backend logs.
+              <div className="bg-card border border-yellow-500/30 rounded-xl p-12 text-center text-sm">
+                {posError?.response?.data?.detail === 'alpaca_credentials_missing'
+                  ? <span className="text-yellow-300">No Alpaca credentials set — add them in <strong>Settings → Alpaca Credentials</strong>.</span>
+                  : <span className="text-red-400">Failed to load positions — check backend logs.</span>
+                }
               </div>
             ) : positions.length === 0 ? (
               <div className="bg-card border border-border rounded-xl p-12 text-center text-slate-500">

@@ -1,7 +1,8 @@
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import text
 from sqlalchemy.orm import Session
-from ..database import get_db, get_current_user, get_user_setting
+from ..database import get_db, get_current_user, get_all_user_settings
+from ..config import settings as global_settings
 from .. import alpaca_client as alp
 from ..sepa_analyzer import analyze
 import logging
@@ -11,10 +12,26 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/positions", tags=["positions"])
 
 
+def _resolve_alpaca_client(user_settings: dict, mode: str):
+    if mode == "paper":
+        key    = user_settings.get("alpaca_paper_key")    or global_settings.alpaca_paper_key
+        secret = user_settings.get("alpaca_paper_secret") or global_settings.alpaca_paper_secret
+        paper  = True
+    else:
+        key    = user_settings.get("alpaca_live_key")    or global_settings.alpaca_live_key
+        secret = user_settings.get("alpaca_live_secret") or global_settings.alpaca_live_secret
+        paper  = False
+    if not key or not secret:
+        raise HTTPException(status_code=400, detail="alpaca_credentials_missing")
+    return alp.get_client_for_keys(key, secret, paper)
+
+
 @router.get("")
 def positions(current_user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
-    mode = get_user_setting(db, "trading_mode", "paper", current_user["id"])
-    raw  = alp.get_positions(mode)
+    user_settings = get_all_user_settings(db, current_user["id"])
+    mode   = user_settings.get("trading_mode", "paper")
+    client = _resolve_alpaca_client(user_settings, mode)
+    raw    = client.get_all_positions()
 
     if not raw:
         return []
@@ -72,8 +89,10 @@ def positions(current_user: dict = Depends(get_current_user), db: Session = Depe
 
 @router.delete("/{symbol}")
 def close(symbol: str, current_user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
-    mode = get_user_setting(db, "trading_mode", "paper", current_user["id"])
-    alp.close_position(symbol.upper(), mode)
+    user_settings = get_all_user_settings(db, current_user["id"])
+    mode   = user_settings.get("trading_mode", "paper")
+    client = _resolve_alpaca_client(user_settings, mode)
+    client.close_position(symbol.upper())
     return {"status": "closed", "symbol": symbol.upper()}
 
 
@@ -132,8 +151,9 @@ def set_exit_levels(
     Save stop/target to the plan. Exit guard detects the change on
     the next monitor cycle and replaces the OCO automatically.
     """
-    symbol = symbol.upper()
-    mode   = get_user_setting(db, "trading_mode", "paper", current_user["id"])
+    symbol        = symbol.upper()
+    user_settings = get_all_user_settings(db, current_user["id"])
+    mode          = user_settings.get("trading_mode", "paper")
     _upsert_plan_exits(db, symbol, stop, target, mode)
     return {"status": "ok", "symbol": symbol, "stop": stop, "target": target, "mode": mode}
 
@@ -156,14 +176,16 @@ def place_exits_now(
       3. Poll until Alpaca confirms orders are fully cancelled
       4. Place fresh OCO
     """
-    symbol = symbol.upper()
-    mode   = get_user_setting(db, "trading_mode", "paper", current_user["id"])
+    symbol        = symbol.upper()
+    user_settings = get_all_user_settings(db, current_user["id"])
+    mode          = user_settings.get("trading_mode", "paper")
+    client        = _resolve_alpaca_client(user_settings, mode)
 
     # Step 1 — persist to plan
     _upsert_plan_exits(db, symbol, stop, target, mode)
 
     # Step 2 — confirm position is still open
-    positions = alp.get_positions(mode)
+    positions = client.get_all_positions()
     pos = next((p for p in positions if p.symbol == symbol), None)
     if not pos:
         raise HTTPException(
@@ -173,8 +195,20 @@ def place_exits_now(
 
     qty = float(pos.qty)
 
-    # Step 3 — cancel all existing sell orders
-    cancelled = alp.cancel_symbol_exit_orders(symbol, mode)
+    # Step 3 — cancel all existing sell orders using the user's client
+    from alpaca.trading.requests import GetOrdersRequest
+    from alpaca.trading.enums import QueryOrderStatus
+    import time as _time
+
+    open_orders = client.get_orders(GetOrdersRequest(status=QueryOrderStatus.OPEN))
+    cancelled = []
+    for o in open_orders:
+        if o.symbol == symbol and 'sell' in str(getattr(o, 'side', '') or '').lower():
+            try:
+                client.cancel_order_by_id(str(o.id))
+                cancelled.append(str(o.id))
+            except Exception as exc:
+                logger.warning("Could not cancel order %s for %s: %s", o.id, symbol, exc)
     logger.info(
         "place_exits_now: cancelled %d sell order(s) for %s [%s]",
         len(cancelled), symbol, mode,
@@ -182,7 +216,16 @@ def place_exits_now(
 
     if cancelled:
         # Step 4 — poll until Alpaca confirms orders are gone
-        cleared = alp.wait_for_orders_cancelled(symbol, mode, timeout=15.0, poll_interval=0.5)
+        elapsed, timeout = 0.0, 15.0
+        cleared = False
+        while elapsed < timeout:
+            remaining = client.get_orders(GetOrdersRequest(status=QueryOrderStatus.OPEN))
+            sell_open = [o for o in remaining if o.symbol == symbol and 'sell' in str(getattr(o, 'side', '') or '').lower()]
+            if not sell_open:
+                cleared = True
+                break
+            _time.sleep(0.5)
+            elapsed += 0.5
         if not cleared:
             raise HTTPException(
                 status_code=503,
@@ -192,9 +235,21 @@ def place_exits_now(
                 ),
             )
 
-    # Step 5 — place fresh OCO
+    # Step 5 — place fresh OCO using the user's client
     try:
-        alp.place_oca_exit(symbol, qty, stop, target, mode)
+        from alpaca.trading.requests import LimitOrderRequest, StopLossRequest, TakeProfitRequest
+        from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass
+        oco_req = LimitOrderRequest(
+            symbol=symbol,
+            qty=round(qty, 0),
+            side=OrderSide.SELL,
+            time_in_force=TimeInForce.GTC,
+            limit_price=round(target, 2),
+            order_class=OrderClass.OCO,
+            stop_loss=StopLossRequest(stop_price=round(stop, 2)),
+            take_profit=TakeProfitRequest(limit_price=round(target, 2)),
+        )
+        client.submit_order(oco_req)
         logger.info(
             "place_exits_now: placed OCO for %s qty=%.0f stop=$%.2f target=$%.2f [%s]",
             symbol, qty, stop, target, mode,

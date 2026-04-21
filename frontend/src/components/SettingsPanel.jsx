@@ -51,6 +51,15 @@ const SECTIONS = [
     ],
   },
   {
+    title: 'Alpaca Credentials',
+    fields: [
+      { key: 'alpaca_paper_key',    label: 'Paper API Key',    type: 'password', span: true },
+      { key: 'alpaca_paper_secret', label: 'Paper API Secret', type: 'password', span: true },
+      { key: 'alpaca_live_key',     label: 'Live API Key',     type: 'password', span: true },
+      { key: 'alpaca_live_secret',  label: 'Live API Secret',  type: 'password', span: true },
+    ],
+  },
+  {
     title: 'AI Analysis (Claude)',
     fields: [
       { key: 'claude_api_key', label: 'Anthropic API Key', type: 'password', span: true },

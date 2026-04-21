@@ -17,6 +17,7 @@ _clients: dict[str, TradingClient] = {}
 
 
 def get_client(mode: str = "paper") -> TradingClient:
+    """Global client using .env credentials — used by scheduler/background jobs only."""
     if mode not in _clients:
         if mode == "paper":
             _clients[mode] = TradingClient(
@@ -31,6 +32,11 @@ def get_client(mode: str = "paper") -> TradingClient:
                 paper=False,
             )
     return _clients[mode]
+
+
+def get_client_for_keys(api_key: str, secret_key: str, paper: bool) -> TradingClient:
+    """Create a TradingClient from explicit credentials (per-user API requests)."""
+    return TradingClient(api_key=api_key, secret_key=secret_key, paper=paper)
 
 
 def get_account(mode: str = "paper"):

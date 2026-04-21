@@ -16,7 +16,7 @@ function fmt(n, sign=false) {
 }
 
 export default function AccountSummary({ onModeChange, refetchInterval = 5000 }) {
-  const { data, isLoading, isError, dataUpdatedAt } = useQuery(
+  const { data, isLoading, isError, error, dataUpdatedAt } = useQuery(
     'account',
     () => fetchAccount(),
     {
@@ -27,11 +27,20 @@ export default function AccountSummary({ onModeChange, refetchInterval = 5000 })
   )
 
   if (isLoading) return <div className="bg-card rounded-xl p-6 animate-pulse h-28" />
-  if (isError || !data) return (
-    <div className="bg-card border border-red-500/30 rounded-xl p-6 text-red-400 text-sm">
-      Unable to reach Alpaca API — check your credentials in <code>.env</code> and restart the backend.
-    </div>
-  )
+  if (isError || !data) {
+    const missing = error?.response?.data?.detail === 'alpaca_credentials_missing'
+    return (
+      <div className="bg-card border border-yellow-500/30 rounded-xl p-6 text-sm">
+        {missing ? (
+          <p className="text-yellow-300">
+            No Alpaca credentials configured. Go to <span className="font-semibold">Settings → Alpaca Credentials</span> to enter your paper or live API keys.
+          </p>
+        ) : (
+          <p className="text-red-400">Unable to reach Alpaca API — verify your credentials in Settings.</p>
+        )}
+      </div>
+    )
+  }
 
   const pnlColor = data.day_pnl >= 0 ? 'text-emerald-400' : 'text-red-400'
   const isPaper  = data.mode === 'paper'
