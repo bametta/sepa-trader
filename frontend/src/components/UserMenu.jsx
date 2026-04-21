@@ -20,13 +20,10 @@ export default function UserMenu() {
 
   async function handleChangePassword(e) {
     e.preventDefault()
-    setPwError('')
-    setPwOk(false)
+    setPwError(''); setPwOk(false)
     try {
       await changePassword(current, next)
-      setPwOk(true)
-      setCurrent('')
-      setNext('')
+      setPwOk(true); setCurrent(''); setNext('')
     } catch (err) {
       setPwError(err?.response?.data?.detail || 'Failed to change password')
     }
@@ -34,46 +31,60 @@ export default function UserMenu() {
 
   if (!user) return null
 
+  const initial = user.username[0].toUpperCase()
+
   return (
     <div className="relative" ref={ref}>
       <button
         onClick={() => setOpen(o => !o)}
-        className="flex items-center gap-2 bg-surface hover:bg-card border border-border rounded-lg px-3 py-1.5 text-sm transition-colors"
+        className="flex items-center gap-2 px-2 py-1.5 rounded-xl transition-all hover:bg-white/[0.04] border border-transparent hover:border-white/[0.06]"
       >
-        <span className="w-6 h-6 rounded-full bg-accent/20 text-accent flex items-center justify-center text-xs font-bold">
-          {user.username[0].toUpperCase()}
-        </span>
-        <span className="text-slate-300 hidden sm:block">{user.username}</span>
+        <div className="w-7 h-7 rounded-lg bg-gradient-to-br from-indigo-500 to-violet-600 flex items-center justify-center text-xs font-bold text-white shadow-glow-indigo">
+          {initial}
+        </div>
+        <span className="text-slate-300 text-sm hidden sm:block font-medium">{user.username}</span>
         {user.role === 'admin' && (
-          <span className="text-xs bg-accent/20 text-accent px-1.5 py-0.5 rounded-full hidden sm:block">admin</span>
+          <span className="hidden sm:block text-[10px] font-bold px-1.5 py-0.5 rounded-full bg-indigo-500/15 text-indigo-400 border border-indigo-500/25">
+            admin
+          </span>
         )}
+        <span className="text-slate-600 text-xs hidden sm:block">▾</span>
       </button>
 
       {open && (
-        <div className="absolute right-0 top-full mt-1 w-72 bg-card border border-border rounded-xl shadow-xl z-50 py-2">
-          <div className="px-4 py-2 border-b border-border">
-            <p className="text-sm text-slate-200 font-medium">{user.username}</p>
-            <p className="text-xs text-slate-500">{user.email}</p>
+        <div className="absolute right-0 top-full mt-2 w-72 card shadow-2xl z-50 py-2 animate-slide-up">
+          {/* User info */}
+          <div className="px-4 py-3 border-b border-white/5">
+            <div className="flex items-center gap-3">
+              <div className="w-9 h-9 rounded-xl bg-gradient-to-br from-indigo-500 to-violet-600 flex items-center justify-center text-sm font-bold text-white">
+                {initial}
+              </div>
+              <div>
+                <p className="text-sm font-semibold text-slate-200">{user.username}</p>
+                <p className="text-xs text-slate-500">{user.email}</p>
+              </div>
+            </div>
           </div>
 
           {/* Change password */}
-          <div className="px-4 py-3 border-b border-border">
+          <div className="px-4 py-3 border-b border-white/5">
             <button
               onClick={() => { setShowPw(s => !s); setPwError(''); setPwOk(false) }}
-              className="text-xs text-slate-400 hover:text-slate-200 transition-colors"
+              className="text-xs text-slate-500 hover:text-slate-300 transition-colors flex items-center gap-1.5"
             >
+              <span>{showPw ? '▲' : '▼'}</span>
               {showPw ? 'Hide' : 'Change password'}
             </button>
             {showPw && (
-              <form onSubmit={handleChangePassword} className="mt-2 space-y-2">
+              <form onSubmit={handleChangePassword} className="mt-3 space-y-2 animate-slide-up">
                 {pwError && <p className="text-xs text-red-400">{pwError}</p>}
-                {pwOk    && <p className="text-xs text-emerald-400">Password changed.</p>}
+                {pwOk    && <p className="text-xs text-emerald-400">Password updated successfully.</p>}
                 <input
                   type="password"
                   value={current}
                   onChange={e => setCurrent(e.target.value)}
                   placeholder="Current password"
-                  className="w-full bg-surface border border-border rounded px-2.5 py-1.5 text-xs text-slate-200 focus:outline-none focus:border-accent"
+                  className="w-full bg-white/[0.04] border border-white/[0.08] rounded-lg px-3 py-1.5 text-xs text-slate-200 outline-none focus:border-indigo-500/50"
                 />
                 <input
                   type="password"
@@ -81,24 +92,24 @@ export default function UserMenu() {
                   onChange={e => setNext(e.target.value)}
                   placeholder="New password (min 8 chars)"
                   minLength={8}
-                  className="w-full bg-surface border border-border rounded px-2.5 py-1.5 text-xs text-slate-200 focus:outline-none focus:border-accent"
+                  className="w-full bg-white/[0.04] border border-white/[0.08] rounded-lg px-3 py-1.5 text-xs text-slate-200 outline-none focus:border-indigo-500/50"
                 />
                 <button
                   type="submit"
                   disabled={!current || next.length < 8}
-                  className="text-xs bg-accent/10 text-accent hover:bg-accent/20 px-3 py-1.5 rounded font-medium disabled:opacity-50"
+                  className="btn-primary text-xs px-3 py-1.5"
                 >
-                  Update
+                  Update password
                 </button>
               </form>
             )}
           </div>
 
           {/* Logout */}
-          <div className="px-2 pt-1">
+          <div className="px-2 pt-1.5">
             <button
               onClick={logout}
-              className="w-full text-left text-sm text-red-400 hover:bg-red-500/10 px-2 py-2 rounded-lg transition-colors"
+              className="w-full text-left text-sm text-red-400/80 hover:text-red-400 hover:bg-red-500/8 px-3 py-2 rounded-xl transition-all"
             >
               Sign out
             </button>

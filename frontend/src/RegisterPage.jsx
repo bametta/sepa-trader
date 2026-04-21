@@ -25,81 +25,71 @@ export default function RegisterPage({ onGoLogin }) {
     }
   }
 
+  const fields = [
+    { label: 'Email',            key: 'email',    type: 'email',    value: email,    set: setEmail,    placeholder: 'you@example.com' },
+    { label: 'Username',         key: 'username', type: 'text',     value: username, set: setUsername, placeholder: 'tradername', min: 3 },
+    { label: 'Password',         key: 'password', type: 'password', value: password, set: setPassword, placeholder: 'Min. 8 characters' },
+    { label: 'Confirm Password', key: 'confirm',  type: 'password', value: confirm,  set: setConfirm,  placeholder: '••••••••' },
+  ]
+
   return (
-    <div className="min-h-screen bg-surface flex items-center justify-center px-4">
-      <div className="w-full max-w-sm bg-card border border-border rounded-2xl p-8 space-y-6">
-        <div className="text-center">
-          <h1 className="text-xl font-bold text-slate-100">SEPA Trader</h1>
-          <p className="text-slate-500 text-sm mt-1">Create an account</p>
+    <div className="min-h-screen bg-aurora flex items-center justify-center px-4">
+      <div className="fixed inset-0 overflow-hidden pointer-events-none">
+        <div className="absolute -top-40 -right-40 w-96 h-96 bg-violet-600/10 rounded-full blur-3xl" />
+        <div className="absolute -bottom-40 -left-40 w-96 h-96 bg-indigo-600/10 rounded-full blur-3xl" />
+      </div>
+
+      <div className="w-full max-w-sm animate-fade-in relative z-10">
+        <div className="text-center mb-8">
+          <div className="inline-flex items-center justify-center w-14 h-14 rounded-2xl bg-gradient-to-br from-indigo-500 to-violet-600 shadow-glow-indigo mb-4">
+            <span className="text-2xl">📈</span>
+          </div>
+          <h1 className="text-2xl font-bold text-slate-100 tracking-tight">Create Account</h1>
+          <p className="text-slate-500 text-sm mt-1">Join BAMETTA</p>
         </div>
 
-        {error && (
-          <div className="bg-red-500/10 border border-red-500/30 rounded-lg px-4 py-2.5 text-red-400 text-sm">
-            {error}
-          </div>
-        )}
+        <div className="card p-7 space-y-5">
+          {error && (
+            <div className="flex items-start gap-2.5 bg-red-500/10 border border-red-500/20 rounded-xl px-4 py-3">
+              <span className="text-red-400 mt-0.5 text-sm">⚠</span>
+              <p className="text-red-400 text-sm">{error}</p>
+            </div>
+          )}
 
-        <form onSubmit={handleSubmit} className="space-y-4">
-          <div className="space-y-1">
-            <label className="text-xs text-slate-400 font-medium">Email</label>
-            <input
-              type="email"
-              value={email}
-              onChange={e => setEmail(e.target.value)}
-              required
-              className="w-full bg-surface border border-border rounded-lg px-3 py-2 text-sm text-slate-200 focus:outline-none focus:border-accent"
-              placeholder="you@example.com"
-            />
-          </div>
-          <div className="space-y-1">
-            <label className="text-xs text-slate-400 font-medium">Username</label>
-            <input
-              type="text"
-              value={username}
-              onChange={e => setUsername(e.target.value)}
-              required
-              minLength={3}
-              className="w-full bg-surface border border-border rounded-lg px-3 py-2 text-sm text-slate-200 focus:outline-none focus:border-accent"
-              placeholder="tradername"
-            />
-          </div>
-          <div className="space-y-1">
-            <label className="text-xs text-slate-400 font-medium">Password</label>
-            <input
-              type="password"
-              value={password}
-              onChange={e => setPassword(e.target.value)}
-              required
-              className="w-full bg-surface border border-border rounded-lg px-3 py-2 text-sm text-slate-200 focus:outline-none focus:border-accent"
-              placeholder="Min. 8 characters"
-            />
-          </div>
-          <div className="space-y-1">
-            <label className="text-xs text-slate-400 font-medium">Confirm password</label>
-            <input
-              type="password"
-              value={confirm}
-              onChange={e => setConfirm(e.target.value)}
-              required
-              className="w-full bg-surface border border-border rounded-lg px-3 py-2 text-sm text-slate-200 focus:outline-none focus:border-accent"
-              placeholder="••••••••"
-            />
-          </div>
-          <button
-            type="submit"
-            disabled={loading}
-            className="w-full bg-accent hover:bg-accent/90 text-white font-medium text-sm py-2.5 rounded-lg transition-colors disabled:opacity-50"
-          >
-            {loading ? 'Creating account…' : 'Create account'}
-          </button>
-        </form>
+          <form onSubmit={handleSubmit} className="space-y-4">
+            {fields.map(f => (
+              <div key={f.key} className="space-y-1.5">
+                <label className="label block">{f.label}</label>
+                <input
+                  type={f.type}
+                  value={f.value}
+                  onChange={e => f.set(e.target.value)}
+                  required
+                  minLength={f.min}
+                  className="input"
+                  placeholder={f.placeholder}
+                />
+              </div>
+            ))}
+            <button type="submit" disabled={loading} className="btn-primary w-full mt-2">
+              {loading ? (
+                <span className="flex items-center justify-center gap-2">
+                  <span className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin" />
+                  Creating account…
+                </span>
+              ) : 'Create account'}
+            </button>
+          </form>
 
-        <p className="text-center text-slate-500 text-sm">
-          Already have an account?{' '}
-          <button onClick={onGoLogin} className="text-accent hover:underline">
-            Sign in
-          </button>
-        </p>
+          <div className="border-t border-white/5 pt-4 text-center">
+            <p className="text-slate-500 text-sm">
+              Already have an account?{' '}
+              <button onClick={onGoLogin} className="text-indigo-400 hover:text-indigo-300 font-medium transition-colors">
+                Sign in
+              </button>
+            </p>
+          </div>
+        </div>
       </div>
     </div>
   )

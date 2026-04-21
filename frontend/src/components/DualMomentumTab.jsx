@@ -1,14 +1,5 @@
 /**
- * Dual Momentum (GEM) Strategy Tab
- *
- * Sections:
- *   1. Market Environment card
- *   2. Momentum bars  (SPY / EFA / AGG / BIL)
- *   3. AI Decision card
- *   4. Current position card
- *   5. Action row: Run Signal + Execute + auto-execute toggle
- *   6. Signal history table
- *   7. Strategy settings accordion
+ * Dual Momentum (GEM) Strategy Tab — polished UI
  */
 import { useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
@@ -24,129 +15,190 @@ import {
 } from '../api/client'
 
 // ── tiny helpers ──────────────────────────────────────────────────────────────
-
-function pct(v) {
+function pct(v, alreadyPercent = false) {
   if (v == null || v === '') return '—'
-  const n = parseFloat(v)
-  return `${n >= 0 ? '+' : ''}${(n * 100).toFixed(2)}%`
+  const n = alreadyPercent ? parseFloat(v) : parseFloat(v) * 100
+  return `${n >= 0 ? '+' : ''}${n.toFixed(2)}%`
 }
-
-function fmt(v, decimals = 2) {
-  if (v == null) return '—'
-  return parseFloat(v).toFixed(decimals)
-}
-
-function currency(v) {
-  if (v == null) return '—'
-  return new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(v)
-}
+function fmt(v, d = 2) { return v != null ? parseFloat(v).toFixed(d) : '—' }
+function currency(v)   { return v != null ? new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(v) : '—' }
 
 // ── colour maps ───────────────────────────────────────────────────────────────
-
-const ENV_COLORS = {
-  BULL:           'text-emerald-400 bg-emerald-400/10 border-emerald-400/30',
-  BULL_VOLATILE:  'text-yellow-400  bg-yellow-400/10  border-yellow-400/30',
-  CORRECTION:     'text-orange-400  bg-orange-400/10  border-orange-400/30',
-  BEAR:           'text-red-400     bg-red-400/10     border-red-400/30',
-  TRANSITIONAL:   'text-sky-400     bg-sky-400/10     border-sky-400/30',
-  UNKNOWN:        'text-slate-400   bg-slate-400/10   border-slate-400/30',
+const ENV_CFG = {
+  BULL:          { label: 'Bull',          bg: 'bg-emerald-500/12', text: 'text-emerald-400', border: 'border-emerald-500/25', dot: 'bg-emerald-400', glow: 'shadow-[0_0_20px_rgba(16,185,129,0.12)]' },
+  BULL_VOLATILE: { label: 'Bull Volatile', bg: 'bg-amber-500/12',   text: 'text-amber-400',   border: 'border-amber-500/25',   dot: 'bg-amber-400',   glow: 'shadow-[0_0_20px_rgba(245,158,11,0.12)]' },
+  CORRECTION:    { label: 'Correction',    bg: 'bg-orange-500/12',  text: 'text-orange-400',  border: 'border-orange-500/25',  dot: 'bg-orange-400',  glow: '' },
+  BEAR:          { label: 'Bear',          bg: 'bg-red-500/12',     text: 'text-red-400',     border: 'border-red-500/25',     dot: 'bg-red-400',     glow: 'shadow-[0_0_20px_rgba(239,68,68,0.10)]' },
+  TRANSITIONAL:  { label: 'Transitional',  bg: 'bg-sky-500/12',    text: 'text-sky-400',     border: 'border-sky-500/25',     dot: 'bg-sky-400',     glow: '' },
+  UNKNOWN:       { label: 'Unknown',       bg: 'bg-slate-500/12',   text: 'text-slate-400',   border: 'border-slate-500/25',   dot: 'bg-slate-500',   glow: '' },
 }
 
-const DECISION_COLORS = {
-  EXECUTE: 'text-emerald-400 bg-emerald-400/10 border-emerald-400/30',
-  HOLD:    'text-yellow-400  bg-yellow-400/10  border-yellow-400/30',
-  WAIT:    'text-slate-400   bg-slate-700/40   border-slate-600/30',
+const DECISION_CFG = {
+  EXECUTE: { label: 'Execute', bg: 'bg-emerald-500/8', border: 'border-emerald-500/20', text: 'text-emerald-400', glow: 'shadow-[0_0_30px_rgba(16,185,129,0.12)]' },
+  HOLD:    { label: 'Hold',    bg: 'bg-amber-500/8',   border: 'border-amber-500/20',   text: 'text-amber-400',   glow: '' },
+  WAIT:    { label: 'Wait',    bg: 'bg-white/[0.02]',  border: 'border-white/[0.06]',   text: 'text-slate-400',   glow: '' },
 }
 
-const RISK_COLORS = {
-  LOW:    'text-emerald-400 bg-emerald-400/10',
-  MEDIUM: 'text-yellow-400  bg-yellow-400/10',
-  HIGH:   'text-red-400     bg-red-400/10',
-}
-
-// ── sub-components ────────────────────────────────────────────────────────────
-
+// ── shared bits ───────────────────────────────────────────────────────────────
 function Skeleton({ className = 'h-4 w-24' }) {
-  return <div className={`${className} bg-slate-700 rounded animate-pulse`} />
+  return <div className={`${className} bg-white/5 rounded-lg animate-pulse`} />
 }
 
-function Badge({ label, colorClass }) {
+function SectionTitle({ children, action }) {
   return (
-    <span className={`inline-block px-2.5 py-0.5 rounded-full text-xs font-semibold border ${colorClass}`}>
-      {label}
+    <div className="flex items-center justify-between mb-4">
+      <h3 className="label">{children}</h3>
+      {action}
+    </div>
+  )
+}
+
+function EnvBadge({ env }) {
+  const c = ENV_CFG[env] || ENV_CFG.UNKNOWN
+  return (
+    <span className={`inline-flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wide px-2.5 py-1 rounded-lg border ${c.bg} ${c.text} ${c.border}`}>
+      <span className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${c.dot}`} />
+      {c.label}
     </span>
   )
 }
 
+// ── Market Environment ────────────────────────────────────────────────────────
 function MarketEnvCard({ env, loading }) {
-  if (loading) {
-    return (
-      <div className="bg-card border border-border rounded-xl p-5 space-y-3">
-        <Skeleton className="h-5 w-36" />
-        <div className="grid grid-cols-2 gap-3">
-          {[...Array(4)].map((_, i) => <Skeleton key={i} className="h-4 w-full" />)}
-        </div>
+  if (loading) return (
+    <div className="card p-5">
+      <Skeleton className="h-4 w-32 mb-5" />
+      <div className="grid grid-cols-2 gap-3">
+        {[...Array(4)].map((_, i) => <Skeleton key={i} className="h-14 w-full" />)}
       </div>
-    )
-  }
+    </div>
+  )
   if (!env) return null
 
-  const colorClass = ENV_COLORS[env.environment] || ENV_COLORS.UNKNOWN
+  const c          = ENV_CFG[env.environment] || ENV_CFG.UNKNOWN
+  const vixColor   = env.vix > 30 ? 'text-red-400' : env.vix > 20 ? 'text-amber-400' : 'text-emerald-400'
+  const spy20Color = env.spy_20d_return >= 0 ? 'text-emerald-400' : 'text-red-400'
 
   return (
-    <div className="bg-card border border-border rounded-xl p-5 space-y-4">
-      <div className="flex items-center justify-between">
-        <h3 className="text-sm font-semibold text-slate-300 uppercase tracking-wide">Market Environment</h3>
-        <Badge label={env.environment} colorClass={colorClass} />
+    <div className={`card p-5 ${c.glow}`}>
+      <SectionTitle>
+        <span>Market Environment</span>
+      </SectionTitle>
+
+      <div className="flex items-center justify-between mb-4">
+        <EnvBadge env={env.environment} />
+        <span className="text-xs text-slate-500 italic max-w-[200px] text-right leading-tight">{env.description}</span>
       </div>
-      <p className="text-xs text-slate-500 italic">{env.description}</p>
-      <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 text-center">
-        <Stat label="SPY Price" value={`$${fmt(env.spy_price)}`} />
-        <Stat label="200-day SMA" value={`$${fmt(env.spy_200sma)}`} />
-        <Stat label="SPY 20d Return" value={`${fmt(env.spy_20d_return)}%`}
-              color={env.spy_20d_return >= 0 ? 'text-emerald-400' : 'text-red-400'} />
-        <Stat label="VIX" value={fmt(env.vix)}
-              color={env.vix > 30 ? 'text-red-400' : env.vix > 20 ? 'text-yellow-400' : 'text-emerald-400'} />
+
+      <div className="grid grid-cols-2 gap-2.5">
+        <div className="stat-card">
+          <div className="label mb-1">SPY Price</div>
+          <div className="text-sm font-bold text-slate-100 num">${fmt(env.spy_price)}</div>
+          <div className="text-[10px] text-slate-600 num mt-0.5">200SMA ${fmt(env.spy_200sma)}</div>
+        </div>
+        <div className="stat-card">
+          <div className="label mb-1">SPY vs 200SMA</div>
+          <div className={`text-sm font-bold ${env.spy_above_200 ? 'text-emerald-400' : 'text-red-400'}`}>
+            {env.spy_above_200 ? '▲ Above' : '▼ Below'}
+          </div>
+        </div>
+        <div className="stat-card">
+          <div className="label mb-1">SPY 20d Return</div>
+          <div className={`text-sm font-bold num ${spy20Color}`}>{pct(env.spy_20d_return, true)}</div>
+        </div>
+        <div className="stat-card">
+          <div className="label mb-1">VIX</div>
+          <div className={`text-sm font-bold num ${vixColor}`}>{fmt(env.vix)}</div>
+          {env.vix > 30 && <div className="text-[10px] text-red-400/70 mt-0.5">Elevated volatility</div>}
+        </div>
       </div>
     </div>
   )
 }
 
-function Stat({ label, value, color = 'text-slate-100' }) {
+// ── AI Decision ───────────────────────────────────────────────────────────────
+function AiDecisionCard({ signal, loading }) {
+  if (loading) return (
+    <div className="card p-5">
+      <Skeleton className="h-4 w-28 mb-4" />
+      <Skeleton className="h-10 w-48 mb-3" />
+      <Skeleton className="h-4 w-full" />
+      <Skeleton className="h-4 w-3/4 mt-2" />
+    </div>
+  )
+  if (!signal) return (
+    <div className="card p-5 flex flex-col items-center justify-center text-center gap-3 min-h-[180px]">
+      <span className="text-4xl opacity-20">⟳</span>
+      <p className="text-slate-500 text-sm">No signal yet</p>
+      <p className="text-slate-600 text-xs">Run an evaluation to generate the first signal</p>
+    </div>
+  )
+
+  const decision = signal.ai_verdict || 'WAIT'
+  const c        = DECISION_CFG[decision] || DECISION_CFG.WAIT
+
   return (
-    <div className="bg-surface rounded-lg p-3">
-      <p className="text-xs text-slate-500 mb-1">{label}</p>
-      <p className={`text-sm font-bold ${color}`}>{value}</p>
+    <div className={`card p-5 border ${c.border} ${c.bg} ${c.glow}`}>
+      <SectionTitle>AI Decision</SectionTitle>
+
+      <div className="flex items-end gap-4 mb-4">
+        <div className={`text-5xl font-black tracking-tight ${c.text}`}>{decision}</div>
+        {signal.recommended_symbol && (
+          <div className="pb-1">
+            <div className="text-2xl font-bold text-slate-100 num">{signal.recommended_symbol}</div>
+            <div className="text-xs text-slate-500 uppercase tracking-wide">{signal.mode || 'paper'} mode</div>
+          </div>
+        )}
+      </div>
+
+      {signal.ai_reasoning && (
+        <p className="text-sm text-slate-400 leading-relaxed italic mb-3">"{signal.ai_reasoning}"</p>
+      )}
+
+      <div className="flex items-center gap-3 flex-wrap">
+        {signal.created_at && (
+          <span className="text-xs text-slate-600">
+            {new Date(signal.created_at).toLocaleDateString()} {new Date(signal.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+          </span>
+        )}
+        {signal.executed && (
+          <span className="inline-flex items-center gap-1 text-[10px] font-semibold px-2 py-0.5 rounded-full bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
+            ✓ Executed
+          </span>
+        )}
+      </div>
     </div>
   )
 }
+
+// ── Momentum bars ─────────────────────────────────────────────────────────────
+const ASSET_LABELS = { SPY: 'US Equities (SPY)', EFA: 'Intl Equities (EFA)', AGG: 'Agg Bonds (AGG)', BIL: 'T-Bills (BIL)' }
 
 function MomentumBars({ momentum }) {
   if (!momentum) return null
-
-  const order = ['SPY', 'EFA', 'AGG', 'BIL']
-  const labels = { SPY: 'US Equities (SPY)', EFA: 'Intl Equities (EFA)', AGG: 'Bonds (AGG)', BIL: 'T-Bills (BIL)' }
-  const values = order.map(k => ({ key: k, label: labels[k], val: momentum[k] ?? 0 }))
-
-  const max = Math.max(...values.map(v => Math.abs(v.val)), 0.01)
+  const assets = ['SPY', 'EFA', 'AGG', 'BIL']
+  const values = assets.map(k => ({ key: k, val: momentum[k] ?? 0 }))
+  const max    = Math.max(...values.map(v => Math.abs(v.val)), 0.001)
 
   return (
-    <div className="bg-card border border-border rounded-xl p-5 space-y-4">
-      <h3 className="text-sm font-semibold text-slate-300 uppercase tracking-wide">12-Month Momentum</h3>
-      <div className="space-y-3">
-        {values.map(({ key, label, val }) => {
-          const barWidth = Math.round((Math.abs(val) / max) * 100)
-          const pos      = val >= 0
+    <div className="card p-5">
+      <SectionTitle>12-Month Momentum</SectionTitle>
+      <div className="space-y-4">
+        {values.map(({ key, val }) => {
+          const w   = Math.round((Math.abs(val) / max) * 100)
+          const pos = val >= 0
           return (
             <div key={key}>
-              <div className="flex justify-between text-xs text-slate-400 mb-1">
-                <span>{label}</span>
-                <span className={pos ? 'text-emerald-400' : 'text-red-400'}>{pct(val)}</span>
+              <div className="flex justify-between items-baseline mb-1.5">
+                <span className="text-xs text-slate-400 font-medium">{ASSET_LABELS[key]}</span>
+                <span className={`text-xs font-bold num ${pos ? 'text-emerald-400' : 'text-red-400'}`}>{pct(val)}</span>
               </div>
-              <div className="h-2 bg-slate-800 rounded-full overflow-hidden">
+              <div className="h-2 bg-white/[0.04] rounded-full overflow-hidden">
                 <div
-                  className={`h-full rounded-full transition-all duration-500 ${pos ? 'bg-emerald-500' : 'bg-red-500'}`}
-                  style={{ width: `${barWidth}%` }}
+                  className={`h-full rounded-full transition-all duration-700 ${
+                    pos ? 'bg-gradient-to-r from-emerald-600 to-emerald-400' : 'bg-gradient-to-r from-red-700 to-red-500'
+                  }`}
+                  style={{ width: `${w}%` }}
                 />
               </div>
             </div>
@@ -157,80 +209,34 @@ function MomentumBars({ momentum }) {
   )
 }
 
-function AiDecisionCard({ signal, loading }) {
-  if (loading) {
-    return (
-      <div className="bg-card border border-border rounded-xl p-5 space-y-3">
-        <Skeleton className="h-5 w-32" />
-        <Skeleton className="h-8 w-48" />
-        <Skeleton className="h-4 w-full" />
-      </div>
-    )
-  }
-  if (!signal) return null
-
-  const decision  = signal.ai_verdict || 'WAIT'
-  const reasoning = signal.ai_reasoning || signal.reasoning || '—'
-  const colorClass = DECISION_COLORS[decision] || DECISION_COLORS.WAIT
-
-  return (
-    <div className={`bg-card border rounded-xl p-5 space-y-4 ${colorClass.includes('emerald') ? 'border-emerald-500/30' : colorClass.includes('yellow') ? 'border-yellow-500/30' : 'border-border'}`}>
-      <div className="flex items-center justify-between">
-        <h3 className="text-sm font-semibold text-slate-300 uppercase tracking-wide">AI Decision</h3>
-        <div className="flex items-center gap-2">
-          <Badge label={signal.mode?.toUpperCase() || 'PAPER'} colorClass="text-slate-400 bg-slate-700/40 border-slate-600/30" />
-        </div>
-      </div>
-
-      <div className="flex items-center gap-4">
-        <span className={`text-3xl font-black ${colorClass.split(' ')[0]}`}>{decision}</span>
-        {signal.recommended_symbol && (
-          <span className="text-2xl font-bold text-slate-200">{signal.recommended_symbol}</span>
-        )}
-      </div>
-
-      <p className="text-xs text-slate-400 italic leading-relaxed">{reasoning}</p>
-
-      <div className="flex items-center gap-2 text-xs text-slate-500">
-        {signal.created_at && (
-          <span>Evaluated {new Date(signal.created_at).toLocaleString()}</span>
-        )}
-        {signal.executed && (
-          <Badge label="Executed" colorClass="text-emerald-400 bg-emerald-400/10 border-emerald-400/30" />
-        )}
-      </div>
+// ── Position list ─────────────────────────────────────────────────────────────
+function PositionsList({ positions, loading }) {
+  if (loading) return (
+    <div className="card p-5">
+      <Skeleton className="h-4 w-32 mb-4" />
+      <Skeleton className="h-16 w-full" />
     </div>
   )
-}
-
-function PositionsList({ positions, loading }) {
-  if (loading) {
-    return (
-      <div className="bg-card border border-border rounded-xl p-5">
-        <Skeleton className="h-5 w-32 mb-4" />
-        <Skeleton className="h-16 w-full" />
-      </div>
-    )
-  }
-
   return (
-    <div className="bg-card border border-border rounded-xl p-5 space-y-4">
-      <h3 className="text-sm font-semibold text-slate-300 uppercase tracking-wide">Current Position</h3>
+    <div className="card p-5">
+      <SectionTitle>Current Position</SectionTitle>
       {(!positions || positions.length === 0) ? (
-        <p className="text-sm text-slate-500 text-center py-4">No open positions in this strategy account.</p>
+        <div className="text-center py-6">
+          <p className="text-slate-600 text-sm">No open positions in this strategy account</p>
+        </div>
       ) : (
-        <div className="space-y-2">
+        <div className="space-y-2.5">
           {positions.map(p => (
-            <div key={p.symbol} className="flex items-center justify-between bg-surface rounded-lg px-4 py-3">
+            <div key={p.symbol} className="flex items-center justify-between stat-card">
               <div>
-                <span className="text-sm font-bold text-slate-100">{p.symbol}</span>
-                <span className="ml-2 text-xs text-slate-500">{p.qty} shares @ {currency(p.entry_price)}</span>
+                <div className="text-sm font-bold text-slate-100 num">{p.symbol}</div>
+                <div className="text-xs text-slate-500 num mt-0.5">{p.qty} sh @ {currency(p.entry_price)}</div>
               </div>
               <div className="text-right">
-                <p className="text-sm font-semibold text-slate-200">{currency(p.market_value)}</p>
-                <p className={`text-xs font-medium ${p.unrealized_pl >= 0 ? 'text-emerald-400' : 'text-red-400'}`}>
+                <div className="text-sm font-bold text-slate-100 num">{currency(p.market_value)}</div>
+                <div className={`text-xs font-medium num ${p.unrealized_pl >= 0 ? 'text-emerald-400' : 'text-red-400'}`}>
                   {p.unrealized_pl >= 0 ? '+' : ''}{currency(p.unrealized_pl)} ({fmt(p.unrealized_plpc)}%)
-                </p>
+                </div>
               </div>
             </div>
           ))}
@@ -240,63 +246,65 @@ function PositionsList({ positions, loading }) {
   )
 }
 
-function HistoryTable({ history }) {
-  if (!history || history.length === 0) {
-    return (
-      <div className="bg-card border border-border rounded-xl p-5">
-        <h3 className="text-sm font-semibold text-slate-300 uppercase tracking-wide mb-4">Signal History</h3>
-        <p className="text-sm text-slate-500 text-center py-4">No signals yet — run an evaluation.</p>
-      </div>
-    )
-  }
+// ── Signal history ────────────────────────────────────────────────────────────
+const VERDICT_COLORS = {
+  EXECUTE: 'bg-emerald-500/12 text-emerald-400 border-emerald-500/25',
+  HOLD:    'bg-amber-500/12   text-amber-400   border-amber-500/25',
+  WAIT:    'bg-slate-500/10   text-slate-500   border-slate-500/20',
+}
 
+function HistoryTable({ history }) {
   return (
-    <div className="bg-card border border-border rounded-xl p-5 space-y-4">
-      <h3 className="text-sm font-semibold text-slate-300 uppercase tracking-wide">Signal History</h3>
-      <div className="overflow-x-auto">
-        <table className="w-full text-xs">
-          <thead>
-            <tr className="text-slate-500 border-b border-border">
-              <th className="text-left pb-2 pr-4">Date</th>
-              <th className="text-left pb-2 pr-4">Symbol</th>
-              <th className="text-left pb-2 pr-4">AI Verdict</th>
-              <th className="text-left pb-2 pr-4">Mode</th>
-              <th className="text-left pb-2">Executed</th>
-            </tr>
-          </thead>
-          <tbody className="divide-y divide-border">
-            {history.map(row => (
-              <tr key={row.id} className="hover:bg-surface/50">
-                <td className="py-2 pr-4 text-slate-400">
-                  {new Date(row.created_at).toLocaleDateString()} {new Date(row.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
-                </td>
-                <td className="py-2 pr-4 font-bold text-slate-200">{row.recommended_symbol || '—'}</td>
-                <td className="py-2 pr-4">
-                  <Badge
-                    label={row.ai_verdict || 'WAIT'}
-                    colorClass={DECISION_COLORS[row.ai_verdict] || DECISION_COLORS.WAIT}
-                  />
-                </td>
-                <td className="py-2 pr-4 text-slate-400 uppercase">{row.mode}</td>
-                <td className="py-2">
-                  {row.executed
-                    ? <span className="text-emerald-400">✓</span>
-                    : <span className="text-slate-600">—</span>}
-                </td>
+    <div className="card p-5">
+      <SectionTitle>Signal History</SectionTitle>
+      {(!history || history.length === 0) ? (
+        <div className="text-center py-6">
+          <p className="text-slate-600 text-sm">No signals yet</p>
+        </div>
+      ) : (
+        <div className="overflow-x-auto -mx-1">
+          <table className="w-full text-xs">
+            <thead>
+              <tr>
+                {['Date', 'Symbol', 'AI Verdict', 'Mode', ''].map(h => (
+                  <th key={h} className="label text-left pb-3 pr-4 first:pl-1">{h}</th>
+                ))}
               </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
+            </thead>
+            <tbody>
+              {history.map((row, i) => (
+                <tr key={row.id} className={`border-t ${i === 0 ? 'border-white/5' : 'border-white/[0.03]'} hover:bg-white/[0.02] transition-colors`}>
+                  <td className="py-2.5 pr-4 pl-1 text-slate-500 num">
+                    {new Date(row.created_at).toLocaleDateString()} <span className="text-slate-700">{new Date(row.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
+                  </td>
+                  <td className="py-2.5 pr-4 font-bold text-slate-200 num">{row.recommended_symbol || '—'}</td>
+                  <td className="py-2.5 pr-4">
+                    <span className={`inline-block text-[10px] font-bold uppercase tracking-wide px-2 py-0.5 rounded-lg border ${VERDICT_COLORS[row.ai_verdict] || VERDICT_COLORS.WAIT}`}>
+                      {row.ai_verdict || 'WAIT'}
+                    </span>
+                  </td>
+                  <td className="py-2.5 pr-4 text-slate-600 uppercase">{row.mode}</td>
+                  <td className="py-2.5 text-center">
+                    {row.executed
+                      ? <span className="text-emerald-500 text-xs">✓</span>
+                      : <span className="text-slate-700 text-xs">—</span>
+                    }
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
     </div>
   )
 }
 
+// ── Settings accordion ────────────────────────────────────────────────────────
 function StrategySettings({ config, onSave, saving }) {
-  const [open, setOpen]           = useState(false)
-  const [form, setForm]           = useState(null)
+  const [open, setOpen] = useState(false)
+  const [form, setForm] = useState(null)
 
-  // Initialise form when config arrives
   if (config && !form) {
     setForm({
       trading_mode:        config.trading_mode        || 'paper',
@@ -310,44 +318,44 @@ function StrategySettings({ config, onSave, saving }) {
     })
   }
 
-  function set(key, val) { setForm(f => ({ ...f, [key]: val })) }
-
-  function handleSave() {
-    if (!form) return
-    const payload = { ...form, lookback_months: parseInt(form.lookback_months) || 12 }
-    onSave(payload)
-  }
+  const set = (k, v) => setForm(f => ({ ...f, [k]: v }))
+  const handleSave = () => form && onSave({ ...form, lookback_months: parseInt(form.lookback_months) || 12 })
 
   return (
-    <div className="bg-card border border-border rounded-xl overflow-hidden">
+    <div className="card overflow-hidden">
       <button
         onClick={() => setOpen(o => !o)}
-        className="w-full flex items-center justify-between px-5 py-4 text-sm font-semibold text-slate-300 hover:text-slate-100 transition-colors"
+        className="w-full flex items-center justify-between px-5 py-4 hover:bg-white/[0.02] transition-colors"
       >
-        <span className="uppercase tracking-wide">Strategy Settings</span>
-        <span className="text-slate-500 text-xs">{open ? '▲ collapse' : '▼ expand'}</span>
+        <span className="label">Strategy Settings</span>
+        <span className={`text-slate-600 text-xs transition-transform duration-200 ${open ? 'rotate-180' : ''}`}>▼</span>
       </button>
 
       {open && form && (
-        <div className="px-5 pb-5 space-y-5 border-t border-border pt-4">
-          {/* Toggle row */}
-          <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
-            <label className="flex items-center gap-3 cursor-pointer">
-              <input type="checkbox" className="w-4 h-4 rounded accent-blue-500"
-                checked={form.is_active} onChange={e => set('is_active', e.target.checked)} />
-              <span className="text-sm text-slate-300">Strategy Active</span>
-            </label>
-            <label className="flex items-center gap-3 cursor-pointer">
-              <input type="checkbox" className="w-4 h-4 rounded accent-blue-500"
-                checked={form.auto_execute} onChange={e => set('auto_execute', e.target.checked)} />
-              <span className="text-sm text-slate-300">Auto-Execute Signals</span>
-            </label>
+        <div className="px-5 pb-6 space-y-6 border-t border-white/5 pt-5 animate-slide-up">
+          {/* Toggles row */}
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-5">
+            {[
+              { label: 'Strategy Active', key: 'is_active' },
+              { label: 'Auto-Execute Signals', key: 'auto_execute' },
+            ].map(({ label, key }) => (
+              <label key={key} className="flex items-center gap-3 cursor-pointer group">
+                <div
+                  onClick={() => set(key, !form[key])}
+                  className={`relative w-10 h-5 rounded-full transition-all cursor-pointer flex-shrink-0 ${form[key] ? 'bg-indigo-500' : 'bg-white/10'}`}
+                >
+                  <div className={`absolute top-0.5 w-4 h-4 rounded-full bg-white shadow transition-all duration-200 ${form[key] ? 'left-5' : 'left-0.5'}`} />
+                </div>
+                <span className="text-sm text-slate-400 group-hover:text-slate-300 transition-colors">{label}</span>
+              </label>
+            ))}
+
             <div className="flex items-center gap-3">
-              <span className="text-sm text-slate-300 whitespace-nowrap">Trading Mode</span>
+              <label className="label whitespace-nowrap">Trading Mode</label>
               <select
-                className="bg-surface border border-border rounded-lg px-3 py-1.5 text-sm text-slate-200 flex-1"
                 value={form.trading_mode}
                 onChange={e => set('trading_mode', e.target.value)}
+                className="flex-1 bg-white/[0.04] border border-white/[0.08] rounded-lg px-3 py-1.5 text-sm text-slate-200 outline-none focus:border-indigo-500/50"
               >
                 <option value="paper">Paper</option>
                 <option value="live">Live</option>
@@ -356,21 +364,21 @@ function StrategySettings({ config, onSave, saving }) {
           </div>
 
           {/* Lookback */}
-          <div className="flex items-center gap-3">
-            <label className="text-sm text-slate-300 whitespace-nowrap">Lookback Months</label>
+          <div className="flex items-center gap-4">
+            <label className="label whitespace-nowrap">Lookback Months</label>
             <input
               type="number" min={1} max={24}
-              className="bg-surface border border-border rounded-lg px-3 py-1.5 text-sm text-slate-200 w-24"
               value={form.lookback_months}
               onChange={e => set('lookback_months', e.target.value)}
+              className="w-20 bg-white/[0.04] border border-white/[0.08] rounded-lg px-3 py-1.5 text-sm text-slate-200 outline-none focus:border-indigo-500/50 num text-center"
             />
-            <span className="text-xs text-slate-500">default: 12 (Antonacci GEM)</span>
+            <span className="text-xs text-slate-600">default: 12 (Antonacci GEM)</span>
           </div>
 
-          {/* Alpaca credentials */}
+          {/* Alpaca keys */}
           <div>
-            <p className="text-xs text-slate-500 mb-3">
-              Strategy-specific Alpaca keys — leave blank to use your account default keys.
+            <p className="text-xs text-slate-600 mb-3">
+              Strategy-specific Alpaca keys — leave blank to use your account defaults.
             </p>
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
               {[
@@ -380,10 +388,10 @@ function StrategySettings({ config, onSave, saving }) {
                 ['alpaca_live_secret',  'Live Secret'],
               ].map(([field, label]) => (
                 <div key={field}>
-                  <label className="text-xs text-slate-500 mb-1 block">{label}</label>
+                  <label className="label block mb-1.5">{label}</label>
                   <input
                     type="password"
-                    className="w-full bg-surface border border-border rounded-lg px-3 py-2 text-sm text-slate-200 font-mono"
+                    className="input font-mono text-xs"
                     placeholder="••••••••"
                     value={form[field]}
                     onChange={e => set(field, e.target.value)}
@@ -393,11 +401,7 @@ function StrategySettings({ config, onSave, saving }) {
             </div>
           </div>
 
-          <button
-            onClick={handleSave}
-            disabled={saving}
-            className="px-5 py-2 bg-accent hover:bg-accent/90 rounded-lg text-sm font-semibold text-white disabled:opacity-50 transition-colors"
-          >
+          <button onClick={handleSave} disabled={saving} className="btn-primary">
             {saving ? 'Saving…' : 'Save Settings'}
           </button>
         </div>
@@ -406,18 +410,17 @@ function StrategySettings({ config, onSave, saving }) {
   )
 }
 
-// ── main component ────────────────────────────────────────────────────────────
-
+// ── Main component ────────────────────────────────────────────────────────────
 export default function DualMomentumTab() {
   const qc = useQueryClient()
 
-  const { data: env,       isLoading: envLoading   } = useQuery('market-env',     fetchMarketEnvironment, { staleTime: 60_000 })
-  const { data: signal,    isLoading: sigLoading   } = useQuery('dm-signal',      fetchDMSignal,          { staleTime: 30_000 })
-  const { data: positions, isLoading: posLoading   } = useQuery('dm-position',    fetchDMPosition,        { staleTime: 10_000, retry: false })
-  const { data: history                            } = useQuery('dm-history',     fetchDMHistory,         { staleTime: 30_000 })
-  const { data: config,    isLoading: cfgLoading   } = useQuery('dm-config',      fetchDMConfig,          { staleTime: 60_000 })
+  const { data: env,       isLoading: envLoading } = useQuery('market-env',  fetchMarketEnvironment, { staleTime: 60_000 })
+  const { data: signal,    isLoading: sigLoading } = useQuery('dm-signal',   fetchDMSignal,          { staleTime: 30_000 })
+  const { data: positions, isLoading: posLoading } = useQuery('dm-position', fetchDMPosition,        { staleTime: 10_000, retry: false })
+  const { data: history                          } = useQuery('dm-history',  fetchDMHistory,         { staleTime: 30_000 })
+  const { data: config                           } = useQuery('dm-config',   fetchDMConfig,          { staleTime: 60_000 })
 
-  const [toast, setToast]     = useState(null)
+  const [toast,      setToast]      = useState(null)
   const [evalResult, setEvalResult] = useState(null)
 
   function showToast(msg, type = 'success') {
@@ -426,88 +429,79 @@ export default function DualMomentumTab() {
   }
 
   const { mutate: runEvaluate, isLoading: evaluating } = useMutation(evaluateDualMomentum, {
-    onSuccess: (data) => {
+    onSuccess: data => {
       setEvalResult(data)
       qc.invalidateQueries('dm-signal')
       qc.invalidateQueries('dm-history')
       showToast('Signal evaluated successfully')
     },
-    onError: (err) => {
-      showToast(err?.response?.data?.detail || 'Evaluation failed', 'error')
-    },
+    onError: err => showToast(err?.response?.data?.detail || 'Evaluation failed', 'error'),
   })
 
   const { mutate: runExecute, isLoading: executing } = useMutation(executeDualMomentum, {
-    onSuccess: (data) => {
+    onSuccess: data => {
       qc.invalidateQueries('dm-position')
       qc.invalidateQueries('dm-signal')
       qc.invalidateQueries('dm-history')
       showToast(`Executed: bought ${data.symbol} [${data.mode}]`)
     },
-    onError: (err) => {
-      showToast(err?.response?.data?.detail || 'Execution failed', 'error')
-    },
+    onError: err => showToast(err?.response?.data?.detail || 'Execution failed', 'error'),
   })
 
   const { mutate: saveConfig, isLoading: saving } = useMutation(updateDMConfig, {
-    onSuccess: () => {
-      qc.invalidateQueries('dm-config')
-      showToast('Settings saved')
-    },
-    onError: (err) => {
-      showToast(err?.response?.data?.detail || 'Save failed', 'error')
-    },
+    onSuccess: () => { qc.invalidateQueries('dm-config'); showToast('Settings saved') },
+    onError:   err => showToast(err?.response?.data?.detail || 'Save failed', 'error'),
   })
 
-  // Decide which signal data to display: latest eval result or last saved signal
   const displaySignal = evalResult
-    ? {
-        ai_verdict:         evalResult.ai_decision?.decision,
-        ai_reasoning:       evalResult.ai_decision?.reasoning,
-        recommended_symbol: evalResult.signal?.recommended_symbol,
-        mode:               config?.trading_mode || 'paper',
-      }
+    ? { ai_verdict: evalResult.ai_decision?.decision, ai_reasoning: evalResult.ai_decision?.reasoning, recommended_symbol: evalResult.signal?.recommended_symbol, mode: config?.trading_mode || 'paper' }
     : signal
 
   const momentum = evalResult?.signal?.momentum || signal?.data?.momentum
-  const envData  = evalResult?.market_env        || env
+  const envData  = evalResult?.market_env       || env
+  const gemReason = evalResult?.signal?.reasoning || signal?.data?.reasoning
 
   return (
-    <div className="space-y-5">
+    <div className="space-y-4 animate-fade-in">
 
       {/* Toast */}
       {toast && (
-        <div className={`fixed top-4 right-4 z-50 px-5 py-3 rounded-xl text-sm font-medium shadow-lg border transition-all
+        <div className={`fixed top-20 right-5 z-50 flex items-center gap-2.5 px-5 py-3 rounded-2xl text-sm font-medium shadow-2xl border animate-slide-up
           ${toast.type === 'error'
-            ? 'bg-red-950 border-red-500/30 text-red-300'
-            : 'bg-emerald-950 border-emerald-500/30 text-emerald-300'}`}
+            ? 'bg-red-950/90 backdrop-blur border-red-500/25 text-red-300'
+            : 'bg-emerald-950/90 backdrop-blur border-emerald-500/25 text-emerald-300'}`}
         >
+          <span>{toast.type === 'error' ? '⚠' : '✓'}</span>
           {toast.msg}
         </div>
       )}
 
-      {/* Header row */}
-      <div className="flex items-center justify-between">
+      {/* Header */}
+      <div className="flex items-center justify-between gap-4 flex-wrap">
         <div>
-          <h2 className="text-lg font-bold text-slate-100">Dual Momentum <span className="text-slate-500 font-normal text-sm">(GEM)</span></h2>
-          <p className="text-xs text-slate-500 mt-0.5">Gary Antonacci's Global Equity Momentum — SPY · EFA · AGG · BIL</p>
+          <h2 className="text-lg font-bold text-slate-100 tracking-tight">
+            Dual Momentum
+            <span className="ml-2 text-sm font-normal text-slate-600">GEM · Antonacci</span>
+          </h2>
+          <p className="text-xs text-slate-600 mt-0.5">SPY · EFA · AGG · BIL · 12-month momentum rotation</p>
         </div>
         <div className="flex items-center gap-2">
           <button
             onClick={() => runExecute()}
             disabled={executing || !signal}
-            className="px-4 py-2 rounded-lg text-sm font-semibold border border-emerald-500/40 text-emerald-400 hover:bg-emerald-500/10 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+            className="btn-ghost"
           >
-            {executing ? 'Executing…' : 'Execute Signal'}
+            {executing ? (
+              <span className="flex items-center gap-1.5">
+                <span className="w-3.5 h-3.5 border border-slate-400 border-t-transparent rounded-full animate-spin" />
+                Executing…
+              </span>
+            ) : 'Execute Signal'}
           </button>
-          <button
-            onClick={() => runEvaluate()}
-            disabled={evaluating}
-            className="px-4 py-2 rounded-lg text-sm font-semibold bg-accent hover:bg-accent/90 text-white disabled:opacity-50 transition-colors"
-          >
+          <button onClick={() => runEvaluate()} disabled={evaluating} className="btn-primary">
             {evaluating ? (
               <span className="flex items-center gap-2">
-                <span className="w-3.5 h-3.5 border border-white border-t-transparent rounded-full animate-spin" />
+                <span className="w-3.5 h-3.5 border-2 border-white/30 border-t-white rounded-full animate-spin" />
                 Running…
               </span>
             ) : 'Run Signal'}
@@ -515,30 +509,32 @@ export default function DualMomentumTab() {
         </div>
       </div>
 
-      {/* Quick regime + AI decision (top 2 cards) */}
+      {/* Top row: market env + AI decision */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
         <MarketEnvCard env={envData} loading={envLoading && !evalResult} />
         <AiDecisionCard signal={displaySignal} loading={sigLoading && !evalResult} />
       </div>
 
-      {/* Reasoning from latest GEM evaluation */}
-      {(evalResult?.signal?.reasoning || signal?.data?.reasoning) && (
-        <div className="bg-card border border-border rounded-xl p-5">
-          <h3 className="text-xs font-semibold text-slate-500 uppercase tracking-wide mb-2">GEM Signal Reasoning</h3>
-          <p className="text-sm text-slate-300 leading-relaxed">
-            {evalResult?.signal?.reasoning || signal?.data?.reasoning}
-          </p>
+      {/* GEM reasoning */}
+      {gemReason && (
+        <div className="card p-5 border-l-2 border-indigo-500/30">
+          <div className="label mb-2">GEM Signal Reasoning</div>
+          <p className="text-sm text-slate-300 leading-relaxed">{gemReason}</p>
         </div>
       )}
 
       {/* Momentum bars */}
       <MomentumBars momentum={momentum} />
 
-      {/* Position */}
-      <PositionsList positions={positions} loading={posLoading} />
-
-      {/* History */}
-      <HistoryTable history={history} />
+      {/* Position + history side by side on large screens */}
+      <div className="grid grid-cols-1 xl:grid-cols-5 gap-4">
+        <div className="xl:col-span-2">
+          <PositionsList positions={positions} loading={posLoading} />
+        </div>
+        <div className="xl:col-span-3">
+          <HistoryTable history={history} />
+        </div>
+      </div>
 
       {/* Settings */}
       <StrategySettings config={config} onSave={saveConfig} saving={saving} />

@@ -4,16 +4,13 @@ import { useQuery, useQueryClient } from 'react-query'
 import UserMenu from './UserMenu'
 
 export default function Navbar({ onModeChange }) {
-  const qc                = useQueryClient()
+  const qc                    = useQueryClient()
   const [running, setRunning] = useState(false)
   const [result,  setResult]  = useState(null)
 
-  // Pull mode from the already-cached account query — zero extra requests
-  const { data: account } = useQuery('account', () => fetchAccount(), {
-    refetchInterval: 30000,
-  })
-  const mode     = account?.mode ?? 'paper'
-  const isPaper  = mode === 'paper'
+  const { data: account } = useQuery('account', () => fetchAccount(), { refetchInterval: 30000 })
+  const mode    = account?.mode ?? 'paper'
+  const isPaper = mode === 'paper'
 
   async function handleRun() {
     setRunning(true)
@@ -40,76 +37,90 @@ export default function Navbar({ onModeChange }) {
     onModeChange && onModeChange(isPaper ? 'live' : 'paper')
   }
 
-  function resultBanner() {
+  function ResultBanner() {
     if (!result) return null
     if (result.status === 'market_closed')
       return (
-        <span className="text-xs text-yellow-400 bg-yellow-500/10 border border-yellow-500/20 px-3 py-1 rounded-lg">
-          Market closed — monitor will auto-run when open
-        </span>
+        <div className="flex items-center gap-2 text-xs text-amber-400 bg-amber-500/10 border border-amber-500/20 px-3 py-1.5 rounded-lg">
+          <span className="w-1.5 h-1.5 rounded-full bg-amber-400" />
+          Market closed
+        </div>
       )
     if (result.status === 'error')
       return (
-        <span className="text-xs text-red-400 bg-red-500/10 border border-red-500/20 px-3 py-1 rounded-lg">
+        <div className="flex items-center gap-2 text-xs text-red-400 bg-red-500/10 border border-red-500/20 px-3 py-1.5 rounded-lg">
+          <span>⚠</span>
           {result.error}
-        </span>
+        </div>
       )
     if (result.status === 'ok') {
       const lost = result.stage2_lost?.length  || 0
       const brk  = result.new_breakouts?.length || 0
-      const msg  = lost ? `${lost} Stage 2 lost` : brk ? `${brk} breakout(s) detected` : 'All positions healthy'
-      const color = lost ? 'red' : brk ? 'emerald' : 'green'
+      const msg  = lost ? `${lost} Stage 2 lost` : brk ? `${brk} breakout(s)` : 'All healthy'
+      const isGood = !lost
       return (
-        <span className={`text-xs text-${color}-400 bg-${color}-500/10 border border-${color}-500/20 px-3 py-1 rounded-lg`}>
-          {msg} — P&L {result.day_pnl >= 0 ? '+' : ''}${result.day_pnl?.toFixed(2)}
-        </span>
+        <div className={`flex items-center gap-2 text-xs px-3 py-1.5 rounded-lg border ${
+          isGood
+            ? 'text-emerald-400 bg-emerald-500/10 border-emerald-500/20'
+            : 'text-red-400 bg-red-500/10 border-red-500/20'
+        }`}>
+          <span className={`w-1.5 h-1.5 rounded-full ${isGood ? 'bg-emerald-400' : 'bg-red-400'}`} />
+          {msg} · {result.day_pnl >= 0 ? '+' : ''}${result.day_pnl?.toFixed(2)}
+        </div>
       )
     }
     return null
   }
 
   return (
-    <nav className="border-b border-border bg-card px-6 py-4 flex items-center justify-between">
-      {/* Left — logo + mode badge */}
-      <div className="flex items-center gap-4">
-        <div className="flex items-center gap-3">
-          <span className="text-2xl">📈</span>
-          <div>
-            <h1 className="text-lg font-bold text-slate-100 leading-none">SEPA Trader</h1>
-            <p className="text-xs text-slate-400">Minervini Stage 2 Monitor</p>
+    <nav className="sticky top-0 z-40 border-b border-white/[0.05] bg-[#080c14]/80 backdrop-blur-xl px-5 py-3">
+      <div className="max-w-7xl mx-auto flex items-center justify-between gap-4">
+
+        {/* Left — logo */}
+        <div className="flex items-center gap-4 min-w-0">
+          <div className="flex items-center gap-3">
+            <div className="w-8 h-8 rounded-xl bg-gradient-to-br from-indigo-500 to-violet-600 flex items-center justify-center flex-shrink-0 shadow-glow-indigo">
+              <span className="text-sm">📈</span>
+            </div>
+            <div className="hidden sm:block">
+              <span className="text-base font-bold tracking-tight bg-gradient-to-r from-indigo-400 to-violet-400 bg-clip-text text-transparent">BAMETTA</span>
+            </div>
           </div>
+
+          {/* Mode badge */}
+          <button
+            onClick={handleModeSwitch}
+            title={`${mode.toUpperCase()} mode — click to switch`}
+            className={`flex items-center gap-1.5 px-2.5 py-1 rounded-lg border text-xs font-bold transition-all ${
+              isPaper
+                ? 'bg-blue-500/10 text-blue-400 border-blue-500/25 hover:bg-blue-500/20'
+                : 'bg-orange-500/10 text-orange-400 border-orange-500/25 hover:bg-orange-500/20'
+            }`}
+          >
+            <span className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${
+              isPaper ? 'bg-blue-400' : 'bg-orange-400 animate-pulse'
+            }`} />
+            {isPaper ? 'PAPER' : '⚡ LIVE'}
+          </button>
         </div>
 
-        {/* Persistent mode indicator — always visible */}
-        <button
-          onClick={handleModeSwitch}
-          title={`Active: ${mode.toUpperCase()} — click to switch`}
-          className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg border text-xs font-bold transition-colors ${
-            isPaper
-              ? 'bg-blue-500/15 text-blue-400 border-blue-500/40 hover:bg-blue-500/25'
-              : 'bg-orange-500/15 text-orange-400 border-orange-500/40 hover:bg-orange-500/25 animate-pulse'
-          }`}
-        >
-          <span className={`w-1.5 h-1.5 rounded-full ${isPaper ? 'bg-blue-400' : 'bg-orange-400'}`} />
-          {isPaper ? 'PAPER' : '⚡ LIVE'}
-        </button>
-      </div>
-
-      {/* Right — result banner + run button + user menu */}
-      <div className="flex items-center gap-3">
-        {resultBanner()}
-        <button
-          onClick={handleRun}
-          disabled={running}
-          className={`px-4 py-2 disabled:opacity-50 text-white text-sm font-semibold rounded-lg transition-colors ${
-            isPaper
-              ? 'bg-accent hover:bg-indigo-500'
-              : 'bg-orange-600 hover:bg-orange-500'
-          }`}
-        >
-          {running ? 'Running…' : 'Run Monitor'}
-        </button>
-        <UserMenu />
+        {/* Right */}
+        <div className="flex items-center gap-2">
+          <ResultBanner />
+          <button
+            onClick={handleRun}
+            disabled={running}
+            className={`flex items-center gap-2 px-4 py-1.5 rounded-lg text-sm font-semibold transition-all disabled:opacity-50 ${
+              isPaper
+                ? 'bg-gradient-to-r from-indigo-500 to-violet-600 text-white shadow-glow-indigo hover:opacity-90'
+                : 'bg-gradient-to-r from-orange-500 to-amber-500 text-white hover:opacity-90'
+            }`}
+          >
+            {running && <span className="w-3.5 h-3.5 border-2 border-white/40 border-t-white rounded-full animate-spin" />}
+            {running ? 'Running…' : 'Run Monitor'}
+          </button>
+          <UserMenu />
+        </div>
       </div>
     </nav>
   )

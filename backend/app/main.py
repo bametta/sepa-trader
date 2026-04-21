@@ -217,7 +217,7 @@ async def lifespan(app: FastAPI):
     stop_scheduler()
 
 
-app = FastAPI(title="SEPA Trader", lifespan=lifespan)
+app = FastAPI(title="BAMETTA", lifespan=lifespan)
 
 _origins = getattr(settings, "allowed_origins", "").split(",") if getattr(settings, "allowed_origins", "") else [
     "http://localhost",

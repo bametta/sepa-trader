@@ -38,88 +38,110 @@ export default function LoginPage({ onGoRegister }) {
   }
 
   return (
-    <div className="min-h-screen bg-surface flex items-center justify-center px-4">
-      <div className="w-full max-w-sm bg-card border border-border rounded-2xl p-8 space-y-6">
-        <div className="text-center">
-          <h1 className="text-xl font-bold text-slate-100">SEPA Trader</h1>
-          <p className="text-slate-500 text-sm mt-1">{tempToken ? 'Two-factor authentication' : 'Sign in to your account'}</p>
+    <div className="min-h-screen bg-aurora flex items-center justify-center px-4">
+      {/* Decorative orbs */}
+      <div className="fixed inset-0 overflow-hidden pointer-events-none">
+        <div className="absolute -top-40 -left-40 w-96 h-96 bg-indigo-600/10 rounded-full blur-3xl" />
+        <div className="absolute -bottom-40 -right-40 w-96 h-96 bg-violet-600/10 rounded-full blur-3xl" />
+        <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[600px] h-[600px] bg-indigo-900/5 rounded-full blur-3xl" />
+      </div>
+
+      <div className="w-full max-w-sm animate-fade-in relative z-10">
+        {/* Logo */}
+        <div className="text-center mb-8">
+          <div className="inline-flex items-center justify-center w-14 h-14 rounded-2xl bg-gradient-to-br from-indigo-500 to-violet-600 shadow-glow-indigo mb-4">
+            <span className="text-2xl">📈</span>
+          </div>
+          <h1 className="text-2xl font-bold text-slate-100 tracking-tight">BAMETTA</h1>
+          <p className="text-slate-500 text-sm mt-1">
+            {tempToken ? 'Two-factor authentication' : 'Sign in to your account'}
+          </p>
         </div>
 
-        {error && (
-          <div className="bg-red-500/10 border border-red-500/30 rounded-lg px-4 py-2.5 text-red-400 text-sm">
-            {error}
-          </div>
-        )}
+        <div className="card p-7 space-y-5">
+          {error && (
+            <div className="flex items-start gap-2.5 bg-red-500/10 border border-red-500/20 rounded-xl px-4 py-3">
+              <span className="text-red-400 mt-0.5 text-sm">⚠</span>
+              <p className="text-red-400 text-sm">{error}</p>
+            </div>
+          )}
 
-        {!tempToken ? (
-          <form onSubmit={handleLogin} className="space-y-4">
-            <div className="space-y-1">
-              <label className="text-xs text-slate-400 font-medium">Email</label>
+          {!tempToken ? (
+            <form onSubmit={handleLogin} className="space-y-4">
+              <div className="space-y-1.5">
+                <label className="label block">Email</label>
+                <input
+                  type="email"
+                  value={email}
+                  onChange={e => setEmail(e.target.value)}
+                  required
+                  className="input"
+                  placeholder="you@example.com"
+                />
+              </div>
+              <div className="space-y-1.5">
+                <label className="label block">Password</label>
+                <input
+                  type="password"
+                  value={password}
+                  onChange={e => setPassword(e.target.value)}
+                  required
+                  className="input"
+                  placeholder="••••••••"
+                />
+              </div>
+              <button type="submit" disabled={loading} className="btn-primary w-full mt-2">
+                {loading ? (
+                  <span className="flex items-center justify-center gap-2">
+                    <span className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin" />
+                    Signing in…
+                  </span>
+                ) : 'Sign in'}
+              </button>
+            </form>
+          ) : (
+            <form onSubmit={handle2fa} className="space-y-4">
+              <div className="text-center">
+                <div className="inline-flex items-center justify-center w-10 h-10 rounded-xl bg-indigo-500/10 border border-indigo-500/20 mb-3">
+                  <span className="text-lg">🔐</span>
+                </div>
+                <p className="text-slate-400 text-sm">Enter the 6-digit code from your authenticator app.</p>
+              </div>
               <input
-                type="email"
-                value={email}
-                onChange={e => setEmail(e.target.value)}
+                type="text"
+                value={code}
+                onChange={e => setCode(e.target.value.replace(/\D/g, '').slice(0, 6))}
                 required
-                className="w-full bg-surface border border-border rounded-lg px-3 py-2 text-sm text-slate-200 focus:outline-none focus:border-accent"
-                placeholder="you@example.com"
+                autoFocus
+                className="input text-center tracking-[0.4em] text-lg font-mono"
+                placeholder="000 000"
+                maxLength={6}
               />
-            </div>
-            <div className="space-y-1">
-              <label className="text-xs text-slate-400 font-medium">Password</label>
-              <input
-                type="password"
-                value={password}
-                onChange={e => setPassword(e.target.value)}
-                required
-                className="w-full bg-surface border border-border rounded-lg px-3 py-2 text-sm text-slate-200 focus:outline-none focus:border-accent"
-                placeholder="••••••••"
-              />
-            </div>
-            <button
-              type="submit"
-              disabled={loading}
-              className="w-full bg-accent hover:bg-accent/90 text-white font-medium text-sm py-2.5 rounded-lg transition-colors disabled:opacity-50"
-            >
-              {loading ? 'Signing in…' : 'Sign in'}
-            </button>
-          </form>
-        ) : (
-          <form onSubmit={handle2fa} className="space-y-4">
-            <p className="text-slate-400 text-sm text-center">
-              Enter the 6-digit code from your authenticator app.
+              <button type="submit" disabled={loading || code.length !== 6} className="btn-primary w-full">
+                {loading ? 'Verifying…' : 'Verify Code'}
+              </button>
+              <button
+                type="button"
+                onClick={() => { setTempToken(null); setCode('') }}
+                className="w-full text-slate-500 hover:text-slate-300 text-sm transition-colors text-center"
+              >
+                ← Back to login
+              </button>
+            </form>
+          )}
+
+          <div className="border-t border-white/5 pt-4 text-center">
+            <p className="text-slate-500 text-sm">
+              No account?{' '}
+              <button onClick={onGoRegister} className="text-indigo-400 hover:text-indigo-300 font-medium transition-colors">
+                Create one
+              </button>
             </p>
-            <input
-              type="text"
-              value={code}
-              onChange={e => setCode(e.target.value.replace(/\D/g, '').slice(0, 6))}
-              required
-              autoFocus
-              className="w-full bg-surface border border-border rounded-lg px-3 py-2 text-sm text-slate-200 text-center tracking-widest focus:outline-none focus:border-accent"
-              placeholder="000000"
-              maxLength={6}
-            />
-            <button
-              type="submit"
-              disabled={loading || code.length !== 6}
-              className="w-full bg-accent hover:bg-accent/90 text-white font-medium text-sm py-2.5 rounded-lg transition-colors disabled:opacity-50"
-            >
-              {loading ? 'Verifying…' : 'Verify'}
-            </button>
-            <button
-              type="button"
-              onClick={() => { setTempToken(null); setCode('') }}
-              className="w-full text-slate-500 hover:text-slate-300 text-sm transition-colors"
-            >
-              Back to login
-            </button>
-          </form>
-        )}
+          </div>
+        </div>
 
-        <p className="text-center text-slate-500 text-sm">
-          No account?{' '}
-          <button onClick={onGoRegister} className="text-accent hover:underline">
-            Register
-          </button>
+        <p className="text-center text-slate-700 text-xs mt-6">
+          Stage 2 · Dual Momentum · AI-powered
         </p>
       </div>
     </div>
