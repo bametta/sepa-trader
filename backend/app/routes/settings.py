@@ -18,6 +18,8 @@ EDITABLE_KEYS = {
     "screener_auto_run", "screener_schedule_day", "screener_schedule_time",
     "tv_username", "tv_password",
     "claude_api_key", "claude_model",
+    "alpaca_paper_key", "alpaca_paper_secret",
+    "alpaca_live_key",  "alpaca_live_secret",
 }
 
 

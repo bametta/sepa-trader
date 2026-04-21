@@ -228,9 +228,10 @@ def sync_tradingview(
 @router.get("/analysis")
 def get_analyses(limit: int = 20, current_user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
     """Return recent Claude AI analyses for the active mode and user."""
-    mode = get_user_setting(db, "trading_mode", "paper", current_user["id"])
+    uid  = current_user["id"]
+    mode = get_user_setting(db, "trading_mode", "paper", uid)
     from ..claude_analyst import get_latest_analyses
-    return get_latest_analyses(db, limit=limit, mode=mode)
+    return get_latest_analyses(db, limit=limit, mode=mode, user_id=uid)
 
 
 @router.post("/analysis/run")
@@ -256,8 +257,8 @@ def trigger_analysis(current_user: dict = Depends(get_current_user), db: Session
         raise HTTPException(404, "No weekly plan found for current mode.")
     picks = [dict(r._mapping) for r in picks_rows]
     try:
-        analysis = analyze_picks(db, picks)
-        log_analysis(db, "manual", None, analysis, mode)
+        analysis = analyze_picks(db, picks, user_id=uid)
+        log_analysis(db, "manual", None, analysis, mode, user_id=uid)
         return {"analysis": analysis}
     except ValueError as exc:
         from fastapi import HTTPException

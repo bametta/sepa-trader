@@ -76,8 +76,14 @@ async def _screener_watchdog():
     db2 = SessionLocal()
     try:
         from .screener import run_screener
+        from sqlalchemy import text as _text
+        admin_row = db2.execute(
+            _text("SELECT id FROM users WHERE role = 'admin' ORDER BY id LIMIT 1")
+        ).fetchone()
+        admin_id = admin_row[0] if admin_row else None
+
         logger.info("Scheduled screener starting (%s ET)...", run_key)
-        plan = run_screener(db2)
+        plan = run_screener(db2, user_id=admin_id)
         set_setting(db2, "screener_status", "done")
         set_setting(db2, "screener_count",  str(len(plan)))
         logger.info("Scheduled screener done. %d stocks selected.", len(plan))

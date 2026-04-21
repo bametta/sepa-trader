@@ -22,8 +22,8 @@ def signal_history(
 ):
     """Signal history scoped to the active trading mode and user."""
     mode   = get_user_setting(db, "trading_mode", "paper", current_user["id"])
-    q      = "SELECT symbol, signal, score, price, mode, created_at FROM signal_log WHERE mode = :mode"
-    params = {"l": limit, "mode": mode}
+    q      = "SELECT symbol, signal, score, price, mode, created_at FROM signal_log WHERE mode = :mode AND user_id = :uid"
+    params = {"l": limit, "mode": mode, "uid": current_user["id"]}
     if symbol:
         q += " AND symbol = :sym"
         params["sym"] = symbol.upper()

@@ -5,7 +5,7 @@ weekly pick review + midweek slot-refill analysis.
 import logging
 from sqlalchemy import text
 from sqlalchemy.orm import Session
-from .database import get_setting
+from .database import get_setting, get_user_setting
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +30,7 @@ def pre_trade_analysis(
     cash: float,
     buying_power: float,
     mode: str,
+    user_id: int = None,
 ) -> dict:
     """
     Ask Claude to evaluate a proposed trade before it is placed.
@@ -46,7 +47,7 @@ def pre_trade_analysis(
         }
     Fails open — never silently blocks trading due to API errors.
     """
-    api_key = get_setting(db, "claude_api_key", "")
+    api_key = get_user_setting(db, "claude_api_key", "", user_id)
     if not api_key:
         logger.warning("pre_trade_analysis: no Claude API key — skipping gate, proceeding.")
         return {
@@ -57,7 +58,7 @@ def pre_trade_analysis(
             "analysis": "",
         }
 
-    model = get_setting(db, "claude_model", "claude-sonnet-4-5")
+    model = get_user_setting(db, "claude_model", "claude-sonnet-4-5", user_id)
 
     # Live accounts get graduated tier thresholds — paper always uses standard
     if mode == "live":
@@ -181,17 +182,19 @@ def log_pre_trade(
     reason: str,
     analysis: str,
     mode: str,
+    user_id: int = None,
 ):
     db.execute(
         text("""
-            INSERT INTO ai_analysis_log (trigger, symbol, analysis, mode)
-            VALUES (:trigger, :symbol, :analysis, :mode)
+            INSERT INTO ai_analysis_log (trigger, symbol, analysis, mode, user_id)
+            VALUES (:trigger, :symbol, :analysis, :mode, :uid)
         """),
         {
             "trigger":  f"pre_trade_{trigger.lower()}",
             "symbol":   symbol,
             "analysis": f"VERDICT: {verdict}\nREASON: {reason}\n\n{analysis}",
             "mode":     mode,
+            "uid":      user_id,
         },
     )
     db.commit()
@@ -211,6 +214,7 @@ def analyze_slot_refill(
     open_positions: list[str],
     pending_picks: list[dict],
     mode: str,
+    user_id: int = None,
 ) -> dict:
     """
     Midweek slot-refill analysis. Decides whether to open a replacement
@@ -225,7 +229,7 @@ def analyze_slot_refill(
             "analysis":    str,
         }
     """
-    api_key = get_setting(db, "claude_api_key", "")
+    api_key = get_user_setting(db, "claude_api_key", "", user_id)
     if not api_key:
         logger.warning("analyze_slot_refill: no Claude API key — defaulting to auto-execute.")
         return {
@@ -236,7 +240,7 @@ def analyze_slot_refill(
             "analysis":    "",
         }
 
-    model = get_setting(db, "claude_model", "claude-sonnet-4-5")
+    model = get_user_setting(db, "claude_model", "claude-sonnet-4-5", user_id)
 
     pnl     = None
     pnl_pct = None
@@ -357,12 +361,12 @@ def _parse_slot_refill_response(text: str, pending_picks: list[dict]) -> dict:
 
 # ── Post-close / weekly pick analysis ────────────────────────────────────────
 
-def analyze_picks(db: Session, picks: list[dict], closed_position: dict | None = None) -> str:
-    api_key = get_setting(db, "claude_api_key", "")
+def analyze_picks(db: Session, picks: list[dict], closed_position: dict | None = None, user_id: int = None) -> str:
+    api_key = get_user_setting(db, "claude_api_key", "", user_id)
     if not api_key:
         raise ValueError("Claude API key not configured in Settings.")
 
-    model = get_setting(db, "claude_model", "claude-sonnet-4-5")
+    model = get_user_setting(db, "claude_model", "claude-sonnet-4-5", user_id)
 
     parts = []
     if closed_position:
@@ -400,37 +404,35 @@ def analyze_picks(db: Session, picks: list[dict], closed_position: dict | None =
     return resp.content[0].text
 
 
-def log_analysis(db: Session, trigger: str, symbol: str | None, analysis_text: str, mode: str):
+def log_analysis(db: Session, trigger: str, symbol: str | None, analysis_text: str, mode: str, user_id: int = None):
     db.execute(
         text("""
-            INSERT INTO ai_analysis_log (trigger, symbol, analysis, mode)
-            VALUES (:trigger, :symbol, :analysis, :mode)
+            INSERT INTO ai_analysis_log (trigger, symbol, analysis, mode, user_id)
+            VALUES (:trigger, :symbol, :analysis, :mode, :uid)
         """),
-        {"trigger": trigger, "symbol": symbol, "analysis": analysis_text, "mode": mode},
+        {"trigger": trigger, "symbol": symbol, "analysis": analysis_text, "mode": mode, "uid": user_id},
     )
     db.commit()
 
 
-def get_latest_analyses(db: Session, limit: int = 20, mode: str | None = None) -> list[dict]:
+def get_latest_analyses(db: Session, limit: int = 20, mode: str | None = None, user_id: int = None) -> list[dict]:
+    filters = []
+    params: dict = {"l": limit}
     if mode:
-        rows = db.execute(
-            text("""
-                SELECT id, trigger, symbol, analysis, mode, created_at
-                FROM ai_analysis_log
-                WHERE mode = :mode
-                ORDER BY created_at DESC
-                LIMIT :l
-            """),
-            {"l": limit, "mode": mode},
-        ).fetchall()
-    else:
-        rows = db.execute(
-            text("""
-                SELECT id, trigger, symbol, analysis, mode, created_at
-                FROM ai_analysis_log
-                ORDER BY created_at DESC
-                LIMIT :l
-            """),
-            {"l": limit},
-        ).fetchall()
+        filters.append("mode = :mode")
+        params["mode"] = mode
+    if user_id:
+        filters.append("user_id = :uid")
+        params["uid"] = user_id
+    where = ("WHERE " + " AND ".join(filters)) if filters else ""
+    rows = db.execute(
+        text(f"""
+            SELECT id, trigger, symbol, analysis, mode, created_at
+            FROM ai_analysis_log
+            {where}
+            ORDER BY created_at DESC
+            LIMIT :l
+        """),
+        params,
+    ).fetchall()
     return [dict(r._mapping) for r in rows]

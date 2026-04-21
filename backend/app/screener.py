@@ -14,7 +14,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from .tv_analyzer import batch_analyze
-from .database import get_setting, set_setting
+from .database import get_setting, set_setting, get_user_setting, set_user_setting
 
 logger = logging.getLogger(__name__)
 
@@ -76,7 +76,7 @@ def _generate_rationale(symbol: str, result: dict) -> str:
     return " ".join(parts)
 
 
-def run_screener(db: Session, mode: str = None) -> list[dict]:
+def run_screener(db: Session, mode: str = None, user_id: int = None) -> list[dict]:
     """
     Scan the stock universe, select top-N SEPA candidates, save to
     weekly_plan table, and update the watchlist setting.
@@ -86,22 +86,25 @@ def run_screener(db: Session, mode: str = None) -> list[dict]:
     Live accounts apply graduated limits from get_live_account_limits()
     which automatically unlock as the account grows across tier boundaries.
     """
+    def _s(key, default=""):
+        return get_user_setting(db, key, default, user_id)
+
     if mode is None:
-        mode = get_setting(db, "trading_mode", "paper")
+        mode = _s("trading_mode", "paper")
 
-    risk_pct = float(get_setting(db, "risk_pct", "2.0"))
-    stop_pct = float(get_setting(db, "stop_loss_pct", "8.0"))
+    risk_pct = float(_s("risk_pct", "2.0"))
+    stop_pct = float(_s("stop_loss_pct", "8.0"))
 
-    # --- Screener filter settings (from DB) ---
-    price_min       = float(get_setting(db, "screener_price_min",     "0")   or "0")
-    price_max       = float(get_setting(db, "screener_price_max",     "0")   or "0")
-    top_n           = int(  get_setting(db, "screener_top_n",         "10")  or "10")
-    min_score_floor = int(  get_setting(db, "screener_min_score",     "0")   or "0")
-    vol_surge_pct   = float(get_setting(db, "screener_vol_surge_pct", "40")  or "40")
-    ema20_pct       = float(get_setting(db, "screener_ema20_pct",     "2.0") or "2.0")
-    ema50_pct       = float(get_setting(db, "screener_ema50_pct",     "3.0") or "3.0")
+    # --- Screener filter settings ---
+    price_min       = float(_s("screener_price_min",     "0")   or "0")
+    price_max       = float(_s("screener_price_max",     "0")   or "0")
+    top_n           = int(  _s("screener_top_n",         "10")  or "10")
+    min_score_floor = int(  _s("screener_min_score",     "0")   or "0")
+    vol_surge_pct   = float(_s("screener_vol_surge_pct", "40")  or "40")
+    ema20_pct       = float(_s("screener_ema20_pct",     "2.0") or "2.0")
+    ema50_pct       = float(_s("screener_ema50_pct",     "3.0") or "3.0")
 
-    account_value = _get_portfolio_value(mode)
+    account_value = _get_portfolio_value(db, mode, user_id)
     tier_label    = "PAPER"
 
     # --- Live account graduated overrides ---
@@ -149,7 +152,7 @@ def run_screener(db: Session, mode: str = None) -> list[dict]:
             )
             min_score_floor = floor_from_limits
 
-    universe_raw = get_setting(db, "screener_universe", "")
+    universe_raw = _s("screener_universe", "")
     universe = (
         [s.strip().upper() for s in universe_raw.split(",") if s.strip()]
         if universe_raw
@@ -264,15 +267,21 @@ def run_screener(db: Session, mode: str = None) -> list[dict]:
         })
 
     # Always save (even empty) so last-run info is queryable
-    _save_plan(db, plan_rows, week_start.isoformat(), mode)
-    set_setting(db, "screener_last_run", summary_msg)
+    _save_plan(db, plan_rows, week_start.isoformat(), mode, user_id)
+    if user_id:
+        set_user_setting(db, "screener_last_run", summary_msg, user_id)
+    else:
+        set_setting(db, "screener_last_run", summary_msg)
 
     if plan_rows:
         top_symbols = [r["symbol"] for r in plan_rows]
-        set_setting(db, "watchlist", ",".join(top_symbols))
+        if user_id:
+            set_user_setting(db, "watchlist", ",".join(top_symbols), user_id)
+        else:
+            set_setting(db, "watchlist", ",".join(top_symbols))
 
-        tv_user = get_setting(db, "tv_username", "")
-        tv_pass = get_setting(db, "tv_password", "")
+        tv_user = _s("tv_username", "")
+        tv_pass = _s("tv_password", "")
         if tv_user and tv_pass:
             from .tradingview_client import update_weekly_picks
             tv_result = update_weekly_picks(tv_user, tv_pass, top_symbols)
@@ -299,29 +308,55 @@ def _log_alert(db: Session, level: str, message: str):
         pass
 
 
-def _get_portfolio_value(mode: str) -> float:
+def _get_portfolio_value(db: Session, mode: str, user_id: int = None) -> float:
     try:
         from . import alpaca_client as alp
+        from .config import settings as global_settings
+
+        if user_id:
+            from .database import get_user_setting as _gus
+            is_admin = db.execute(
+                text("SELECT role FROM users WHERE id = :id"), {"id": user_id}
+            ).scalar() == "admin"
+            if mode == "paper":
+                key    = _gus(db, "alpaca_paper_key",    "", user_id)
+                secret = _gus(db, "alpaca_paper_secret", "", user_id)
+                if is_admin:
+                    key    = key    or global_settings.alpaca_paper_key
+                    secret = secret or global_settings.alpaca_paper_secret
+                paper = True
+            else:
+                key    = _gus(db, "alpaca_live_key",    "", user_id)
+                secret = _gus(db, "alpaca_live_secret", "", user_id)
+                if is_admin:
+                    key    = key    or global_settings.alpaca_live_key
+                    secret = secret or global_settings.alpaca_live_secret
+                paper = False
+            if key and secret:
+                client = alp.get_client_for_keys(key, secret, paper)
+                return float(client.get_account().portfolio_value)
+
         acct = alp.get_account(mode)
         return float(acct.portfolio_value)
     except Exception:
         return 10_000.0
 
 
-def _save_plan(db: Session, rows: list[dict], week_start: str, mode: str):
+def _save_plan(db: Session, rows: list[dict], week_start: str, mode: str, user_id: int = None):
     db.execute(
-        text("DELETE FROM weekly_plan WHERE week_start = :w AND mode = :m"),
-        {"w": week_start, "m": mode},
+        text("DELETE FROM weekly_plan WHERE week_start = :w AND mode = :m AND user_id IS NOT DISTINCT FROM :uid"),
+        {"w": week_start, "m": mode, "uid": user_id},
     )
     for r in rows:
+        row = {**r, "user_id": user_id}
         db.execute(
             text("""
                 INSERT INTO weekly_plan
                     (week_start, symbol, rank, score, signal, entry_price, stop_price,
-                     target1, target2, position_size, risk_amount, rationale, status, mode)
+                     target1, target2, position_size, risk_amount, rationale, status, mode, user_id)
                 VALUES (:week_start, :symbol, :rank, :score, :signal, :entry_price, :stop_price,
-                        :target1, :target2, :position_size, :risk_amount, :rationale, :status, :mode)
+                        :target1, :target2, :position_size, :risk_amount, :rationale, :status, :mode, :user_id)
             """),
-            r,
+            row,
         )
     db.commit()

@@ -51,9 +51,10 @@ def positions(current_user: dict = Depends(get_current_user), db: Session = Depe
             FROM weekly_plan
             WHERE symbol = ANY(:syms)
               AND mode = :mode
+              AND user_id = :uid
             ORDER BY symbol, week_start DESC
         """),
-        {"syms": symbols, "mode": mode},
+        {"syms": symbols, "mode": mode, "uid": current_user["id"]},
     ).fetchall()
 
     plan_map = {
@@ -102,18 +103,19 @@ def close(symbol: str, current_user: dict = Depends(get_current_user), db: Sessi
     return {"status": "closed", "symbol": symbol.upper()}
 
 
-def _upsert_plan_exits(db: Session, symbol: str, stop: float, target: float, mode: str):
-    """Upsert stop/target into the current week's plan for a given mode."""
+def _upsert_plan_exits(db: Session, symbol: str, stop: float, target: float, mode: str, user_id: int):
+    """Upsert stop/target into the current week's plan for a given mode and user."""
     existing = db.execute(
         text("""
             SELECT id FROM weekly_plan
             WHERE symbol = :sym
               AND mode = :mode
+              AND user_id = :uid
               AND week_start = (
-                  SELECT MAX(week_start) FROM weekly_plan WHERE mode = :mode
+                  SELECT MAX(week_start) FROM weekly_plan WHERE mode = :mode AND user_id = :uid
               )
         """),
-        {"sym": symbol, "mode": mode},
+        {"sym": symbol, "mode": mode, "uid": user_id},
     ).fetchone()
 
     if existing:
@@ -123,24 +125,27 @@ def _upsert_plan_exits(db: Session, symbol: str, stop: float, target: float, mod
                 SET stop_price = :stop, target1 = :target
                 WHERE symbol = :sym
                   AND mode = :mode
+                  AND user_id = :uid
                   AND week_start = (
-                      SELECT MAX(week_start) FROM weekly_plan WHERE mode = :mode
+                      SELECT MAX(week_start) FROM weekly_plan WHERE mode = :mode AND user_id = :uid
                   )
             """),
-            {"stop": stop, "target": target, "sym": symbol, "mode": mode},
+            {"stop": stop, "target": target, "sym": symbol, "mode": mode, "uid": user_id},
         )
     else:
         db.execute(
             text("""
                 INSERT INTO weekly_plan
-                    (week_start, symbol, rank, score, entry_price, stop_price, target1, status, mode)
+                    (week_start, symbol, rank, score, entry_price, stop_price, target1, status, mode, user_id)
                 VALUES (
-                    (SELECT COALESCE(MAX(week_start), CURRENT_DATE)
-                     FROM weekly_plan WHERE mode = :mode),
-                    :sym, 99, 0, 0, :stop, :target, 'EXECUTED', :mode
+                    COALESCE(
+                        (SELECT MAX(week_start) FROM weekly_plan WHERE mode = :mode AND user_id = :uid),
+                        CURRENT_DATE
+                    ),
+                    :sym, 99, 0, 0, :stop, :target, 'EXECUTED', :mode, :uid
                 )
             """),
-            {"sym": symbol, "stop": stop, "target": target, "mode": mode},
+            {"sym": symbol, "stop": stop, "target": target, "mode": mode, "uid": user_id},
         )
     db.commit()
 
@@ -160,7 +165,7 @@ def set_exit_levels(
     symbol        = symbol.upper()
     user_settings = get_all_user_settings(db, current_user["id"])
     mode          = user_settings.get("trading_mode", "paper")
-    _upsert_plan_exits(db, symbol, stop, target, mode)
+    _upsert_plan_exits(db, symbol, stop, target, mode, current_user["id"])
     return {"status": "ok", "symbol": symbol, "stop": stop, "target": target, "mode": mode}
 
 
@@ -188,7 +193,7 @@ def place_exits_now(
     client        = _resolve_alpaca_client(user_settings, mode, is_admin=current_user["role"] == "admin")
 
     # Step 1 — persist to plan
-    _upsert_plan_exits(db, symbol, stop, target, mode)
+    _upsert_plan_exits(db, symbol, stop, target, mode, current_user["id"])
 
     # Step 2 — confirm position is still open
     positions = client.get_all_positions()
