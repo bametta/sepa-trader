@@ -57,3 +57,13 @@ export const updatePlanStatus   = (symbol, status) => api.patch(`/screener/weekl
 export const fetchAlpacaHistory = (limit=100) => api.get(`/orders/alpaca-history?limit=${limit}`).then(r => r.data)
 export const fetchAnalyses      = (limit=20) => api.get(`/screener/analysis?limit=${limit}`).then(r => r.data)
 export const runAnalysis        = () => api.post('/screener/analysis/run').then(r => r.data)
+
+// ── Strategies ────────────────────────────────────────────────────────────────
+export const fetchMarketEnvironment = () => api.get('/strategies/market-environment').then(r => r.data)
+export const fetchDMSignal          = () => api.get('/strategies/dual-momentum/signal').then(r => r.data)
+export const evaluateDualMomentum   = () => api.post('/strategies/dual-momentum/evaluate').then(r => r.data)
+export const executeDualMomentum    = () => api.post('/strategies/dual-momentum/execute').then(r => r.data)
+export const fetchDMPosition        = () => api.get('/strategies/dual-momentum/position').then(r => r.data)
+export const fetchDMHistory         = (limit = 24) => api.get(`/strategies/dual-momentum/history?limit=${limit}`).then(r => r.data)
+export const fetchDMConfig          = () => api.get('/strategies/dual-momentum/config').then(r => r.data)
+export const updateDMConfig         = (data) => api.patch('/strategies/dual-momentum/config', data).then(r => r.data)

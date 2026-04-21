@@ -81,6 +81,42 @@ def _run_migrations():
             )
         """))
 
+        # ── Strategy tables ───────────────────────────────────────────────────
+        db.execute(text("""
+            CREATE TABLE IF NOT EXISTS strategy_config (
+                id                  SERIAL PRIMARY KEY,
+                user_id             INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                strategy_name       VARCHAR(50) NOT NULL,
+                is_active           BOOLEAN NOT NULL DEFAULT false,
+                auto_execute        BOOLEAN NOT NULL DEFAULT false,
+                trading_mode        VARCHAR(10) NOT NULL DEFAULT 'paper',
+                alpaca_paper_key    TEXT,
+                alpaca_paper_secret TEXT,
+                alpaca_live_key     TEXT,
+                alpaca_live_secret  TEXT,
+                settings            JSONB NOT NULL DEFAULT '{}',
+                created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                UNIQUE (user_id, strategy_name)
+            )
+        """))
+        db.execute(text("""
+            CREATE TABLE IF NOT EXISTS strategy_signals (
+                id                  SERIAL PRIMARY KEY,
+                user_id             INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                strategy_name       VARCHAR(50) NOT NULL,
+                recommended_symbol  VARCHAR(20),
+                current_symbol      VARCHAR(20),
+                action              VARCHAR(20),
+                data                JSONB,
+                reasoning           TEXT,
+                ai_verdict          VARCHAR(20),
+                ai_reasoning        TEXT,
+                mode                VARCHAR(10) NOT NULL DEFAULT 'paper',
+                executed            BOOLEAN NOT NULL DEFAULT false,
+                created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+        """))
+
         # ── Add user_id FK to trading tables (idempotent) ────────────────────
         for table in ("weekly_plan", "trade_log", "signal_log", "ai_analysis_log"):
             db.execute(text(f"""
@@ -197,7 +233,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-from .routes import auth as auth_route, admin as admin_route
+from .routes import auth as auth_route, admin as admin_route, strategies as strategies_route
 
 app.include_router(auth_route.router)
 app.include_router(admin_route.router)
@@ -208,6 +244,7 @@ app.include_router(signals.router)
 app.include_router(settings_route.router)
 app.include_router(webhook.router)
 app.include_router(screener.router)
+app.include_router(strategies_route.router)
 
 
 @app.get("/health")

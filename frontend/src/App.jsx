@@ -10,6 +10,7 @@ import { OpenOrdersTable, AlpacaHistoryTable } from './components/OrdersTable'
 import SettingsPanel from './components/SettingsPanel'
 import WeeklyPlan from './components/WeeklyPlan'
 import AdminPanel from './components/AdminPanel'
+import DualMomentumTab from './components/DualMomentumTab'
 import { fetchPositions, updateSetting } from './api/client'
 
 const POSITIONS_INTERVAL = 5000
@@ -20,7 +21,7 @@ function Dashboard() {
   const [switching, setSwitching]  = useState(false)
   const qc                         = useQueryClient()
 
-  const tabs = ['Positions', 'Orders', 'History', 'Weekly Plan', 'Settings',
+  const tabs = ['Positions', 'Orders', 'History', 'Weekly Plan', 'Dual Momentum', 'Settings',
                  ...(user?.role === 'admin' ? ['Admin'] : [])]
   const [tab, setTab] = useState('Positions')
 
@@ -135,11 +136,12 @@ function Dashboard() {
           </div>
         )}
 
-        {tab === 'Orders'      && <div className="space-y-6"><OpenOrdersTable /><AlpacaHistoryTable /></div>}
-        {tab === 'History'     && <AlpacaHistoryTable />}
-        {tab === 'Weekly Plan' && <WeeklyPlan />}
-        {tab === 'Settings'    && <SettingsPanel />}
-        {tab === 'Admin'       && <AdminPanel />}
+        {tab === 'Orders'         && <div className="space-y-6"><OpenOrdersTable /><AlpacaHistoryTable /></div>}
+        {tab === 'History'        && <AlpacaHistoryTable />}
+        {tab === 'Weekly Plan'    && <WeeklyPlan />}
+        {tab === 'Dual Momentum'  && <DualMomentumTab />}
+        {tab === 'Settings'       && <SettingsPanel />}
+        {tab === 'Admin'          && <AdminPanel />}
       </main>
     </div>
   )
