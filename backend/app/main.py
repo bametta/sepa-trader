@@ -1,15 +1,23 @@
+import logging
+import secrets
 from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import text
+
+from .config import settings
 from .database import SessionLocal
 from .scheduler import start_scheduler, stop_scheduler
-from .routes import account, positions, orders, signals, settings, webhook, screener
+from .routes import account, positions, orders, signals, settings as settings_route, webhook, screener
+
+logger = logging.getLogger(__name__)
 
 
 def _run_migrations():
     db = SessionLocal()
     try:
+        # ── Trading tables ────────────────────────────────────────────────────
         db.execute(text("""
             CREATE TABLE IF NOT EXISTS weekly_plan (
                 id            SERIAL PRIMARY KEY,
@@ -47,6 +55,40 @@ def _run_migrations():
                 fetched_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )
         """))
+
+        # ── Auth tables ───────────────────────────────────────────────────────
+        db.execute(text("""
+            CREATE TABLE IF NOT EXISTS users (
+                id            SERIAL PRIMARY KEY,
+                email         VARCHAR(255) UNIQUE NOT NULL,
+                username      VARCHAR(100) UNIQUE NOT NULL,
+                password_hash VARCHAR(255) NOT NULL,
+                role          VARCHAR(20) NOT NULL DEFAULT 'user',
+                is_active     BOOLEAN NOT NULL DEFAULT true,
+                totp_secret   VARCHAR(64),
+                totp_enabled  BOOLEAN NOT NULL DEFAULT false,
+                created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                last_login    TIMESTAMPTZ
+            )
+        """))
+        db.execute(text("""
+            CREATE TABLE IF NOT EXISTS user_settings (
+                id      SERIAL PRIMARY KEY,
+                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                key     VARCHAR(100) NOT NULL,
+                value   TEXT NOT NULL,
+                UNIQUE (user_id, key)
+            )
+        """))
+
+        # ── Add user_id FK to trading tables (idempotent) ────────────────────
+        for table in ("weekly_plan", "trade_log", "signal_log", "ai_analysis_log"):
+            db.execute(text(f"""
+                ALTER TABLE {table}
+                ADD COLUMN IF NOT EXISTS user_id INTEGER REFERENCES users(id)
+            """))
+
+        # ── Seed global settings (defaults) ──────────────────────────────────
         db.execute(text("""
             INSERT INTO settings (key, value) VALUES
                 ('screener_auto_run',          'true'),
@@ -61,14 +103,60 @@ def _run_migrations():
                 ('screener_ema50_pct',          '3.0'),
                 ('claude_api_key',              ''),
                 ('claude_model',                'claude-sonnet-4-5'),
-                -- Mode-scoped position snapshots — never share state between accounts
                 ('positions_snapshot_paper',    ''),
                 ('positions_snapshot_live',     '')
             ON CONFLICT (key) DO NOTHING
         """))
+
         db.commit()
+
+        # ── Bootstrap admin user ──────────────────────────────────────────────
+        _bootstrap_admin(db)
+
     finally:
         db.close()
+
+
+def _bootstrap_admin(db):
+    """Create the initial admin user if none exists. Assigns all existing data to them."""
+    existing = db.execute(
+        text("SELECT id FROM users WHERE role = 'admin' ORDER BY id LIMIT 1")
+    ).fetchone()
+
+    if existing:
+        admin_id = existing[0]
+    else:
+        from .auth import hash_password
+        admin_email    = getattr(settings, "admin_email",    "admin@sepa.local")
+        admin_password = getattr(settings, "admin_password", "")
+        if not admin_password:
+            admin_password = secrets.token_urlsafe(12)
+            logger.warning("=" * 60)
+            logger.warning("ADMIN ACCOUNT CREATED")
+            logger.warning("  Email:    %s", admin_email)
+            logger.warning("  Password: %s", admin_password)
+            logger.warning("Change this immediately in the Admin panel.")
+            logger.warning("=" * 60)
+
+        row = db.execute(
+            text("""
+                INSERT INTO users (email, username, password_hash, role)
+                VALUES (:email, 'admin', :pw, 'admin')
+                ON CONFLICT (email) DO UPDATE SET role = 'admin'
+                RETURNING id
+            """),
+            {"email": admin_email, "pw": hash_password(admin_password)},
+        ).fetchone()
+        db.commit()
+        admin_id = row[0]
+
+    # Assign any existing data rows (pre-auth migration) to the admin
+    for table in ("weekly_plan", "trade_log", "signal_log", "ai_analysis_log"):
+        db.execute(
+            text(f"UPDATE {table} SET user_id = :uid WHERE user_id IS NULL"),
+            {"uid": admin_id},
+        )
+    db.commit()
 
 
 @asynccontextmanager
@@ -81,18 +169,29 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="SEPA Trader", lifespan=lifespan)
 
+_origins = getattr(settings, "allowed_origins", "").split(",") if getattr(settings, "allowed_origins", "") else [
+    "http://localhost",
+    "http://localhost:5173",
+    "http://localhost:3000",
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_origins,
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+from .routes import auth as auth_route, admin as admin_route
+
+app.include_router(auth_route.router)
+app.include_router(admin_route.router)
 app.include_router(account.router)
 app.include_router(positions.router)
 app.include_router(orders.router)
 app.include_router(signals.router)
-app.include_router(settings.router)
+app.include_router(settings_route.router)
 app.include_router(webhook.router)
 app.include_router(screener.router)
 

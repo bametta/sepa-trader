@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import text
 from sqlalchemy.orm import Session
-from ..database import get_db, get_setting
+from ..database import get_db, get_current_user, get_user_setting
 from .. import alpaca_client as alp
 from ..sepa_analyzer import analyze
 import logging
@@ -12,8 +12,8 @@ router = APIRouter(prefix="/api/positions", tags=["positions"])
 
 
 @router.get("")
-def positions(db: Session = Depends(get_db)):
-    mode = get_setting(db, "trading_mode", "paper")
+def positions(current_user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
+    mode = get_user_setting(db, "trading_mode", "paper", current_user["id"])
     raw  = alp.get_positions(mode)
 
     if not raw:
@@ -71,8 +71,8 @@ def positions(db: Session = Depends(get_db)):
 
 
 @router.delete("/{symbol}")
-def close(symbol: str, db: Session = Depends(get_db)):
-    mode = get_setting(db, "trading_mode", "paper")
+def close(symbol: str, current_user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
+    mode = get_user_setting(db, "trading_mode", "paper", current_user["id"])
     alp.close_position(symbol.upper(), mode)
     return {"status": "closed", "symbol": symbol.upper()}
 
@@ -125,6 +125,7 @@ def set_exit_levels(
     symbol: str,
     stop: float = Query(..., gt=0),
     target: float = Query(..., gt=0),
+    current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
     """
@@ -132,7 +133,7 @@ def set_exit_levels(
     the next monitor cycle and replaces the OCO automatically.
     """
     symbol = symbol.upper()
-    mode   = get_setting(db, "trading_mode", "paper")
+    mode   = get_user_setting(db, "trading_mode", "paper", current_user["id"])
     _upsert_plan_exits(db, symbol, stop, target, mode)
     return {"status": "ok", "symbol": symbol, "stop": stop, "target": target, "mode": mode}
 
@@ -142,6 +143,7 @@ def place_exits_now(
     symbol: str,
     stop: float = Query(..., gt=0),
     target: float = Query(..., gt=0),
+    current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
     """
@@ -155,7 +157,7 @@ def place_exits_now(
       4. Place fresh OCO
     """
     symbol = symbol.upper()
-    mode   = get_setting(db, "trading_mode", "paper")
+    mode   = get_user_setting(db, "trading_mode", "paper", current_user["id"])
 
     # Step 1 — persist to plan
     _upsert_plan_exits(db, symbol, stop, target, mode)

@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import { useQuery, useQueryClient } from 'react-query'
-import { fetchSettings, updateSetting } from '../api/client'
+import { fetchSettings, updateSetting, fetchMe } from '../api/client'
+import TwoFactorSetup from './TwoFactorSetup'
 
 const DAYS = ['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday']
 
@@ -61,6 +62,7 @@ const SECTIONS = [
 export default function SettingsPanel() {
   const qc            = useQueryClient()
   const { data = {} } = useQuery('settings', fetchSettings)
+  const { data: me, refetch: refetchMe } = useQuery('me', fetchMe, { staleTime: 60000 })
   const [saving, setSaving] = useState(null)
 
   async function save(key, value) {
@@ -74,6 +76,24 @@ export default function SettingsPanel() {
 
   return (
     <div className="space-y-6">
+
+      {/* Account & Security */}
+      <div className="bg-card border border-border rounded-xl p-5 space-y-4">
+        <h3 className="text-sm font-semibold text-slate-400 uppercase tracking-wider">Account & Security</h3>
+        {me && (
+          <div className="flex items-center gap-3 pb-3 border-b border-border">
+            <div className="w-9 h-9 rounded-full bg-accent/20 text-accent flex items-center justify-center font-bold">
+              {me.username[0].toUpperCase()}
+            </div>
+            <div>
+              <p className="text-sm text-slate-200 font-medium">{me.username}</p>
+              <p className="text-xs text-slate-500">{me.email} · <span className="capitalize">{me.role}</span></p>
+            </div>
+          </div>
+        )}
+        <TwoFactorSetup enabled={me?.totp_enabled ?? false} onChanged={refetchMe} />
+      </div>
+
       {SECTIONS.map(section => (
         <div key={section.title} className="bg-card border border-border rounded-xl p-5">
           <h3 className="text-sm font-semibold text-slate-400 uppercase tracking-wider mb-4">

@@ -1,14 +1,17 @@
 from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
-from ..database import get_db, get_setting
+from ..database import get_db, get_current_user, get_user_setting
 from .. import alpaca_client as alp
 
 router = APIRouter(prefix="/api/account", tags=["account"])
 
 
 @router.get("")
-def account(db: Session = Depends(get_db)):
-    mode = get_setting(db, "trading_mode", "paper")
+def account(
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    mode = get_user_setting(db, "trading_mode", "paper", current_user["id"])
     acct = alp.get_account(mode)
     equity     = float(acct.equity)
     last_equity = float(acct.last_equity)

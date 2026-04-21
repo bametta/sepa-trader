@@ -1,10 +1,13 @@
+from fastapi import Cookie, Depends, HTTPException
+from jose import JWTError
 from sqlalchemy import create_engine, text
-from sqlalchemy.orm import sessionmaker, declarative_base
+from sqlalchemy.orm import sessionmaker, declarative_base, Session
+
 from .config import settings
 
-engine = create_engine(settings.database_url.replace("postgresql://", "postgresql+psycopg2://"))
+engine       = create_engine(settings.database_url.replace("postgresql://", "postgresql+psycopg2://"))
 SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False)
-Base = declarative_base()
+Base         = declarative_base()
 
 
 def get_db():
@@ -14,6 +17,8 @@ def get_db():
     finally:
         db.close()
 
+
+# ── Global settings (system-level, used by scheduler/background jobs) ─────────
 
 def get_setting(db, key: str, default: str = "") -> str:
     row = db.execute(text("SELECT value FROM settings WHERE key = :k"), {"k": key}).fetchone()
@@ -28,21 +33,87 @@ def set_setting(db, key: str, value: str):
     db.commit()
 
 
+# ── Per-user settings (override global defaults for API-driven operations) ────
+
+def get_user_setting(db, key: str, default: str = "", user_id: int = None) -> str:
+    """Return user-specific setting, falling back to global if not overridden."""
+    if user_id:
+        row = db.execute(
+            text("SELECT value FROM user_settings WHERE key = :k AND user_id = :uid"),
+            {"k": key, "uid": user_id},
+        ).fetchone()
+        if row:
+            return row[0]
+    return get_setting(db, key, default)
+
+
+def set_user_setting(db, key: str, value: str, user_id: int):
+    db.execute(
+        text("""
+            INSERT INTO user_settings (user_id, key, value) VALUES (:uid, :k, :v)
+            ON CONFLICT (user_id, key) DO UPDATE SET value = :v
+        """),
+        {"uid": user_id, "k": key, "v": value},
+    )
+    db.commit()
+
+
+def get_all_user_settings(db, user_id: int) -> dict:
+    """Return merged dict: global defaults overlaid with user overrides."""
+    global_rows = db.execute(text("SELECT key, value FROM settings")).fetchall()
+    merged = {r[0]: r[1] for r in global_rows}
+
+    user_rows = db.execute(
+        text("SELECT key, value FROM user_settings WHERE user_id = :uid"),
+        {"uid": user_id},
+    ).fetchall()
+    for r in user_rows:
+        merged[r[0]] = r[1]
+
+    return merged
+
+
+# ── Auth dependencies ─────────────────────────────────────────────────────────
+
+def get_current_user(
+    access_token: str | None = Cookie(None),
+    db: Session = Depends(get_db),
+) -> dict:
+    if not access_token:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    try:
+        from .auth import decode_token
+        payload = decode_token(access_token)
+        if payload.get("type") != "access":
+            raise HTTPException(status_code=401, detail="Invalid token type")
+        user_id = int(payload["sub"])
+    except (JWTError, KeyError, ValueError):
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
+
+    row = db.execute(
+        text("SELECT id, email, username, role, is_active FROM users WHERE id = :id"),
+        {"id": user_id},
+    ).fetchone()
+
+    if not row or not row[4]:
+        raise HTTPException(status_code=401, detail="User not found or inactive")
+
+    return {"id": row[0], "email": row[1], "username": row[2], "role": row[3]}
+
+
+def require_admin(current_user: dict = Depends(get_current_user)) -> dict:
+    if current_user["role"] != "admin":
+        raise HTTPException(status_code=403, detail="Admin access required")
+    return current_user
+
+
+# ── Account tier helpers ──────────────────────────────────────────────────────
+
 def get_live_account_limits(portfolio_value: float) -> dict:
     """
     Graduated position sizing constraints for live accounts.
     Called automatically on every screener run and monitor cycle.
     Paper accounts never call this — they always use settings as-is.
-
-    Tiers:
-      < $10K  — micro    (3 positions, tight price/score filters)
-      $10-25K — small    (5 positions, moderate filters)
-      $25-50K — standard (7 positions, light filters)
-      $50K+   — full     (uses max_positions setting, no overrides)
-
-    As the account grows and crosses a tier boundary, limits unlock
-    automatically on the next screener run or monitor cycle — no
-    manual settings changes required.
     """
     if portfolio_value < 10_000:
         return {
@@ -52,9 +123,9 @@ def get_live_account_limits(portfolio_value: float) -> dict:
             "screener_price_min": 15.0,
             "screener_price_max": 200.0,
             "min_score_floor":    5,
-            "max_position_pct":   35.0,   # each position ~25-33% on a $5K account
-            "min_cash_pct":       5.0,    # keep 5% cash buffer
-            "max_risk_pct":       2.5,    # slight tolerance for small account math
+            "max_position_pct":   35.0,
+            "min_cash_pct":       5.0,
+            "max_risk_pct":       2.5,
         }
 
     if portfolio_value < 25_000:
@@ -75,22 +146,21 @@ def get_live_account_limits(portfolio_value: float) -> dict:
             "tier":               "STANDARD ($25K–$50K)",
             "max_positions":      7,
             "screener_top_n":     7,
-            "screener_price_min": 0.0,   # no price floor needed
-            "screener_price_max": 0.0,   # no price ceiling needed
+            "screener_price_min": 0.0,
+            "screener_price_max": 0.0,
             "min_score_floor":    4,
             "max_position_pct":   20.0,
             "min_cash_pct":       10.0,
             "max_risk_pct":       2.0,
         }
 
-    # $50K+ — full account, use settings values without structural override
     return {
         "tier":               "FULL ($50K+)",
-        "max_positions":      None,   # None = use settings value unchanged
+        "max_positions":      None,
         "screener_top_n":     None,
         "screener_price_min": None,
         "screener_price_max": None,
-        "min_score_floor":    0,      # 0 = adaptive (no forced floor)
+        "min_score_floor":    0,
         "max_position_pct":   20.0,
         "min_cash_pct":       10.0,
         "max_risk_pct":       2.0,

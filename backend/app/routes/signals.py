@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Depends
 from sqlalchemy import text
 from sqlalchemy.orm import Session
-from ..database import get_db, get_setting
+from ..database import get_db, get_current_user, get_user_setting
 from ..sepa_analyzer import analyze
 from ..trader import run_monitor
 
@@ -9,7 +9,7 @@ router = APIRouter(prefix="/api/signals", tags=["signals"])
 
 
 @router.get("/analyze/{symbol}")
-def analyze_symbol(symbol: str):
+def analyze_symbol(symbol: str, _: dict = Depends(get_current_user)):
     return analyze(symbol.upper())
 
 
@@ -17,10 +17,11 @@ def analyze_symbol(symbol: str):
 def signal_history(
     symbol: str = None,
     limit: int = 100,
+    current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """Signal history scoped to the active trading mode."""
-    mode   = get_setting(db, "trading_mode", "paper")
+    """Signal history scoped to the active trading mode and user."""
+    mode   = get_user_setting(db, "trading_mode", "paper", current_user["id"])
     q      = "SELECT symbol, signal, score, price, mode, created_at FROM signal_log WHERE mode = :mode"
     params = {"l": limit, "mode": mode}
     if symbol:
@@ -42,6 +43,6 @@ def signal_history(
 
 
 @router.post("/run-monitor")
-async def trigger_monitor(db: Session = Depends(get_db)):
+async def trigger_monitor(current_user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
     result = await run_monitor(db)
     return result

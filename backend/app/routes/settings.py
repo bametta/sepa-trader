@@ -1,32 +1,30 @@
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
-from sqlalchemy import text
 from sqlalchemy.orm import Session
-from ..database import get_db, get_setting, set_setting
+
+from ..database import (
+    get_db, get_current_user,
+    get_all_user_settings, set_user_setting,
+)
 
 router = APIRouter(prefix="/api/settings", tags=["settings"])
 
 EDITABLE_KEYS = {
     "trading_mode", "auto_execute", "risk_pct", "stop_loss_pct", "max_positions",
     "watchlist", "webhook_secret",
-    # Screener universe
     "screener_universe",
-    # Screener filters
     "screener_price_min", "screener_price_max", "screener_top_n",
     "screener_min_score", "screener_vol_surge_pct", "screener_ema20_pct", "screener_ema50_pct",
-    # Screener schedule
     "screener_auto_run", "screener_schedule_day", "screener_schedule_time",
-    # TradingView
     "tv_username", "tv_password",
-    # AI Analysis
     "claude_api_key", "claude_model",
 }
 
 
 @router.get("")
-def get_all(db: Session = Depends(get_db)):
-    rows = db.execute(text("SELECT key, value FROM settings")).fetchall()
-    return {r[0]: r[1] for r in rows}
+def get_all(current_user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Return merged settings: global defaults overlaid with user-specific overrides."""
+    return get_all_user_settings(db, current_user["id"])
 
 
 class SettingUpdate(BaseModel):
@@ -34,12 +32,15 @@ class SettingUpdate(BaseModel):
 
 
 @router.patch("/{key}")
-def update(key: str, body: SettingUpdate, db: Session = Depends(get_db)):
+def update(
+    key: str,
+    body: SettingUpdate,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
     if key not in EDITABLE_KEYS:
-        from fastapi import HTTPException
         raise HTTPException(400, f"Key '{key}' is not editable")
     if key == "trading_mode" and body.value not in ("paper", "live"):
-        from fastapi import HTTPException
         raise HTTPException(400, "trading_mode must be 'paper' or 'live'")
-    set_setting(db, key, body.value)
+    set_user_setting(db, key, body.value, current_user["id"])
     return {"key": key, "value": body.value}

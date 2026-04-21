@@ -1,7 +1,43 @@
 import axios from 'axios'
 
-const api = axios.create({ baseURL: '/api' })
+const api = axios.create({
+  baseURL: '/api',
+  withCredentials: true,   // send httpOnly cookies automatically
+})
 
+// On 401, redirect to login (token expired / not authenticated)
+api.interceptors.response.use(
+  res => res,
+  err => {
+    if (err.response?.status === 401 && !window.location.pathname.includes('/login')) {
+      window.location.href = '/login'
+    }
+    return Promise.reject(err)
+  }
+)
+
+// ── Auth ──────────────────────────────────────────────────────────────────────
+export const login          = (email, password)          => api.post('/auth/login',    { email, password }).then(r => r.data)
+export const loginWith2fa   = (temp_token, code)         => api.post('/auth/login/2fa', { temp_token, code }).then(r => r.data)
+export const register       = (email, username, password) => api.post('/auth/register', { email, username, password }).then(r => r.data)
+export const logout         = ()                         => api.post('/auth/logout').then(r => r.data)
+export const fetchMe        = ()                         => api.get('/auth/me').then(r => r.data)
+export const changePassword = (current_password, new_password) =>
+  api.patch('/auth/password', { current_password, new_password }).then(r => r.data)
+
+// ── 2FA ───────────────────────────────────────────────────────────────────────
+export const setup2fa   = ()       => api.post('/auth/2fa/setup').then(r => r.data)
+export const enable2fa  = (code)   => api.post('/auth/2fa/enable',  { code }).then(r => r.data)
+export const disable2fa = (password) => api.post('/auth/2fa/disable', { password }).then(r => r.data)
+
+// ── Admin ─────────────────────────────────────────────────────────────────────
+export const fetchAdminUsers       = ()                             => api.get('/admin/users').then(r => r.data)
+export const updateAdminUser       = (id, data)                     => api.patch(`/admin/users/${id}`, data).then(r => r.data)
+export const deleteAdminUser       = (id)                           => api.delete(`/admin/users/${id}`).then(r => r.data)
+export const resetAdminUserPassword = (id)                          => api.post(`/admin/users/${id}/reset-password`).then(r => r.data)
+export const fetchAppHealth        = ()                             => api.get('/admin/health').then(r => r.data)
+
+// ── Trading ───────────────────────────────────────────────────────────────────
 export const fetchAccount      = () => api.get('/account').then(r => r.data)
 export const fetchPositions    = () => api.get('/positions').then(r => r.data)
 export const fetchOpenOrders   = () => api.get('/orders/open').then(r => r.data)
@@ -14,10 +50,10 @@ export const analyzeSymbol     = (sym) => api.get(`/signals/analyze/${sym}`).the
 export const fetchWeeklyPlan    = () => api.get('/screener/weekly-plan').then(r => r.data)
 export const fetchWeeklyDD      = () => api.get('/screener/dd').then(r => r.data)
 export const forceRefreshDD     = () => api.get('/screener/dd?refresh=true').then(r => r.data)
-export const fetchScreenerStatus= () => api.get('/screener/status').then(r => r.data)
+export const fetchScreenerStatus = () => api.get('/screener/status').then(r => r.data)
 export const runScreener        = () => api.post('/screener/run').then(r => r.data)
 export const syncTradingView    = () => api.post('/screener/sync-tradingview').then(r => r.data)
-export const updatePlanStatus      = (symbol, status) => api.patch(`/screener/weekly-plan/${symbol}/status`, { status }).then(r => r.data)
-export const fetchAlpacaHistory    = (limit=100) => api.get(`/orders/alpaca-history?limit=${limit}`).then(r => r.data)
-export const fetchAnalyses         = (limit=20) => api.get(`/screener/analysis?limit=${limit}`).then(r => r.data)
-export const runAnalysis           = () => api.post('/screener/analysis/run').then(r => r.data)
+export const updatePlanStatus   = (symbol, status) => api.patch(`/screener/weekly-plan/${symbol}/status`, { status }).then(r => r.data)
+export const fetchAlpacaHistory = (limit=100) => api.get(`/orders/alpaca-history?limit=${limit}`).then(r => r.data)
+export const fetchAnalyses      = (limit=20) => api.get(`/screener/analysis?limit=${limit}`).then(r => r.data)
+export const runAnalysis        = () => api.post('/screener/analysis/run').then(r => r.data)

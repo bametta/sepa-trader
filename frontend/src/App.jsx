@@ -1,32 +1,33 @@
 import { useState } from 'react'
 import { useQuery, useQueryClient } from 'react-query'
+import { AuthProvider, useAuth } from './AuthContext'
+import LoginPage from './LoginPage'
+import RegisterPage from './RegisterPage'
 import Navbar from './components/Navbar'
 import AccountSummary from './components/AccountSummary'
 import PositionCard from './components/PositionCard'
 import { OpenOrdersTable, AlpacaHistoryTable } from './components/OrdersTable'
 import SettingsPanel from './components/SettingsPanel'
 import WeeklyPlan from './components/WeeklyPlan'
+import AdminPanel from './components/AdminPanel'
 import { fetchPositions, updateSetting } from './api/client'
 
-const TABS = ['Positions', 'Orders', 'History', 'Weekly Plan', 'Settings']
+const POSITIONS_INTERVAL = 5000
+const ACCOUNT_INTERVAL   = 5000
 
-// Refresh intervals — aggressive during market hours, relaxed otherwise
-const POSITIONS_INTERVAL = 5000   // 5s — near real-time position P&L
-const ACCOUNT_INTERVAL   = 5000   // 5s — buying power / cash stays current
+function Dashboard() {
+  const { user }                   = useAuth()
+  const [switching, setSwitching]  = useState(false)
+  const qc                         = useQueryClient()
 
-export default function App() {
-  const [tab, setTab]             = useState('Positions')
-  const [switching, setSwitching] = useState(false)
-  const qc                        = useQueryClient()
+  const tabs = ['Positions', 'Orders', 'History', 'Weekly Plan', 'Settings',
+                 ...(user?.role === 'admin' ? ['Admin'] : [])]
+  const [tab, setTab] = useState('Positions')
 
   const { data: positions = [], isLoading, isError: posError } = useQuery(
     'positions',
-    () => fetchPositions(),
-    {
-      refetchInterval:            POSITIONS_INTERVAL,
-      refetchIntervalInBackground: true,   // keep refreshing even if tab is backgrounded
-      staleTime:                  2000,
-    }
+    fetchPositions,
+    { refetchInterval: POSITIONS_INTERVAL, refetchIntervalInBackground: true, staleTime: 2000 },
   )
 
   async function handleModeChange(newMode) {
@@ -57,7 +58,6 @@ export default function App() {
     <div className="min-h-screen bg-surface">
       <Navbar onModeChange={handleModeChange} />
 
-      {/* Mode-switch overlay */}
       {switching && (
         <div className="fixed inset-0 bg-black/60 z-50 flex items-center justify-center">
           <div className="bg-card border border-border rounded-xl px-8 py-6 text-center space-y-2">
@@ -87,14 +87,10 @@ export default function App() {
           </div>
         )}
 
-        <AccountSummary
-          onModeChange={handleModeChange}
-          refetchInterval={ACCOUNT_INTERVAL}
-        />
+        <AccountSummary onModeChange={handleModeChange} refetchInterval={ACCOUNT_INTERVAL} />
 
-        {/* Tabs */}
-        <div className="flex gap-1 bg-card border border-border rounded-xl p-1 w-fit">
-          {TABS.map(t => (
+        <div className="flex gap-1 bg-card border border-border rounded-xl p-1 w-fit flex-wrap">
+          {tabs.map(t => (
             <button
               key={t}
               onClick={() => setTab(t)}
@@ -140,7 +136,37 @@ export default function App() {
         {tab === 'History'     && <AlpacaHistoryTable />}
         {tab === 'Weekly Plan' && <WeeklyPlan />}
         {tab === 'Settings'    && <SettingsPanel />}
+        {tab === 'Admin'       && <AdminPanel />}
       </main>
     </div>
+  )
+}
+
+function AuthGate() {
+  const { user, loading } = useAuth()
+  const [page, setPage]   = useState('login')
+
+  if (loading) {
+    return (
+      <div className="min-h-screen bg-surface flex items-center justify-center">
+        <div className="w-8 h-8 border-2 border-accent border-t-transparent rounded-full animate-spin" />
+      </div>
+    )
+  }
+
+  if (!user) {
+    return page === 'login'
+      ? <LoginPage onGoRegister={() => setPage('register')} />
+      : <RegisterPage onGoLogin={() => setPage('login')} />
+  }
+
+  return <Dashboard />
+}
+
+export default function App() {
+  return (
+    <AuthProvider>
+      <AuthGate />
+    </AuthProvider>
   )
 }

@@ -1,15 +1,15 @@
 from fastapi import APIRouter, Depends
 from sqlalchemy import text
 from sqlalchemy.orm import Session
-from ..database import get_db, get_setting
+from ..database import get_db, get_current_user, get_user_setting
 from .. import alpaca_client as alp
 
 router = APIRouter(prefix="/api/orders", tags=["orders"])
 
 
 @router.get("/open")
-def open_orders(db: Session = Depends(get_db)):
-    mode   = get_setting(db, "trading_mode", "paper")
+def open_orders(current_user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
+    mode   = get_user_setting(db, "trading_mode", "paper", current_user["id"])
     orders = alp.get_open_orders(mode)
     return [
         {
@@ -28,18 +28,22 @@ def open_orders(db: Session = Depends(get_db)):
 
 
 @router.get("/history")
-def trade_history(limit: int = 50, db: Session = Depends(get_db)):
-    """Internal trade log — filtered to current trading mode."""
-    mode = get_setting(db, "trading_mode", "paper")
+def trade_history(
+    limit: int = 50,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Internal trade log — filtered to current trading mode and user."""
+    mode = get_user_setting(db, "trading_mode", "paper", current_user["id"])
     rows = db.execute(
         text("""
             SELECT symbol, action, qty, price, trigger, mode, created_at
             FROM trade_log
-            WHERE mode = :mode
+            WHERE mode = :mode AND user_id = :uid
             ORDER BY created_at DESC
             LIMIT :l
         """),
-        {"l": limit, "mode": mode},
+        {"l": limit, "mode": mode, "uid": current_user["id"]},
     ).fetchall()
     return [
         {
@@ -56,9 +60,13 @@ def trade_history(limit: int = 50, db: Session = Depends(get_db)):
 
 
 @router.get("/alpaca-history")
-def alpaca_order_history(limit: int = 100, db: Session = Depends(get_db)):
+def alpaca_order_history(
+    limit: int = 100,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
     """Full Alpaca order history from the active account (paper or live)."""
-    mode   = get_setting(db, "trading_mode", "paper")
+    mode   = get_user_setting(db, "trading_mode", "paper", current_user["id"])
     orders = alp.get_all_orders(mode, limit=limit)
     return [
         {

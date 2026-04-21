@@ -15,6 +15,13 @@ class Settings(BaseSettings):
 
     secret_key: str = "dev-secret-change-me"
 
+    # Auth bootstrap — admin credentials on first startup
+    admin_email:    str = "admin@sepa.local"
+    admin_password: str = ""   # auto-generated if blank; printed to logs once
+
+    # CORS — comma-separated list of allowed frontend origins
+    allowed_origins: str = "http://localhost,http://localhost:5173,http://localhost:3000"
+
     class Config:
         env_file = ".env"
 

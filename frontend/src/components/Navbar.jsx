@@ -1,7 +1,7 @@
 import { useState } from 'react'
-import { runMonitor } from '../api/client'
+import { runMonitor, fetchAccount } from '../api/client'
 import { useQuery, useQueryClient } from 'react-query'
-import { fetchAccount } from '../api/client'
+import UserMenu from './UserMenu'
 
 export default function Navbar({ onModeChange }) {
   const qc                = useQueryClient()
@@ -95,8 +95,8 @@ export default function Navbar({ onModeChange }) {
         </button>
       </div>
 
-      {/* Right — result banner + run button */}
-      <div className="flex items-center gap-4">
+      {/* Right — result banner + run button + user menu */}
+      <div className="flex items-center gap-3">
         {resultBanner()}
         <button
           onClick={handleRun}
@@ -109,6 +109,7 @@ export default function Navbar({ onModeChange }) {
         >
           {running ? 'Running…' : 'Run Monitor'}
         </button>
+        <UserMenu />
       </div>
     </nav>
   )
