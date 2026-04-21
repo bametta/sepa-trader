@@ -1,6 +1,12 @@
 """
-Claude AI analyst — pre-trade safety gate + post-close evaluation +
+AI analyst — pre-trade safety gate + post-close evaluation +
 weekly pick review + midweek slot-refill analysis.
+
+Supports multiple AI providers:
+  • anthropic        — Claude via Anthropic SDK
+  • openai           — GPT-4 / o-series via OpenAI SDK
+  • openai_compatible — any OpenAI-compatible endpoint (xAI, DeepSeek,
+                         Mistral, Groq, Gemini, Ollama, …)
 """
 import logging
 from sqlalchemy import text
@@ -9,10 +15,52 @@ from .database import get_setting, get_user_setting
 
 logger = logging.getLogger(__name__)
 
+# ── Provider-aware call helper ────────────────────────────────────────────────
 
-def _client(api_key: str):
-    import anthropic
-    return anthropic.Anthropic(api_key=api_key)
+def _call_ai(
+    db: Session,
+    prompt: str,
+    max_tokens: int,
+    user_id: int = None,
+) -> str | None:
+    """
+    Send *prompt* to whichever AI provider the user has configured.
+    Returns the response text, or None if no credentials are set.
+    Raises on hard API errors (caller decides whether to fail-open).
+    """
+    provider = get_user_setting(db, "ai_provider", "anthropic", user_id)
+    api_key  = get_user_setting(db, "ai_api_key",  "",          user_id)
+    model    = get_user_setting(db, "ai_model",    "",          user_id)
+    base_url = get_user_setting(db, "ai_base_url", "",          user_id)
+
+    if not api_key:
+        return None
+
+    if provider == "anthropic":
+        import anthropic
+        default_model = "claude-sonnet-4-5"
+        resp = anthropic.Anthropic(api_key=api_key).messages.create(
+            model=model or default_model,
+            max_tokens=max_tokens,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        return resp.content[0].text
+
+    # openai or openai_compatible (xAI, DeepSeek, Mistral, Groq, Gemini, …)
+    if provider in ("openai", "openai_compatible"):
+        from openai import OpenAI
+        kwargs: dict = {"api_key": api_key}
+        if base_url:
+            kwargs["base_url"] = base_url
+        default_model = "gpt-4o" if provider == "openai" else ""
+        resp = OpenAI(**kwargs).chat.completions.create(
+            model=model or default_model,
+            max_tokens=max_tokens,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        return resp.choices[0].message.content
+
+    raise ValueError(f"Unknown AI provider: {provider!r}")
 
 
 # ── Pre-trade analysis ────────────────────────────────────────────────────────
@@ -47,18 +95,17 @@ def pre_trade_analysis(
         }
     Fails open — never silently blocks trading due to API errors.
     """
-    api_key = get_user_setting(db, "claude_api_key", "", user_id)
-    if not api_key:
-        logger.warning("pre_trade_analysis: no Claude API key — skipping gate, proceeding.")
+    # Check credentials without fetching the full key for the log message
+    api_key_set = bool(get_user_setting(db, "ai_api_key", "", user_id))
+    if not api_key_set:
+        logger.warning("pre_trade_analysis: no AI API key configured — skipping gate, proceeding.")
         return {
             "proceed":  True,
             "verdict":  "PROCEED",
-            "reason":   "Claude API key not configured — gate bypassed.",
-            "warnings": ["Claude API key not set — pre-trade analysis unavailable."],
+            "reason":   "AI API key not configured — gate bypassed.",
+            "warnings": ["AI API key not set — pre-trade analysis unavailable."],
             "analysis": "",
         }
-
-    model = get_user_setting(db, "claude_model", "claude-sonnet-4-5", user_id)
 
     # Live accounts get graduated tier thresholds — paper always uses standard
     if mode == "live":
@@ -129,19 +176,23 @@ Use ABORT only for clear rule violations.
 Use PROCEED when all rules pass."""
 
     try:
-        resp = _client(api_key).messages.create(
-            model=model,
-            max_tokens=256,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        return _parse_pre_trade_response(resp.content[0].text.strip())
+        text = _call_ai(db, prompt, max_tokens=256, user_id=user_id)
+        if text is None:
+            return {
+                "proceed":  True,
+                "verdict":  "PROCEED",
+                "reason":   "AI API key not configured — gate bypassed.",
+                "warnings": ["AI API key not set — pre-trade analysis unavailable."],
+                "analysis": "",
+            }
+        return _parse_pre_trade_response(text.strip())
 
     except Exception as exc:
         logger.error("pre_trade_analysis failed for %s: %s", symbol, exc)
         return {
             "proceed":  True,
             "verdict":  "PROCEED",
-            "reason":   f"Claude API error — gate bypassed: {str(exc)[:80]}",
+            "reason":   f"AI API error — gate bypassed: {str(exc)[:80]}",
             "warnings": [f"Pre-trade analysis error: {str(exc)[:80]}"],
             "analysis": "",
         }
@@ -229,18 +280,15 @@ def analyze_slot_refill(
             "analysis":    str,
         }
     """
-    api_key = get_user_setting(db, "claude_api_key", "", user_id)
-    if not api_key:
-        logger.warning("analyze_slot_refill: no Claude API key — defaulting to auto-execute.")
+    if not get_user_setting(db, "ai_api_key", "", user_id):
+        logger.warning("analyze_slot_refill: no AI API key — defaulting to auto-execute.")
         return {
             "should_open": True,
             "symbol":      pending_picks[0]["symbol"] if pending_picks else None,
             "verdict":     "OPEN",
-            "reason":      "Claude API key not configured — defaulting to next PENDING pick.",
+            "reason":      "AI API key not configured — defaulting to next PENDING pick.",
             "analysis":    "",
         }
-
-    model = get_user_setting(db, "claude_model", "claude-sonnet-4-5", user_id)
 
     pnl     = None
     pnl_pct = None
@@ -313,12 +361,16 @@ If OPEN: choose the highest-ranked pick with score ≥5 and R:R ≥2.
 If WAIT or SKIP_WEEK: SYMBOL must be NONE."""
 
     try:
-        resp = _client(api_key).messages.create(
-            model=model,
-            max_tokens=200,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        return _parse_slot_refill_response(resp.content[0].text.strip(), pending_picks)
+        text = _call_ai(db, prompt, max_tokens=200, user_id=user_id)
+        if text is None:
+            return {
+                "should_open": True,
+                "symbol":      pending_picks[0]["symbol"] if pending_picks else None,
+                "verdict":     "OPEN",
+                "reason":      "AI API key not configured — defaulting to next PENDING pick.",
+                "analysis":    "",
+            }
+        return _parse_slot_refill_response(text.strip(), pending_picks)
 
     except Exception as exc:
         logger.error("analyze_slot_refill failed: %s — defaulting to next pick.", exc)
@@ -326,7 +378,7 @@ If WAIT or SKIP_WEEK: SYMBOL must be NONE."""
             "should_open": True,
             "symbol":      pending_picks[0]["symbol"] if pending_picks else None,
             "verdict":     "OPEN",
-            "reason":      f"Claude error — defaulting to next pick: {str(exc)[:60]}",
+            "reason":      f"AI error — defaulting to next pick: {str(exc)[:60]}",
             "analysis":    "",
         }
 
@@ -362,11 +414,8 @@ def _parse_slot_refill_response(text: str, pending_picks: list[dict]) -> dict:
 # ── Post-close / weekly pick analysis ────────────────────────────────────────
 
 def analyze_picks(db: Session, picks: list[dict], closed_position: dict | None = None, user_id: int = None) -> str:
-    api_key = get_user_setting(db, "claude_api_key", "", user_id)
-    if not api_key:
-        raise ValueError("Claude API key not configured in Settings.")
-
-    model = get_user_setting(db, "claude_model", "claude-sonnet-4-5", user_id)
+    if not get_user_setting(db, "ai_api_key", "", user_id):
+        raise ValueError("AI API key not configured in Settings.")
 
     parts = []
     if closed_position:
@@ -396,12 +445,10 @@ def analyze_picks(db: Session, picks: list[dict], closed_position: dict | None =
         "Output a numbered list only — no preamble."
     )
 
-    resp = _client(api_key).messages.create(
-        model=model,
-        max_tokens=1024,
-        messages=[{"role": "user", "content": "\n\n".join(parts)}],
-    )
-    return resp.content[0].text
+    result = _call_ai(db, "\n\n".join(parts), max_tokens=1024, user_id=user_id)
+    if result is None:
+        raise ValueError("AI API key not configured in Settings.")
+    return result
 
 
 def log_analysis(db: Session, trigger: str, symbol: str | None, analysis_text: str, mode: str, user_id: int = None):

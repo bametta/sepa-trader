@@ -60,10 +60,19 @@ const SECTIONS = [
     ],
   },
   {
-    title: 'AI Analysis (Claude)',
+    title: 'AI Analysis',
     fields: [
-      { key: 'claude_api_key', label: 'Anthropic API Key', type: 'password', span: true },
-      { key: 'claude_model',   label: 'Model ID (e.g. claude-opus-4-7)', type: 'text' },
+      {
+        key: 'ai_provider', label: 'Provider', type: 'select',
+        options: [
+          { value: 'anthropic',         label: 'Anthropic (Claude)' },
+          { value: 'openai',            label: 'OpenAI (GPT-4 / o-series)' },
+          { value: 'openai_compatible', label: 'OpenAI-compatible (xAI, DeepSeek, Mistral, Groq…)' },
+        ],
+      },
+      { key: 'ai_api_key',  label: 'API Key',                              type: 'password', span: true },
+      { key: 'ai_model',    label: 'Model ID (leave blank for provider default)', type: 'text' },
+      { key: 'ai_base_url', label: 'Base URL (OpenAI-compatible only)',    type: 'text', span: true },
     ],
   },
 ]

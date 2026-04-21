@@ -17,7 +17,8 @@ EDITABLE_KEYS = {
     "screener_min_score", "screener_vol_surge_pct", "screener_ema20_pct", "screener_ema50_pct",
     "screener_auto_run", "screener_schedule_day", "screener_schedule_time",
     "tv_username", "tv_password",
-    "claude_api_key", "claude_model",
+    # AI provider settings (replaces claude_api_key / claude_model)
+    "ai_provider", "ai_api_key", "ai_model", "ai_base_url",
     "alpaca_paper_key", "alpaca_paper_secret",
     "alpaca_live_key",  "alpaca_live_secret",
 }

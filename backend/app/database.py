@@ -39,10 +39,16 @@ def set_setting(db, key: str, value: str):
 # They are NEVER sourced from the global settings table, so a new user always
 # sees empty values regardless of what admin has configured globally.
 _PRIVATE_KEYS: frozenset[str] = frozenset({
+    # AI provider credentials
+    "ai_api_key",
+    "ai_base_url",
+    # Legacy key — kept so old data isn't leaked if still in settings table
     "claude_api_key",
+    # Integrations
     "tv_username",
     "tv_password",
     "webhook_secret",
+    # Alpaca credentials
     "alpaca_paper_key",
     "alpaca_paper_secret",
     "alpaca_live_key",
