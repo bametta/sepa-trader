@@ -10,15 +10,21 @@ from alpaca.trading.enums import QueryOrderStatus
 router = APIRouter(prefix="/api/orders", tags=["orders"])
 
 
-def _resolve_alpaca_client(user_settings: dict, mode: str):
+def _resolve_alpaca_client(user_settings: dict, mode: str, is_admin: bool = False):
     if mode == "paper":
-        key    = user_settings.get("alpaca_paper_key")    or global_settings.alpaca_paper_key
-        secret = user_settings.get("alpaca_paper_secret") or global_settings.alpaca_paper_secret
-        paper  = True
+        key    = user_settings.get("alpaca_paper_key")
+        secret = user_settings.get("alpaca_paper_secret")
+        if is_admin:
+            key    = key    or global_settings.alpaca_paper_key
+            secret = secret or global_settings.alpaca_paper_secret
+        paper = True
     else:
-        key    = user_settings.get("alpaca_live_key")    or global_settings.alpaca_live_key
-        secret = user_settings.get("alpaca_live_secret") or global_settings.alpaca_live_secret
-        paper  = False
+        key    = user_settings.get("alpaca_live_key")
+        secret = user_settings.get("alpaca_live_secret")
+        if is_admin:
+            key    = key    or global_settings.alpaca_live_key
+            secret = secret or global_settings.alpaca_live_secret
+        paper = False
     if not key or not secret:
         raise HTTPException(status_code=400, detail="alpaca_credentials_missing")
     return alp.get_client_for_keys(key, secret, paper)
@@ -28,7 +34,7 @@ def _resolve_alpaca_client(user_settings: dict, mode: str):
 def open_orders(current_user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
     user_settings = get_all_user_settings(db, current_user["id"])
     mode   = user_settings.get("trading_mode", "paper")
-    client = _resolve_alpaca_client(user_settings, mode)
+    client = _resolve_alpaca_client(user_settings, mode, is_admin=current_user["role"] == "admin")
     orders = client.get_orders(GetOrdersRequest(status=QueryOrderStatus.OPEN))
     return [
         {
@@ -87,7 +93,7 @@ def alpaca_order_history(
     """Full Alpaca order history from the active account (paper or live)."""
     user_settings = get_all_user_settings(db, current_user["id"])
     mode   = user_settings.get("trading_mode", "paper")
-    client = _resolve_alpaca_client(user_settings, mode)
+    client = _resolve_alpaca_client(user_settings, mode, is_admin=current_user["role"] == "admin")
     orders = client.get_orders(GetOrdersRequest(status=QueryOrderStatus.ALL, limit=limit))
     return [
         {

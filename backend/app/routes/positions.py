@@ -12,15 +12,21 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/positions", tags=["positions"])
 
 
-def _resolve_alpaca_client(user_settings: dict, mode: str):
+def _resolve_alpaca_client(user_settings: dict, mode: str, is_admin: bool = False):
     if mode == "paper":
-        key    = user_settings.get("alpaca_paper_key")    or global_settings.alpaca_paper_key
-        secret = user_settings.get("alpaca_paper_secret") or global_settings.alpaca_paper_secret
-        paper  = True
+        key    = user_settings.get("alpaca_paper_key")
+        secret = user_settings.get("alpaca_paper_secret")
+        if is_admin:
+            key    = key    or global_settings.alpaca_paper_key
+            secret = secret or global_settings.alpaca_paper_secret
+        paper = True
     else:
-        key    = user_settings.get("alpaca_live_key")    or global_settings.alpaca_live_key
-        secret = user_settings.get("alpaca_live_secret") or global_settings.alpaca_live_secret
-        paper  = False
+        key    = user_settings.get("alpaca_live_key")
+        secret = user_settings.get("alpaca_live_secret")
+        if is_admin:
+            key    = key    or global_settings.alpaca_live_key
+            secret = secret or global_settings.alpaca_live_secret
+        paper = False
     if not key or not secret:
         raise HTTPException(status_code=400, detail="alpaca_credentials_missing")
     return alp.get_client_for_keys(key, secret, paper)
@@ -30,7 +36,7 @@ def _resolve_alpaca_client(user_settings: dict, mode: str):
 def positions(current_user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
     user_settings = get_all_user_settings(db, current_user["id"])
     mode   = user_settings.get("trading_mode", "paper")
-    client = _resolve_alpaca_client(user_settings, mode)
+    client = _resolve_alpaca_client(user_settings, mode, is_admin=current_user["role"] == "admin")
     raw    = client.get_all_positions()
 
     if not raw:
@@ -91,7 +97,7 @@ def positions(current_user: dict = Depends(get_current_user), db: Session = Depe
 def close(symbol: str, current_user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
     user_settings = get_all_user_settings(db, current_user["id"])
     mode   = user_settings.get("trading_mode", "paper")
-    client = _resolve_alpaca_client(user_settings, mode)
+    client = _resolve_alpaca_client(user_settings, mode, is_admin=current_user["role"] == "admin")
     client.close_position(symbol.upper())
     return {"status": "closed", "symbol": symbol.upper()}
 
@@ -179,7 +185,7 @@ def place_exits_now(
     symbol        = symbol.upper()
     user_settings = get_all_user_settings(db, current_user["id"])
     mode          = user_settings.get("trading_mode", "paper")
-    client        = _resolve_alpaca_client(user_settings, mode)
+    client        = _resolve_alpaca_client(user_settings, mode, is_admin=current_user["role"] == "admin")
 
     # Step 1 — persist to plan
     _upsert_plan_exits(db, symbol, stop, target, mode)
