@@ -3,13 +3,11 @@ JWT utilities, password hashing, and TOTP for two-factor authentication.
 """
 from datetime import datetime, timedelta, timezone
 
+import bcrypt as _bcrypt
 import pyotp
 from jose import jwt, JWTError
-from passlib.context import CryptContext
 
 from .config import settings
-
-_pwd_ctx = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 _ALGO                        = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES  = 15
@@ -20,11 +18,11 @@ TWO_FA_TOKEN_EXPIRE_MINUTES  = 5
 # ── Passwords ─────────────────────────────────────────────────────────────────
 
 def hash_password(password: str) -> str:
-    return _pwd_ctx.hash(password)
+    return _bcrypt.hashpw(password.encode("utf-8"), _bcrypt.gensalt()).decode()
 
 
 def verify_password(plain: str, hashed: str) -> bool:
-    return _pwd_ctx.verify(plain, hashed)
+    return _bcrypt.checkpw(plain.encode("utf-8"), hashed.encode("utf-8"))
 
 
 # ── Tokens ────────────────────────────────────────────────────────────────────
