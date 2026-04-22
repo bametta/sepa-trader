@@ -38,9 +38,9 @@ const SECTIONS = [
       { key: 'pb_beta_max',          label: 'Max beta (default 2.5)',               type: 'number' },
       { key: 'pb_earnings_days_min', label: 'Min days to earnings (default 15)',    type: 'number' },
       { key: 'pb_top_n',             label: 'Top N from pullback screener (default 5)', type: 'number' },
-      { key: 'pb_ema_alignment',     label: 'Require EMA20 > EMA50 > EMA200',      type: 'toggle' },
-      { key: 'pb_price_above_ema20', label: 'Require price > EMA20',               type: 'toggle' },
-      { key: 'pb_ppst_required',     label: 'Require PPST bullish confirmation',   type: 'toggle' },
+      { key: 'pb_ema_alignment',     label: 'Require EMA20 > EMA50 > EMA200',      type: 'toggle', defaultValue: 'true' },
+      { key: 'pb_price_above_ema20', label: 'Require price > EMA20',               type: 'toggle', defaultValue: 'true' },
+      { key: 'pb_ppst_required',     label: 'Require PPST bullish confirmation',   type: 'toggle', defaultValue: 'true' },
     ],
   },
   {
@@ -54,8 +54,8 @@ const SECTIONS = [
   {
     title: 'Monitor',
     fields: [
-      { key: 'monitor_enabled',     label: 'Monitor enabled (auto-place exits & manage positions)', type: 'toggle' },
-      { key: 'auto_execute',        label: 'Auto-execute new entries on Monday open',               type: 'toggle' },
+      { key: 'monitor_enabled',     label: 'Monitor enabled (auto-place exits & manage positions)', type: 'toggle', defaultValue: 'true' },
+      { key: 'auto_execute',        label: 'Auto-execute new entries on Monday open',               type: 'toggle', defaultValue: 'true' },
       { key: 'risk_pct',            label: 'Risk per trade %',                                     type: 'number' },
       { key: 'stop_loss_pct',       label: 'Default stop loss %',                                  type: 'number' },
       { key: 'max_position_pct',    label: 'Max position size % (hard cap)',                       type: 'number' },
@@ -65,7 +65,7 @@ const SECTIONS = [
   {
     title: 'Screener — Schedule (ET)',
     fields: [
-      { key: 'screener_auto_run',      label: 'Auto-run enabled',   type: 'toggle' },
+      { key: 'screener_auto_run',      label: 'Auto-run enabled',   type: 'toggle', defaultValue: 'true' },
       { key: 'screener_schedule_day',  label: 'Day of week',        type: 'select', options: DAYS.map((d, i) => ({ value: String(i), label: d })) },
       { key: 'screener_schedule_time', label: 'Time (HH:MM, 24h)',  type: 'time'   },
     ],
@@ -166,7 +166,8 @@ export default function SettingsPanel() {
 
 function Field({ field, value, saving, onSave }) {
   const [local, setLocal] = useState(null)
-  const current = local ?? value
+  // Use local (optimistic) → DB value → field default → empty string
+  const current = local ?? (value !== '' && value !== undefined ? value : (field.defaultValue ?? ''))
 
   if (field.type === 'toggle') {
     const on = current === 'true'
@@ -174,7 +175,11 @@ function Field({ field, value, saving, onSave }) {
       <div className="flex items-center justify-between bg-surface rounded-lg p-3 h-full">
         <span className="text-sm text-slate-300">{field.label}</span>
         <button
-          onClick={() => onSave(on ? 'false' : 'true')}
+          onClick={() => {
+            const next = on ? 'false' : 'true'
+            setLocal(next)   // optimistic — shows instantly
+            onSave(next)
+          }}
           disabled={saving}
           className={`relative w-11 h-6 rounded-full transition-colors flex-shrink-0 ${on ? 'bg-accent' : 'bg-slate-700'} disabled:opacity-50`}
         >
