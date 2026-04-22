@@ -15,6 +15,8 @@ logger = logging.getLogger(__name__)
 TV_BASE        = "https://www.tradingview.com"
 SIGNIN_URL     = f"{TV_BASE}/accounts/signin/"
 WATCHLIST_API  = f"{TV_BASE}/api/v1/symbols_list/watchlists/"
+SCREENER_API   = f"{TV_BASE}/api/v1/symbols_list/screeners/"
+SCAN_URL       = "https://scanner.tradingview.com/america/scan"
 
 _UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -113,6 +115,178 @@ def _update_watchlist(cookies: dict, csrf: str, wl_id: str, name: str, tv_symbol
         )
         resp.raise_for_status()
         return resp.json()
+
+
+def list_saved_screeners(username: str, password: str) -> list[dict]:
+    """
+    Return the user's saved TradingView screeners as
+    [{"id": "...", "name": "...", "symbol_count": N}, ...]
+
+    Tries the watchlist-style screener API first, then falls back to the
+    scanner saved-screener endpoint.  Returns an empty list on any error.
+    """
+    try:
+        cookies, csrf = _signin(username, password)
+        with httpx.Client(cookies=cookies, timeout=30) as client:
+            # Primary attempt — same API family as watchlists
+            resp = client.get(SCREENER_API, headers=_headers(csrf))
+
+            # Fallback: scanner-domain saved list
+            if resp.status_code in (404, 403, 401):
+                resp = client.get(
+                    "https://scanner.tradingview.com/screener/saved/list",
+                    headers=_headers(csrf),
+                )
+
+            resp.raise_for_status()
+            data = resp.json()
+            items = data.get("payload", data) if isinstance(data, dict) else data
+            if not isinstance(items, list):
+                return []
+
+            return [
+                {
+                    "id":           str(item.get("id", "")),
+                    "name":         item.get("name", ""),
+                    "symbol_count": item.get("symbol_count", item.get("count", None)),
+                }
+                for item in items
+                if item.get("name")
+            ]
+    except Exception as exc:
+        logger.error("list_saved_screeners failed: %s", exc)
+        return []
+
+
+def run_saved_screener(
+    username: str,
+    password: str,
+    screener_name: str,
+) -> tuple[list[str], str]:
+    """
+    Authenticate with TradingView, find the saved screener by name, and
+    execute its filter set against the US stock universe.
+
+    Returns (symbols, error_message).
+    symbols is empty and error_message is non-empty on failure.
+
+    Two execution strategies are attempted:
+      1. Fetch the screener's saved filter config and re-run it via the scanner API.
+      2. If the screener stores a symbol list (like a watchlist), return that directly.
+    """
+    try:
+        cookies, csrf = _signin(username, password)
+    except Exception as exc:
+        return [], f"TradingView sign-in failed: {exc}"
+
+    # ── Step 1: Find screener by name ─────────────────────────────────────────
+    screener_id = None
+    screener_filters = None
+
+    with httpx.Client(cookies=cookies, timeout=30) as client:
+        for url in (SCREENER_API, "https://scanner.tradingview.com/screener/saved/list"):
+            try:
+                resp = client.get(url, headers=_headers(csrf))
+                if resp.status_code not in (200, 201):
+                    continue
+                data = resp.json()
+                items = data.get("payload", data) if isinstance(data, dict) else data
+                if not isinstance(items, list):
+                    continue
+                match = next(
+                    (i for i in items if i.get("name", "").lower() == screener_name.lower()),
+                    None,
+                )
+                if match:
+                    screener_id = str(match.get("id", ""))
+                    # Some APIs embed the filter directly in the list response
+                    screener_filters = match.get("filters") or match.get("filter")
+                    break
+            except Exception:
+                continue
+
+    if not screener_id:
+        return [], f"Screener '{screener_name}' not found in your saved TradingView screeners."
+
+    # ── Step 2: Fetch filter config if not already embedded ───────────────────
+    if not screener_filters and screener_id:
+        with httpx.Client(cookies=cookies, timeout=30) as client:
+            for url in (
+                f"{SCREENER_API}{screener_id}/",
+                f"https://scanner.tradingview.com/screener/saved/{screener_id}",
+            ):
+                try:
+                    resp = client.get(url, headers=_headers(csrf))
+                    if resp.status_code not in (200, 201):
+                        continue
+                    data = resp.json()
+                    payload = data.get("payload", data) if isinstance(data, dict) else data
+                    screener_filters = payload.get("filters") or payload.get("filter")
+                    if screener_filters:
+                        break
+                except Exception:
+                    continue
+
+    # ── Step 3a: Re-run the saved filter set via the scanner API ─────────────
+    if screener_filters:
+        try:
+            resp = httpx.post(
+                SCAN_URL,
+                json={
+                    "filter":  screener_filters,
+                    "columns": ["close"],
+                    "range":   [0, 500],
+                    "markets": ["america"],
+                },
+                timeout=30,
+                headers={
+                    "User-Agent": _UA,
+                    "Origin":     TV_BASE + "/",
+                    "Referer":    TV_BASE + "/",
+                    **{k: v for k, v in (httpx.Cookies(cookies) if hasattr(cookies, "items") else {}).items()},
+                },
+                cookies=cookies,
+            )
+            resp.raise_for_status()
+            symbols = [row["s"].split(":")[-1] for row in resp.json().get("data", [])]
+            logger.info("run_saved_screener '%s': %d symbols via filter re-run", screener_name, len(symbols))
+            return symbols, ""
+        except Exception as exc:
+            logger.warning("run_saved_screener filter re-run failed: %s — trying symbol list", exc)
+
+    # ── Step 3b: Fallback — screener saved as a symbol list (like a watchlist) ─
+    with httpx.Client(cookies=cookies, timeout=30) as client:
+        for url in (
+            f"{SCREENER_API}{screener_id}/",
+            f"https://scanner.tradingview.com/screener/saved/{screener_id}",
+        ):
+            try:
+                resp = client.get(url, headers=_headers(csrf))
+                if resp.status_code not in (200, 201):
+                    continue
+                data = resp.json()
+                payload = data.get("payload", data) if isinstance(data, dict) else data
+                # Symbol list formats used by different TV endpoints
+                symbols = (
+                    [s["symbol"] for s in payload.get("symbols", {}).get("content", [])]
+                    or [s.get("symbol") or s.get("s") for s in payload.get("symbols", [])]
+                    or []
+                )
+                symbols = [s.split(":")[-1] for s in symbols if s]
+                if symbols:
+                    logger.info(
+                        "run_saved_screener '%s': %d symbols via symbol list",
+                        screener_name, len(symbols),
+                    )
+                    return symbols, ""
+            except Exception:
+                continue
+
+    return [], (
+        f"Screener '{screener_name}' was found (id={screener_id}) but its results "
+        "could not be fetched — TradingView's API may not support reading filter "
+        "configurations for this screener type."
+    )
 
 
 def update_weekly_picks(

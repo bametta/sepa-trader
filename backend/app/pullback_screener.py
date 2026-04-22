@@ -28,11 +28,9 @@ logger = logging.getLogger(__name__)
 
 SCAN_URL = "https://scanner.tradingview.com/america/scan"
 
-# TradingView columns for the pullback filter pass.
-# Only confirmed-valid column names are used here (same set the Minervini
-# screener uses successfully).  Relative volume is derived from
-# volume / average_volume_30d_calc; 1-week change and beta are dropped
-# because their TV column names vary and cause 400 errors.
+# TradingView columns fetched for every candidate.
+# Only confirmed-valid column names — relative volume is derived locally
+# from volume / average_volume_30d_calc.
 _PB_COLS = [
     "close",
     "EMA20",
@@ -41,9 +39,19 @@ _PB_COLS = [
     "EMA200",
     "RSI",
     "volume",
-    "average_volume_30d_calc",  # confirmed valid; used as avg-vol proxy
+    "average_volume_30d_calc",
     "market_cap_basic",
 ]
+
+_TV_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Origin":  "https://www.tradingview.com",
+    "Referer": "https://www.tradingview.com/",
+}
 
 # ── Settings helpers ──────────────────────────────────────────────────────────
 
@@ -98,13 +106,32 @@ def run_pullback_screener(
         if universe_raw else DEFAULT_UNIVERSE
     )
 
-    logger.info(
-        "Pullback screener: scanning %d symbols (mode=%s, top_n=%d)…",
-        len(universe), mode, cfg["top_n"],
-    )
+    # ── Pass 1: TradingView filter ────────────────────────────────────────────
+    # Option B: user has named a saved TV screener → use it directly
+    tv_screener_name = get_user_setting(db, "pb_tv_screener_name", "", user_id).strip()
+    tv_user = get_user_setting(db, "tv_username", "", user_id)
+    tv_pass = get_user_setting(db, "tv_password", "", user_id)
 
-    # ── Pass 1: TradingView batch filter ─────────────────────────────────────
-    candidates = _tv_filter(universe, cfg)
+    if tv_screener_name and tv_user and tv_pass:
+        logger.info(
+            "Pullback screener [Option B]: using saved TV screener '%s'", tv_screener_name
+        )
+        candidates = _tv_filter_saved_screener(tv_screener_name, tv_user, tv_pass, cfg)
+        if candidates is None:
+            # Fallback to Option A when saved screener fetch fails
+            logger.warning(
+                "Saved TV screener '%s' failed — falling back to server-side filter scan.",
+                tv_screener_name,
+            )
+            candidates = _tv_filter_serverside(cfg)
+    else:
+        # Option A: send filter conditions to TV's scanner, let TV do the filtering
+        logger.info(
+            "Pullback screener [Option A]: server-side TV filter scan (universe=%d symbols)",
+            len(universe),
+        )
+        candidates = _tv_filter_serverside(cfg)
+
     logger.info("Pullback screener: %d candidates after TV filter", len(candidates))
 
     if not candidates:
@@ -197,12 +224,57 @@ def run_pullback_screener(
     return plan_rows
 
 
-# ── Pass 1: TradingView batch filter ─────────────────────────────────────────
+# ── Pass 1 helpers ────────────────────────────────────────────────────────────
 
-def _tv_filter(universe: list[str], cfg: dict) -> list[dict]:
-    """Single TradingView POST — returns candidates that pass all hard filters."""
-    tv_syms = [to_tv_symbol(s) for s in universe]
+def _build_tv_filters(cfg: dict) -> list[dict]:
+    """
+    Convert pb_* settings into TradingView scanner filter conditions.
+    These are enforced server-side by TV — no local re-check needed.
+    """
+    f = []
 
+    # Price range
+    if cfg["price_min"] > 0:
+        f.append({"left": "close", "operation": "greater", "right": cfg["price_min"]})
+    if cfg["price_max"] > 0:
+        f.append({"left": "close", "operation": "less",    "right": cfg["price_max"]})
+
+    # EMA ladder (each step independent)
+    if cfg["price_above_ema20"]:
+        f.append({"left": "close", "operation": "greater", "right": "EMA20"})
+    if cfg["ema20_above_ema50"]:
+        f.append({"left": "EMA20",  "operation": "greater", "right": "EMA50"})
+    if cfg["ema50_above_ema100"]:
+        f.append({"left": "EMA50",  "operation": "greater", "right": "EMA100"})
+    if cfg["ema100_above_ema200"]:
+        f.append({"left": "EMA100", "operation": "greater", "right": "EMA200"})
+
+    # RSI reset zone
+    f.append({"left": "RSI", "operation": "in_range",
+               "right": [cfg["rsi_min"], cfg["rsi_max"]]})
+
+    # Average volume (absolute floor — rel_vol is checked locally after fetch)
+    if cfg["avg_vol_min"] > 0:
+        f.append({"left": "average_volume_30d_calc",
+                  "operation": "greater", "right": cfg["avg_vol_min"]})
+
+    # Market cap
+    if cfg["market_cap_min"] > 0:
+        f.append({"left": "market_cap_basic",
+                  "operation": "greater", "right": cfg["market_cap_min"]})
+
+    return f
+
+
+def _fetch_and_refine(tv_syms: list[str], cfg: dict) -> list[dict]:
+    """
+    Batch-fetch _PB_COLS for a list of TV-formatted symbols, then apply the
+    two filters that can't be expressed server-side:
+      • EMA50 proximity  (requires arithmetic on two columns)
+      • Relative volume  (volume / average_volume_30d_calc)
+
+    Returns a list of candidate dicts ready for pass 2.
+    """
     try:
         resp = httpx.post(
             SCAN_URL,
@@ -211,98 +283,152 @@ def _tv_filter(universe: list[str], cfg: dict) -> list[dict]:
                 "columns": _PB_COLS,
             },
             timeout=30,
-            headers={
-                "User-Agent": (
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/124.0.0.0 Safari/537.36"
-                ),
-                "Origin":  "https://www.tradingview.com",
-                "Referer": "https://www.tradingview.com/",
-            },
+            headers=_TV_HEADERS,
         )
         resp.raise_for_status()
     except Exception as exc:
-        logger.error("Pullback TV scan failed: %s", exc)
+        logger.error("Pullback TV data fetch failed: %s", exc)
         return []
 
     candidates = []
     for row in resp.json().get("data", []):
         sym = row["s"].split(":")[-1]
         v   = dict(zip(_PB_COLS, row["d"]))
-        c   = _apply_tv_filters(sym, v, cfg)
+        c   = _local_refinement(sym, v, cfg)
         if c is not None:
             candidates.append(c)
-
     return candidates
 
 
-def _apply_tv_filters(sym: str, v: dict, cfg: dict) -> dict | None:
-    """Returns a candidate dict if the stock passes all TV-based filters, else None."""
+def _local_refinement(sym: str, v: dict, cfg: dict) -> dict | None:
+    """
+    Apply the two filters that TV can't enforce server-side, then build the
+    candidate dict.  The EMA ladder and price/volume/cap conditions are already
+    guaranteed by the server-side filter — we don't re-check them here.
+    """
     close = v.get("close") or 0
     if not close:
-        return None
-
-    # ── Price range ───────────────────────────────────────────────────────────
-    if cfg["price_min"] > 0 and close < cfg["price_min"]:
-        return None
-    if cfg["price_max"] > 0 and close > cfg["price_max"]:
         return None
 
     e20  = v.get("EMA20")  or 0
     e50  = v.get("EMA50")  or 0
     e100 = v.get("EMA100") or 0
     e200 = v.get("EMA200") or 0
+    rsi  = v.get("RSI")    or 50.0
 
-    # ── EMA ladder — each step checked independently ──────────────────────────
-    if cfg["price_above_ema20"]   and e20  and close < e20:
-        return None
-    if cfg["ema20_above_ema50"]   and e20  and e50  and e20  <= e50:
-        return None
-    if cfg["ema50_above_ema100"]  and e50  and e100 and e50  <= e100:
-        return None
-    if cfg["ema100_above_ema200"] and e100 and e200 and e100 <= e200:
-        return None
-
-    # ── RSI in reset zone 40–60 ───────────────────────────────────────────────
-    rsi = v.get("RSI") or 0
-    if rsi and (rsi < cfg["rsi_min"] or rsi > cfg["rsi_max"]):
-        return None
-
-    # ── Average volume (30-day — confirmed valid TV column) ───────────────────
     avg_vol = v.get("average_volume_30d_calc") or 0
-    if avg_vol < cfg["avg_vol_min"]:
-        return None
-
-    # ── Relative volume (derived: today's volume / 30-day avg) ───────────────
-    vol = v.get("volume") or 0
+    vol     = v.get("volume") or 0
     rel_vol = (vol / avg_vol) if avg_vol > 0 else 0
+
+    # Relative volume — can't be done server-side (derived column)
     if rel_vol < cfg["rel_vol_min"]:
         return None
 
-    # ── Market cap ────────────────────────────────────────────────────────────
-    mcap = v.get("market_cap_basic") or 0
-    if mcap < cfg["market_cap_min"]:
-        return None
-
-    # ── EMA50 proximity (the actual pullback condition) ───────────────────────
+    # EMA50 proximity — requires arithmetic on two TV columns
     ema50_pct = abs(close - e50) / e50 * 100 if e50 else 0
     if e50 and ema50_pct > cfg["ema50_proximity"]:
         return None
 
     return {
-        "symbol":    sym,
-        "price":     close,
-        "rsi":       rsi or 50.0,
-        "ema20":     e20,
-        "ema50":     e50,
-        "ema100":    e100,
-        "ema200":    e200,
-        "ema50_pct": ema50_pct,
-        "avg_vol":   avg_vol,
-        "rel_vol":   round(rel_vol, 2),
-        "market_cap": mcap,
+        "symbol":     sym,
+        "price":      close,
+        "rsi":        rsi,
+        "ema20":      e20,
+        "ema50":      e50,
+        "ema100":     e100,
+        "ema200":     e200,
+        "ema50_pct":  ema50_pct,
+        "avg_vol":    avg_vol,
+        "rel_vol":    round(rel_vol, 2),
+        "market_cap": v.get("market_cap_basic") or 0,
     }
+
+
+# ── Pass 1 Option A: server-side TV filter scan ───────────────────────────────
+
+def _tv_filter_serverside(cfg: dict) -> list[dict]:
+    """
+    Send filter conditions to TV's scanner and let TV do the heavy lifting.
+    Returns all of the US market — not limited to a configured universe.
+    Eliminates false positives caused by local Python filtering.
+    """
+    tv_filters = _build_tv_filters(cfg)
+
+    try:
+        resp = httpx.post(
+            SCAN_URL,
+            json={
+                "filter":  tv_filters,
+                "columns": _PB_COLS,
+                "range":   [0, 200],   # up to 200 pre-filtered results
+                "sort":    {"sortBy": "market_cap_basic", "sortOrder": "desc"},
+                "markets": ["america"],
+            },
+            timeout=30,
+            headers=_TV_HEADERS,
+        )
+        resp.raise_for_status()
+    except Exception as exc:
+        logger.error("Pullback TV server-side filter scan failed: %s", exc)
+        return []
+
+    candidates = []
+    for row in resp.json().get("data", []):
+        sym = row["s"].split(":")[-1]
+        v   = dict(zip(_PB_COLS, row["d"]))
+        c   = _local_refinement(sym, v, cfg)
+        if c is not None:
+            candidates.append(c)
+
+    logger.info(
+        "Pullback [Option A]: TV returned %d pre-filtered stocks, %d passed local refinement",
+        len(resp.json().get("data", [])), len(candidates),
+    )
+    return candidates
+
+
+# ── Pass 1 Option B: saved TV screener ────────────────────────────────────────
+
+def _tv_filter_saved_screener(
+    screener_name: str,
+    tv_user: str,
+    tv_pass: str,
+    cfg: dict,
+) -> list[dict] | None:
+    """
+    Fetch results from the user's saved TradingView screener by name,
+    then batch-fetch indicator data and apply local refinement (EMA50
+    proximity + relative volume).
+
+    Returns None on failure so the caller can fall back to Option A.
+    """
+    from .tradingview_client import run_saved_screener, to_tv_symbol
+
+    symbols, err = run_saved_screener(tv_user, tv_pass, screener_name)
+
+    if err:
+        logger.error("Saved TV screener error: %s", err)
+        return None
+
+    if not symbols:
+        logger.warning("Saved TV screener '%s' returned 0 symbols.", screener_name)
+        return None
+
+    logger.info(
+        "Pullback [Option B]: saved screener '%s' returned %d symbols — fetching indicators…",
+        screener_name, len(symbols),
+    )
+
+    tv_syms = [to_tv_symbol(s) for s in symbols]
+    # Batch-fetch indicators then apply local refinement only
+    # (EMA ladder is already guaranteed by the TV screener itself)
+    candidates = _fetch_and_refine(tv_syms, cfg)
+
+    logger.info(
+        "Pullback [Option B]: %d/%d symbols passed local refinement (EMA50 proximity + rel-vol)",
+        len(candidates), len(symbols),
+    )
+    return candidates
 
 
 # ── Pass 2: PPST + earnings ───────────────────────────────────────────────────
