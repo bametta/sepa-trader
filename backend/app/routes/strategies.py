@@ -101,7 +101,7 @@ def _save_signal(db: Session, user_id: int, strategy_name: str,
                  data, reasoning, ai_verdict, ai_reasoning, mode)
             VALUES
                 (:uid, :name, :sym, :action,
-                 :data::jsonb, :reasoning, :ai_verdict, :ai_reasoning, :mode)
+                 CAST(:data AS jsonb), :reasoning, :ai_verdict, :ai_reasoning, :mode)
         """),
         {
             "uid":         user_id,
@@ -369,7 +369,7 @@ def update_dm_config(
             params[field] = val
 
     if body.lookback_months is not None:
-        updates.append("settings = settings || :extra::jsonb")
+        updates.append("settings = settings || CAST(:extra AS jsonb)")
         params["extra"] = json.dumps({"lookback_months": body.lookback_months})
 
     if updates:
@@ -446,13 +446,16 @@ def _execute_signal_bg(user_id: int, strategy_name: str, symbol: str, mode: str)
     db = SessionLocal()
     try:
         _execute_signal(db, user_id, strategy_name, symbol, mode)
-        # Mark latest signal as executed
+        # Mark latest signal as executed (subquery required — PostgreSQL has no UPDATE...ORDER BY)
         db.execute(
             text("""
                 UPDATE strategy_signals SET executed = true
-                WHERE user_id = :uid AND strategy_name = :name
-                ORDER BY created_at DESC
-                LIMIT 1
+                WHERE id = (
+                    SELECT id FROM strategy_signals
+                    WHERE user_id = :uid AND strategy_name = :name
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                )
             """),
             {"uid": user_id, "name": strategy_name},
         )
