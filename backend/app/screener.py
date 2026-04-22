@@ -92,8 +92,9 @@ def run_screener(db: Session, mode: str = None, user_id: int = None) -> list[dic
     if mode is None:
         mode = _s("trading_mode", "paper")
 
-    risk_pct = float(_s("risk_pct", "2.0"))
-    stop_pct = float(_s("stop_loss_pct", "8.0"))
+    risk_pct         = float(_s("risk_pct",         "2.0"))
+    stop_pct         = float(_s("stop_loss_pct",    "8.0"))
+    max_position_pct = float(_s("max_position_pct", "20.0") or "20.0")
 
     # --- Screener filter settings ---
     price_min       = float(_s("screener_price_min",     "0")   or "0")
@@ -245,8 +246,16 @@ def run_screener(db: Session, mode: str = None, user_id: int = None) -> list[dic
         stop     = round(price * (1 - stop_pct / 100), 4)
         target1  = round(price * (1 + stop_pct * 2 / 100), 4)
         target2  = round(price * (1 + stop_pct * 3 / 100), 4)
-        stop_d   = price - stop
-        shares   = int(risk_dollars / stop_d) if stop_d > 0 else 0
+        stop_d            = price - stop
+        risk_based_shares = int(risk_dollars / stop_d) if stop_d > 0 else 0
+        max_value_shares  = int((account_value * max_position_pct / 100) / price) if price > 0 else 0
+        shares            = min(risk_based_shares, max_value_shares)
+        if risk_based_shares > max_value_shares and max_value_shares > 0:
+            logger.info(
+                "Position cap applied for %s: risk-based=%d shares ($%.0f) capped to %d shares ($%.0f, %.0f%% of account)",
+                c["symbol"], risk_based_shares, risk_based_shares * price,
+                max_value_shares, max_value_shares * price, max_position_pct,
+            )
         risk_amt = round(shares * stop_d, 2)
 
         plan_rows.append({

@@ -99,7 +99,7 @@ export default function PositionCard({ pos }) {
       : ''
 
   return (
-    <div className={`card p-5 flex flex-col gap-4 glass-hover ${glowClass}`}>
+    <div className={`card p-4 flex flex-col gap-3 glass-hover ${glowClass}`}>
 
       {/* Header */}
       <div className="flex items-start justify-between gap-2">
@@ -182,7 +182,7 @@ export default function PositionCard({ pos }) {
       </div>
 
       {/* Edit exits */}
-      <div className="border-t border-white/5 pt-3 space-y-3">
+      <div className="border-t border-white/5 pt-2 space-y-2">
         <button
           onClick={openExitForm}
           className="flex items-center gap-1.5 text-xs text-amber-400/80 hover:text-amber-300 transition-colors"

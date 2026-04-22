@@ -46,7 +46,7 @@ function Skeleton({ className = 'h-4 w-24' }) {
 
 function SectionTitle({ children, action }) {
   return (
-    <div className="flex items-center justify-between mb-4">
+    <div className="flex items-center justify-between mb-3">
       <h3 className="label">{children}</h3>
       {action}
     </div>
@@ -66,7 +66,7 @@ function EnvBadge({ env }) {
 // ── Market Environment ────────────────────────────────────────────────────────
 function MarketEnvCard({ env, loading }) {
   if (loading) return (
-    <div className="card p-5">
+    <div className="card p-4">
       <Skeleton className="h-4 w-32 mb-5" />
       <div className="grid grid-cols-2 gap-3">
         {[...Array(4)].map((_, i) => <Skeleton key={i} className="h-14 w-full" />)}
@@ -119,7 +119,7 @@ function MarketEnvCard({ env, loading }) {
 // ── AI Decision ───────────────────────────────────────────────────────────────
 function AiDecisionCard({ signal, loading }) {
   if (loading) return (
-    <div className="card p-5">
+    <div className="card p-4">
       <Skeleton className="h-4 w-28 mb-4" />
       <Skeleton className="h-10 w-48 mb-3" />
       <Skeleton className="h-4 w-full" />
@@ -127,7 +127,7 @@ function AiDecisionCard({ signal, loading }) {
     </div>
   )
   if (!signal) return (
-    <div className="card p-5 flex flex-col items-center justify-center text-center gap-3 min-h-[180px]">
+    <div className="card p-4 flex flex-col items-center justify-center text-center gap-3 min-h-[180px]">
       <span className="text-4xl opacity-20">⟳</span>
       <p className="text-slate-500 text-sm">No signal yet</p>
       <p className="text-slate-600 text-xs">Run an evaluation to generate the first signal</p>
@@ -181,9 +181,9 @@ function MomentumBars({ momentum }) {
   const max    = Math.max(...values.map(v => Math.abs(v.val)), 0.001)
 
   return (
-    <div className="card p-5">
+    <div className="card p-4">
       <SectionTitle>12-Month Momentum</SectionTitle>
-      <div className="space-y-4">
+      <div className="space-y-3">
         {values.map(({ key, val }) => {
           const w   = Math.round((Math.abs(val) / max) * 100)
           const pos = val >= 0
@@ -212,13 +212,13 @@ function MomentumBars({ momentum }) {
 // ── Position list ─────────────────────────────────────────────────────────────
 function PositionsList({ positions, loading }) {
   if (loading) return (
-    <div className="card p-5">
+    <div className="card p-4">
       <Skeleton className="h-4 w-32 mb-4" />
       <Skeleton className="h-16 w-full" />
     </div>
   )
   return (
-    <div className="card p-5">
+    <div className="card p-4">
       <SectionTitle>Current Position</SectionTitle>
       {(!positions || positions.length === 0) ? (
         <div className="text-center py-6">
@@ -255,7 +255,7 @@ const VERDICT_COLORS = {
 
 function HistoryTable({ history }) {
   return (
-    <div className="card p-5">
+    <div className="card p-4">
       <SectionTitle>Signal History</SectionTitle>
       {(!history || history.length === 0) ? (
         <div className="text-center py-6">
@@ -325,16 +325,16 @@ function StrategySettings({ config, onSave, saving }) {
     <div className="card overflow-hidden">
       <button
         onClick={() => setOpen(o => !o)}
-        className="w-full flex items-center justify-between px-5 py-4 hover:bg-white/[0.02] transition-colors"
+        className="w-full flex items-center justify-between px-4 py-3 hover:bg-white/[0.02] transition-colors"
       >
         <span className="label">Strategy Settings</span>
         <span className={`text-slate-600 text-xs transition-transform duration-200 ${open ? 'rotate-180' : ''}`}>▼</span>
       </button>
 
       {open && form && (
-        <div className="px-5 pb-6 space-y-6 border-t border-white/5 pt-5 animate-slide-up">
+        <div className="px-4 pb-4 space-y-4 border-t border-white/5 pt-4 animate-slide-up">
           {/* Toggles row */}
-          <div className="grid grid-cols-1 sm:grid-cols-3 gap-5">
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
             {[
               { label: 'Strategy Active', key: 'is_active' },
               { label: 'Auto-Execute Signals', key: 'auto_execute' },
@@ -462,7 +462,7 @@ export default function DualMomentumTab() {
   const gemReason = evalResult?.signal?.reasoning || signal?.data?.reasoning
 
   return (
-    <div className="space-y-4 animate-fade-in">
+    <div className="space-y-3 animate-fade-in">
 
       {/* Toast */}
       {toast && (
@@ -510,14 +510,14 @@ export default function DualMomentumTab() {
       </div>
 
       {/* Top row: market env + AI decision */}
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-3">
         <MarketEnvCard env={envData} loading={envLoading && !evalResult} />
         <AiDecisionCard signal={displaySignal} loading={sigLoading && !evalResult} />
       </div>
 
       {/* GEM reasoning */}
       {gemReason && (
-        <div className="card p-5 border-l-2 border-indigo-500/30">
+        <div className="card p-4 border-l-2 border-indigo-500/30">
           <div className="label mb-2">GEM Signal Reasoning</div>
           <p className="text-sm text-slate-300 leading-relaxed">{gemReason}</p>
         </div>
