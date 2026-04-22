@@ -28,7 +28,11 @@ logger = logging.getLogger(__name__)
 
 SCAN_URL = "https://scanner.tradingview.com/america/scan"
 
-# TradingView columns for the pullback filter pass
+# TradingView columns for the pullback filter pass.
+# Only confirmed-valid column names are used here (same set the Minervini
+# screener uses successfully).  Relative volume is derived from
+# volume / average_volume_30d_calc; 1-week change and beta are dropped
+# because their TV column names vary and cause 400 errors.
 _PB_COLS = [
     "close",
     "EMA20",
@@ -36,12 +40,9 @@ _PB_COLS = [
     "EMA100",
     "EMA200",
     "RSI",
-    "Relative.Volume.10D",
-    "average_volume_10d_calc",
     "volume",
+    "average_volume_30d_calc",  # confirmed valid; used as avg-vol proxy
     "market_cap_basic",
-    "change_1W",
-    "beta_1_year",
 ]
 
 # ── Settings helpers ──────────────────────────────────────────────────────────
@@ -59,11 +60,10 @@ def get_pb_settings(db: Session, user_id: int) -> dict:
         "rsi_min":           float(_s("pb_rsi_min",           40.0)),
         "rsi_max":           float(_s("pb_rsi_max",           60.0)),
         "avg_vol_min":       float(_s("pb_avg_vol_min",       1_000_000)),
+        # rel_vol_min: derived from volume / average_volume_30d_calc
         "rel_vol_min":       float(_s("pb_rel_vol_min",       0.75)),
         "market_cap_min":    float(_s("pb_market_cap_min",    500_000_000)),
-        "week_change_min":   float(_s("pb_week_change_min",   -3.0)),
         "ema50_proximity":   float(_s("pb_ema50_proximity",   8.0)),
-        "beta_max":          float(_s("pb_beta_max",          2.5)),
         "earnings_days_min": int(  _s("pb_earnings_days_min", 15)),
         "ppst_required":     _s("pb_ppst_required",     "true") == "true",
         "top_n":             int(  _s("pb_top_n",             5)),
@@ -255,29 +255,20 @@ def _apply_tv_filters(sym: str, v: dict, cfg: dict) -> dict | None:
     if rsi and (rsi < cfg["rsi_min"] or rsi > cfg["rsi_max"]):
         return None
 
-    # ── Average volume 10D ────────────────────────────────────────────────────
-    avg_vol10 = v.get("average_volume_10d_calc") or 0
-    if avg_vol10 < cfg["avg_vol_min"]:
+    # ── Average volume (30-day — confirmed valid TV column) ───────────────────
+    avg_vol = v.get("average_volume_30d_calc") or 0
+    if avg_vol < cfg["avg_vol_min"]:
         return None
 
-    # ── Relative volume ───────────────────────────────────────────────────────
-    rel_vol = v.get("Relative.Volume.10D") or 0
+    # ── Relative volume (derived: today's volume / 30-day avg) ───────────────
+    vol = v.get("volume") or 0
+    rel_vol = (vol / avg_vol) if avg_vol > 0 else 0
     if rel_vol < cfg["rel_vol_min"]:
         return None
 
     # ── Market cap ────────────────────────────────────────────────────────────
     mcap = v.get("market_cap_basic") or 0
     if mcap < cfg["market_cap_min"]:
-        return None
-
-    # ── 1-week change ─────────────────────────────────────────────────────────
-    w_change = v.get("change_1W")
-    if w_change is not None and w_change < cfg["week_change_min"]:
-        return None
-
-    # ── Beta ──────────────────────────────────────────────────────────────────
-    beta = v.get("beta_1_year")
-    if beta is not None and beta > cfg["beta_max"]:
         return None
 
     # ── EMA50 proximity (the actual pullback condition) ───────────────────────
@@ -293,10 +284,9 @@ def _apply_tv_filters(sym: str, v: dict, cfg: dict) -> dict | None:
         "ema50":     e50,
         "ema200":    e200,
         "ema50_pct": ema50_pct,
-        "avg_vol10": avg_vol10,
-        "rel_vol":   rel_vol,
+        "avg_vol":   avg_vol,
+        "rel_vol":   round(rel_vol, 2),
         "market_cap": mcap,
-        "w_change":  w_change,
     }
 
 
