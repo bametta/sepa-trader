@@ -77,6 +77,8 @@ def get_pb_settings(db: Session, user_id: int) -> dict:
         "ema50_proximity":     float(_s("pb_ema50_proximity",   8.0)),
         "earnings_days_min":   int(  _s("pb_earnings_days_min", 15)),
         "ppst_required":       _s("pb_ppst_required",     "true") == "true",
+        "ppst_period":         int(  _s("pb_ppst_period",       14)),
+        "ppst_multiplier":     float(_s("pb_ppst_multiplier",   2.0)),
         "top_n":               int(  _s("pb_top_n",             5)),
     }
 
@@ -452,7 +454,7 @@ def _score_candidates(candidates: list[dict], cfg: dict) -> list[dict]:
                 logger.debug("Pullback: %s skipped — insufficient OHLCV data", sym)
                 continue
 
-            ppst_bullish = _calc_ppst(df)
+            ppst_bullish = _calc_ppst(df, period=cfg["ppst_period"], multiplier=cfg["ppst_multiplier"])
 
             if cfg["ppst_required"] and not ppst_bullish:
                 logger.debug("Pullback: %s skipped — PPST not bullish", sym)
