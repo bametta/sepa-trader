@@ -1,6 +1,6 @@
 import { useState } from 'react'
-import { useQuery, useQueryClient } from 'react-query'
-import { fetchSettings, updateSetting, fetchMe } from '../api/client'
+import { useQuery, useQueryClient, useMutation } from 'react-query'
+import { fetchSettings, updateSetting, fetchMe, fetchTvScreeners } from '../api/client'
 import TwoFactorSetup from './TwoFactorSetup'
 
 const DAYS = ['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday']
@@ -26,6 +26,7 @@ const SECTIONS = [
   {
     title: 'Pullback Screener (PPST + EMA)',
     fields: [
+      { key: 'pb_tv_screener_name',  label: 'TradingView Screener name (leave blank to use app filters below)', type: 'tv_screener', span: true },
       { key: 'pb_price_min',         label: 'Min price $ (default 10)',             type: 'number' },
       { key: 'pb_price_max',         label: 'Max price $ (default 200)',            type: 'number' },
       { key: 'pb_rsi_min',           label: 'RSI min (reset zone, default 40)',     type: 'number' },
@@ -112,7 +113,23 @@ export default function SettingsPanel() {
   const qc            = useQueryClient()
   const { data = {} } = useQuery('settings', fetchSettings)
   const { data: me, refetch: refetchMe } = useQuery('me', fetchMe, { staleTime: 60000 })
-  const [saving, setSaving] = useState(null)
+  const [saving, setSaving]   = useState(null)
+  const [tvOpen, setTvOpen]   = useState(false)
+  const [tvList, setTvList]   = useState([])
+  const [tvLoading, setTvLoading] = useState(false)
+  const [tvError, setTvError] = useState('')
+
+  async function loadTvScreeners() {
+    setTvLoading(true); setTvError('')
+    try {
+      const res = await fetchTvScreeners()
+      setTvList(res.screeners || [])
+      setTvOpen(true)
+    } catch (e) {
+      setTvError(e?.response?.data?.detail || 'Could not fetch screeners — check TradingView credentials in Settings → Integrations.')
+    } finally {
+      setTvLoading(false) }
+  }
 
   async function save(key, value) {
     setSaving(key)
@@ -156,6 +173,12 @@ export default function SettingsPanel() {
                   value={data[f.key] ?? ''}
                   saving={saving === f.key}
                   onSave={val => save(f.key, val)}
+                  tvScreeners={f.type === 'tv_screener' ? tvList : undefined}
+                  tvLoading={f.type === 'tv_screener' ? tvLoading : undefined}
+                  tvError={f.type === 'tv_screener' ? tvError : undefined}
+                  tvOpen={f.type === 'tv_screener' ? tvOpen : undefined}
+                  onBrowseTv={f.type === 'tv_screener' ? loadTvScreeners : undefined}
+                  onCloseTv={f.type === 'tv_screener' ? () => setTvOpen(false) : undefined}
                 />
               </div>
             ))}
@@ -166,10 +189,58 @@ export default function SettingsPanel() {
   )
 }
 
-function Field({ field, value, saving, onSave }) {
+function Field({ field, value, saving, onSave,
+                 tvScreeners, tvLoading, tvError, tvOpen, onBrowseTv, onCloseTv }) {
   const [local, setLocal] = useState(null)
   // Use local (optimistic) → DB value → field default → empty string
   const current = local ?? (value !== '' && value !== undefined ? value : (field.defaultValue ?? ''))
+
+  if (field.type === 'tv_screener') {
+    return (
+      <div className="bg-surface rounded-lg p-3">
+        <label className="text-xs text-slate-400 block mb-1">{field.label}</label>
+        <div className="flex gap-2 items-center">
+          <input
+            type="text"
+            value={local ?? value ?? ''}
+            onChange={e => setLocal(e.target.value)}
+            placeholder="e.g. My Pullback Screener"
+            className="flex-1 bg-transparent text-slate-200 text-sm outline-none border-b border-border focus:border-accent"
+          />
+          {(local !== null && local !== value) && (
+            <button
+              onClick={() => { onSave(local); setLocal(null) }}
+              disabled={saving}
+              className="text-xs text-accent hover:text-indigo-300 disabled:opacity-50 flex-shrink-0"
+            >{saving ? '…' : 'Save'}</button>
+          )}
+          <button
+            onClick={onBrowseTv}
+            disabled={tvLoading}
+            className="text-xs bg-accent/20 text-accent hover:bg-accent/30 rounded px-2 py-1 flex-shrink-0 disabled:opacity-50"
+          >{tvLoading ? 'Loading…' : 'Browse'}</button>
+        </div>
+        {tvError && <p className="text-xs text-red-400 mt-1">{tvError}</p>}
+        {(local ?? value) && (
+          <p className="text-xs text-emerald-400 mt-1">
+            ✓ Using TV screener — app filters below are bypassed
+          </p>
+        )}
+        {!(local ?? value) && (
+          <p className="text-xs text-slate-500 mt-1">
+            Blank = use app filters below (Option A — server-side TV scan)
+          </p>
+        )}
+        {tvOpen && (
+          <TvScreenerPicker
+            screeners={tvScreeners}
+            onSelect={name => { setLocal(name); onSave(name); onCloseTv() }}
+            onClose={onCloseTv}
+          />
+        )}
+      </div>
+    )
+  }
 
   if (field.type === 'toggle') {
     const on = current === 'true'
@@ -231,6 +302,48 @@ function Field({ field, value, saving, onSave }) {
             {saving ? '…' : 'Save'}
           </button>
         )}
+      </div>
+    </div>
+  )
+}
+
+function TvScreenerPicker({ screeners, onSelect, onClose }) {
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60"
+         onClick={onClose}>
+      <div className="bg-card border border-border rounded-xl p-4 w-80 max-h-96 flex flex-col shadow-2xl"
+           onClick={e => e.stopPropagation()}>
+        <div className="flex items-center justify-between mb-3">
+          <h3 className="text-sm font-semibold text-slate-200">Your TradingView Screeners</h3>
+          <button onClick={onClose} className="text-slate-500 hover:text-slate-200 text-lg leading-none">×</button>
+        </div>
+        {screeners.length === 0 ? (
+          <p className="text-sm text-slate-400 py-4 text-center">
+            No saved screeners found.<br />
+            <span className="text-xs text-slate-500">Create and save a screener in TradingView first.</span>
+          </p>
+        ) : (
+          <ul className="overflow-y-auto space-y-1">
+            {screeners.map(s => (
+              <li key={s.id}>
+                <button
+                  onClick={() => onSelect(s.name)}
+                  className="w-full text-left px-3 py-2 rounded-lg hover:bg-accent/20 text-sm text-slate-200 flex items-center justify-between group"
+                >
+                  <span>{s.name}</span>
+                  {s.symbol_count != null && (
+                    <span className="text-xs text-slate-500 group-hover:text-slate-300">
+                      {s.symbol_count} stocks
+                    </span>
+                  )}
+                </button>
+              </li>
+            ))}
+          </ul>
+        )}
+        <p className="text-xs text-slate-500 mt-3 border-t border-border pt-2">
+          Selecting a screener will use its exact TV filter set. App filters below will be bypassed.
+        </p>
       </div>
     </div>
   )

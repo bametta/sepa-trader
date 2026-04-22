@@ -384,6 +384,30 @@ def get_pullback_settings(
     return get_pb_settings(db, current_user["id"])
 
 
+@router.get("/tv-screeners")
+def list_tv_screeners(
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Authenticate with TradingView using the user's stored credentials
+    and return their saved screeners as [{"id": ..., "name": ...}].
+    Returns an empty list (not an error) when no credentials are configured.
+    """
+    from fastapi import HTTPException
+    from ..tradingview_client import list_saved_screeners
+
+    uid      = current_user["id"]
+    tv_user  = get_user_setting(db, "tv_username", "", uid)
+    tv_pass  = get_user_setting(db, "tv_password", "", uid)
+
+    if not tv_user or not tv_pass:
+        raise HTTPException(400, "TradingView credentials not configured in Settings → Integrations.")
+
+    screeners = list_saved_screeners(tv_user, tv_pass)
+    return {"screeners": screeners, "count": len(screeners)}
+
+
 @router.post("/sync-tradingview")
 def sync_tradingview(
     background_tasks: BackgroundTasks,
