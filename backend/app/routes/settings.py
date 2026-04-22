@@ -10,17 +10,26 @@ from ..database import (
 router = APIRouter(prefix="/api/settings", tags=["settings"])
 
 EDITABLE_KEYS = {
-    "trading_mode", "auto_execute", "risk_pct", "stop_loss_pct", "max_positions",
+    "trading_mode", "auto_execute", "monitor_enabled",
+    "risk_pct", "stop_loss_pct", "max_positions", "max_position_pct",
     "watchlist", "webhook_secret",
     "screener_universe",
     "screener_price_min", "screener_price_max", "screener_top_n",
     "screener_min_score", "screener_vol_surge_pct", "screener_ema20_pct", "screener_ema50_pct",
     "screener_auto_run", "screener_schedule_day", "screener_schedule_time",
     "tv_username", "tv_password",
-    # AI provider settings (replaces claude_api_key / claude_model)
+    # AI provider settings
     "ai_provider", "ai_api_key", "ai_model", "ai_base_url",
     "alpaca_paper_key", "alpaca_paper_secret",
     "alpaca_live_key",  "alpaca_live_secret",
+    # Pullback screener settings
+    "pb_price_min", "pb_price_max",
+    "pb_rsi_min", "pb_rsi_max",
+    "pb_avg_vol_min", "pb_rel_vol_min",
+    "pb_market_cap_min", "pb_week_change_min",
+    "pb_ema50_proximity", "pb_beta_max",
+    "pb_earnings_days_min", "pb_top_n",
+    "pb_ema_alignment", "pb_price_above_ema20", "pb_ppst_required",
 }
 
 
