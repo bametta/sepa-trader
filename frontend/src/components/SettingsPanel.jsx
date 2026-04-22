@@ -76,14 +76,22 @@ const SECTIONS = [
       { key: 'stop_loss_pct',       label: 'Default stop loss %',                                  type: 'number' },
       { key: 'max_position_pct',    label: 'Max position size % (hard cap)',                       type: 'number' },
       { key: 'max_positions',       label: 'Max simultaneous positions',                           type: 'number' },
-      { key: 'entry_order_type', label: 'Entry order type', type: 'select',
+      { key: 'mv_entry_order_type', label: 'Minervini entry order type', type: 'select',
         options: [
-          { value: 'limit',      label: 'Limit — fills up to entry + slippage% (recommended for pullbacks)' },
-          { value: 'stop_limit', label: 'Stop-limit — activates only when price reaches entry (recommended for breakouts)' },
-          { value: 'market',     label: 'Market — immediate fill at any price (original behaviour)' },
+          { value: 'stop_limit', label: 'Stop-limit — activates only when price breaks out (recommended for Minervini)' },
+          { value: 'limit',      label: 'Limit — fills up to entry + slippage%' },
+          { value: 'market',     label: 'Market — immediate fill at any price' },
         ]
       },
-      { key: 'entry_slippage_pct', label: 'Entry slippage tolerance % (default 0.5 — limit fills up to entry × 1.005)', type: 'number' },
+      { key: 'mv_entry_slippage_pct', label: 'Minervini slippage tolerance % (default 1.0)', type: 'number' },
+      { key: 'pb_entry_order_type', label: 'Pullback entry order type', type: 'select',
+        options: [
+          { value: 'limit',      label: 'Limit — fills up to entry + slippage% (recommended for pullbacks)' },
+          { value: 'stop_limit', label: 'Stop-limit — activates only when price reaches entry' },
+          { value: 'market',     label: 'Market — immediate fill at any price' },
+        ]
+      },
+      { key: 'pb_entry_slippage_pct', label: 'Pullback slippage tolerance % (default 0.5)', type: 'number' },
     ],
   },
   {

@@ -147,20 +147,29 @@ def _place_entry(
     target: float,
     trigger: str,
     mode: str,
+    screener_type: str = "minervini",
 ) -> str:
     """
     Submit the entry buy using the user-configured order type.
     Returns a short description string for logging.
 
-    entry_order_type setting:
+    Settings are split by screener source:
+      mv_entry_order_type / mv_entry_slippage_pct  — Minervini/breakout picks
+      pb_entry_order_type / pb_entry_slippage_pct  — Pullback-to-MA picks
+
+    order_type values:
       market     — market order + bracket exits (original behaviour)
       limit      — DAY limit at entry×(1+slippage%), bracket exits attached
       stop_limit — DAY stop-limit at entry price, limit at entry×(1+slippage%);
                    Alpaca does not support brackets here so exits are added by
                    the monitor on the next cycle after fill
     """
-    order_type   = get_setting(db, "entry_order_type",   "limit")
-    slippage_pct = float(get_setting(db, "entry_slippage_pct", "0.5"))
+    if screener_type == "pullback":
+        order_type   = get_setting(db, "pb_entry_order_type",   "limit")
+        slippage_pct = float(get_setting(db, "pb_entry_slippage_pct", "0.5"))
+    else:  # minervini (default)
+        order_type   = get_setting(db, "mv_entry_order_type",   "stop_limit")
+        slippage_pct = float(get_setting(db, "mv_entry_slippage_pct", "1.0"))
     has_exits    = stop > 0 and target > 0
 
     if order_type == "limit":
@@ -223,7 +232,8 @@ def run_monday_open(db: Session):
 
     rows = db.execute(
         text("""
-            SELECT symbol, entry_price, stop_price, target1
+            SELECT symbol, entry_price, stop_price, target1,
+                   COALESCE(screener_type, 'minervini') AS screener_type
             FROM weekly_plan
             WHERE week_start = (
                 SELECT MAX(week_start) FROM weekly_plan WHERE mode = :mode
@@ -256,6 +266,7 @@ def run_monday_open(db: Session):
         entry  = float(row[1] or 0)
         stop   = float(row[2] or 0)
         target = float(row[3] or 0)
+        stype  = row[4]
 
         if sym in held or entry <= 0:
             continue
@@ -269,7 +280,7 @@ def run_monday_open(db: Session):
             continue
 
         try:
-            order_desc   = _place_entry(db, sym, qty, entry, stop, target, "MONDAY_OPEN", mode)
+            order_desc   = _place_entry(db, sym, qty, entry, stop, target, "MONDAY_OPEN", mode, stype)
             order_placed = True
             logger.info("Monday open: %s qty=%.0f — %s", sym, qty, order_desc)
 
@@ -390,7 +401,8 @@ def _refill_slot(
     held_tuple = tuple(current_positions) if current_positions else ("__none__",)
     pending_rows = db.execute(
         text("""
-            SELECT symbol, score, signal, entry_price, stop_price, target1, rationale, rank
+            SELECT symbol, score, signal, entry_price, stop_price, target1, rationale, rank,
+                   COALESCE(screener_type, 'minervini') AS screener_type
             FROM weekly_plan
             WHERE week_start = (
                 SELECT MAX(week_start) FROM weekly_plan WHERE mode = :mode
@@ -472,9 +484,10 @@ def _execute_specific_pick(db: Session, mode: str, symbol: str, pending_picks: l
         logger.warning("Slot refill: recommended symbol %s not found in pending picks.", symbol)
         return
 
-    entry  = float(pick.get("entry_price") or 0)
-    stop   = float(pick.get("stop_price")  or 0)
-    target = float(pick.get("target1")     or 0)
+    entry  = float(pick.get("entry_price")   or 0)
+    stop   = float(pick.get("stop_price")   or 0)
+    target = float(pick.get("target1")      or 0)
+    stype  = pick.get("screener_type", "minervini")
 
     if entry <= 0:
         logger.warning("Slot refill: %s has no entry price — skipping.", symbol)
@@ -499,7 +512,7 @@ def _execute_specific_pick(db: Session, mode: str, symbol: str, pending_picks: l
         return
 
     try:
-        order_desc = _place_entry(db, symbol, qty, entry, stop, target, "SLOT_REFILL", mode)
+        order_desc = _place_entry(db, symbol, qty, entry, stop, target, "SLOT_REFILL", mode, stype)
         logger.info("Slot refill: %s qty=%.0f — %s [%s]", symbol, qty, order_desc, mode)
 
         db.execute(
@@ -530,7 +543,8 @@ def _execute_next_pick(db: Session, mode: str, held: set):
     """Fallback — execute the next PENDING pick without slot-refill analysis."""
     row = db.execute(
         text("""
-            SELECT symbol, entry_price, stop_price, target1
+            SELECT symbol, entry_price, stop_price, target1,
+                   COALESCE(screener_type, 'minervini') AS screener_type
             FROM weekly_plan
             WHERE week_start = (
                 SELECT MAX(week_start) FROM weekly_plan WHERE mode = :mode
@@ -551,6 +565,7 @@ def _execute_next_pick(db: Session, mode: str, held: set):
     entry  = float(row[1] or 0)
     stop   = float(row[2] or 0)
     target = float(row[3] or 0)
+    stype  = row[4]
 
     if sym in held or entry <= 0:
         return
@@ -572,7 +587,7 @@ def _execute_next_pick(db: Session, mode: str, held: set):
         return
 
     try:
-        order_desc = _place_entry(db, sym, qty, entry, stop, target, "POST_CLOSE", mode)
+        order_desc = _place_entry(db, sym, qty, entry, stop, target, "POST_CLOSE", mode, stype)
         logger.info("Post-close fallback: %s qty=%.0f — %s", sym, qty, order_desc)
 
         db.execute(

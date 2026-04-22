@@ -496,7 +496,7 @@ async def run_monitor(db: Session, user_id: int | None = None):
                             continue
                         try:
                             from .position_manager import _place_entry as _pm_place_entry
-                            order_desc = _pm_place_entry(db, sym, qty, price, stop, target, "BREAKOUT", mode)
+                            order_desc = _pm_place_entry(db, sym, qty, price, stop, target, "BREAKOUT", mode, "minervini")
                             logger.info("Watchlist buy %s qty=%.0f — %s [%s]", sym, qty, order_desc, mode)
                             _log_trade(db, sym, "BUY", qty, price, "BREAKOUT", mode)
                             new_breakouts.append(sym)
