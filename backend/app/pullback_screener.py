@@ -14,7 +14,7 @@ All thresholds are configurable via user_settings with the 'pb_' prefix.
 """
 import logging
 import math
-from datetime import date
+from datetime import date, datetime, timezone
 
 import httpx
 import numpy as np
@@ -41,6 +41,7 @@ _PB_COLS = [
     "volume",
     "average_volume_30d_calc",
     "market_cap_basic",
+    "earnings_release_next_date",   # Unix timestamp — skip Yahoo Finance round-trip when present
 ]
 
 _TV_HEADERS = {
@@ -334,18 +335,28 @@ def _local_refinement(sym: str, v: dict, cfg: dict) -> dict | None:
     if e50 and ema50_pct > cfg["ema50_proximity"]:
         return None
 
+    # Earnings date from TV (Unix timestamp → date, or None if unavailable)
+    tv_earn_ts = v.get("earnings_release_next_date")
+    tv_earn_date: date | None = None
+    if tv_earn_ts:
+        try:
+            tv_earn_date = datetime.fromtimestamp(float(tv_earn_ts), tz=timezone.utc).date()
+        except Exception:
+            pass
+
     return {
-        "symbol":     sym,
-        "price":      close,
-        "rsi":        rsi,
-        "ema20":      e20,
-        "ema50":      e50,
-        "ema100":     e100,
-        "ema200":     e200,
-        "ema50_pct":  ema50_pct,
-        "avg_vol":    avg_vol,
-        "rel_vol":    round(rel_vol, 2),
-        "market_cap": v.get("market_cap_basic") or 0,
+        "symbol":        sym,
+        "price":         close,
+        "rsi":           rsi,
+        "ema20":         e20,
+        "ema50":         e50,
+        "ema100":        e100,
+        "ema200":        e200,
+        "ema50_pct":     ema50_pct,
+        "avg_vol":       avg_vol,
+        "rel_vol":       round(rel_vol, 2),
+        "market_cap":    v.get("market_cap_basic") or 0,
+        "tv_earn_date":  tv_earn_date,   # None → pass-2 will call Yahoo Finance
     }
 
 
@@ -469,11 +480,18 @@ def _score_candidates(candidates: list[dict], cfg: dict) -> list[dict]:
                 continue
 
             # ── Earnings gate ─────────────────────────────────────────────────
+            # Source priority: TV (already fetched in pass-1) → Yahoo Finance → block/allow
             days_to_earnings = None
             if cfg["earnings_days_min"] > 0:
-                next_earn = get_next_earnings_date(sym)
+                next_earn = c.get("tv_earn_date")   # from TV pass-1 (free)
                 if next_earn is None:
-                    # Earnings date unknown — block by default unless user opts out
+                    # TV had no date — try Yahoo Finance as fallback
+                    next_earn = get_next_earnings_date(sym)
+                    if next_earn is not None:
+                        logger.debug("Pullback: %s earnings from Yahoo Finance: %s", sym, next_earn)
+
+                if next_earn is None:
+                    # Both sources unknown — block by default unless user opts out
                     if cfg["block_unknown_earnings"]:
                         logger.debug(
                             "Pullback: %s skipped — earnings date unknown (block_unknown_earnings=true)",
