@@ -587,33 +587,32 @@ B — Solid setup with one minor blemish (e.g. slightly elevated pullback volume
 C — Marginal: passes filters but chart is messy, volume not contracting, or trend quality is weak.
 SKIP — Reject: downtrend bounce not a real pullback, excessive earnings risk, volume expanding on decline, or broken trend structure.
 
-Respond ONLY with valid JSON (no markdown, no explanation outside the JSON):
-{{"grade":"A|B|C|SKIP","reasoning":"1-2 sentence plain-English summary of the chart quality","strengths":["..."],"concerns":["..."]}}"""
+Respond ONLY with a single compact JSON object on one line — no markdown fences, no newlines inside strings, no trailing text:
+{{"grade":"A|B|C|SKIP","reasoning":"Max 30-word plain-English summary"}}"""
 
-        raw = _call_ai(db, prompt, max_tokens=400, user_id=user_id)
+        raw = _call_ai(db, prompt, max_tokens=250, user_id=user_id)
         if not raw:
             return {"grade": "B", "pass": True, "reasoning": "AI key not configured — skipping chart review"}
 
-        # Parse JSON — handle markdown fences defensively
+        # Robust JSON extraction — find first {{ ... }} block, handle truncation
+        import re as _re
         text = raw.strip()
-        if text.startswith("```"):
-            text = text.split("```")[1]
-            if text.startswith("json"):
-                text = text[4:]
-        result = _json.loads(text.strip())
+        # Strip markdown fences if present
+        text = _re.sub(r"^```[a-z]*\n?", "", text)
+        text = _re.sub(r"\n?```$", "", text)
+        text = text.strip()
+        # Extract the first JSON object
+        m = _re.search(r'\{[^{}]*\}', text, _re.DOTALL)
+        if not m:
+            logger.warning("AI chart review %s: no JSON found in response: %s", symbol, text[:200])
+            return {"grade": "B", "pass": True, "reasoning": "AI response unparseable — allowing through"}
+        raw_json = m.group(0)
+        # Sanitise: replace real newlines inside strings with spaces
+        raw_json = _re.sub(r'\n', ' ', raw_json)
+        result = _json.loads(raw_json)
 
         grade     = result.get("grade", "B").strip().upper()
         reasoning = result.get("reasoning", "")
-        strengths = result.get("strengths", [])
-        concerns  = result.get("concerns",  [])
-
-        if strengths or concerns:
-            detail = ""
-            if strengths:
-                detail += " Strengths: " + "; ".join(strengths) + "."
-            if concerns:
-                detail += " Concerns: " + "; ".join(concerns) + "."
-            reasoning = (reasoning + detail).strip()
 
         logger.info("AI chart review %s: grade=%s — %s", symbol, grade, reasoning[:120])
         return {"grade": grade, "pass": grade not in ("C", "SKIP"), "reasoning": reasoning}

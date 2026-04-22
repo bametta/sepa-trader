@@ -135,12 +135,18 @@ export default function SettingsPanel() {
     setTvLoading(true); setTvError('')
     try {
       const res = await fetchTvScreeners()
-      setTvList(res.screeners || [])
-      setTvOpen(true)
+      const list = res.screeners || []
+      setTvList(list)
+      if (res.message && list.length === 0) {
+        setTvError(res.message)
+      } else {
+        setTvOpen(true)
+      }
     } catch (e) {
       setTvError(e?.response?.data?.detail || 'Could not fetch screeners — check TradingView credentials in Settings → Integrations.')
     } finally {
-      setTvLoading(false) }
+      setTvLoading(false)
+    }
   }
 
   async function save(key, value) {

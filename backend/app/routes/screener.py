@@ -402,7 +402,11 @@ def list_tv_screeners(
     tv_pass  = get_user_setting(db, "tv_password", "", uid)
 
     if not tv_user or not tv_pass:
-        raise HTTPException(400, "TradingView credentials not configured in Settings → Integrations.")
+        return {
+            "screeners": [],
+            "count": 0,
+            "message": "TradingView credentials not configured — add them in Settings → Integrations.",
+        }
 
     screeners = list_saved_screeners(tv_user, tv_pass)
     return {"screeners": screeners, "count": len(screeners)}
