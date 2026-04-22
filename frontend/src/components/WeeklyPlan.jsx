@@ -53,6 +53,7 @@ export default function WeeklyPlan() {
   const [analyzing, setAnalyzing]   = useState(false)
   const [msg, setMsg]               = useState(null)
   const [msgType, setMsgType]       = useState('info')
+  const [logOpen, setLogOpen]       = useState(false)
   const prevStatusRef               = useRef(null)
 
   const { data: plan = [], isLoading, isError } = useQuery(
@@ -290,18 +291,36 @@ export default function WeeklyPlan() {
       )}
 
       {analyses.length > 0 && (
-        <div className="space-y-2">
-          <h4 className="text-sm font-semibold text-slate-400 uppercase tracking-wider">AI Analysis Log</h4>
-          {analyses.map(a => (
-            <div key={a.id} className="bg-card border border-violet-500/20 rounded-xl p-4 space-y-2">
-              <div className="flex items-center gap-2 text-xs text-slate-500">
-                <span className="bg-violet-500/20 text-violet-300 px-1.5 py-0.5 rounded capitalize">{a.trigger}</span>
-                {a.symbol && <span className="font-medium text-slate-300">{a.symbol}</span>}
-                <span className="ml-auto">{new Date(a.created_at).toLocaleString()}</span>
-              </div>
-              <pre className="text-xs text-slate-300 leading-relaxed whitespace-pre-wrap font-sans">{a.analysis}</pre>
+        <div className="card overflow-hidden">
+          {/* Collapsible header */}
+          <button
+            onClick={() => setLogOpen(o => !o)}
+            className="w-full flex items-center justify-between px-4 py-3 hover:bg-white/[0.02] transition-colors"
+          >
+            <div className="flex items-center gap-2">
+              <span className="text-sm font-semibold text-slate-400 uppercase tracking-wider">AI Analysis Log</span>
+              <span className="text-[10px] font-medium px-1.5 py-0.5 rounded-full bg-violet-500/15 text-violet-400 border border-violet-500/20">
+                {analyses.length}
+              </span>
             </div>
-          ))}
+            <span className={`text-slate-600 text-xs transition-transform duration-200 ${logOpen ? 'rotate-180' : ''}`}>▼</span>
+          </button>
+
+          {/* Log entries */}
+          {logOpen && (
+            <div className="border-t border-white/5 divide-y divide-white/[0.04]">
+              {analyses.map(a => (
+                <div key={a.id} className="px-4 py-3 space-y-2">
+                  <div className="flex items-center gap-2 text-xs text-slate-500">
+                    <span className="bg-violet-500/20 text-violet-300 px-1.5 py-0.5 rounded capitalize">{a.trigger}</span>
+                    {a.symbol && <span className="font-medium text-slate-300">{a.symbol}</span>}
+                    <span className="ml-auto">{new Date(a.created_at).toLocaleString()}</span>
+                  </div>
+                  <pre className="text-xs text-slate-300 leading-relaxed whitespace-pre-wrap font-sans">{a.analysis}</pre>
+                </div>
+              ))}
+            </div>
+          )}
         </div>
       )}
     </div>
