@@ -25,12 +25,12 @@ export default function AccountSummary({ onModeChange, refetchInterval = 5000 })
 
   if (isLoading) {
     return (
-      <div className="card p-5">
-        <div className="flex items-center justify-between mb-4">
+      <div className="card p-4">
+        <div className="flex items-center justify-between mb-3">
           <div className="h-5 w-36 bg-white/5 rounded-lg animate-pulse" />
           <div className="h-7 w-20 bg-white/5 rounded-lg animate-pulse" />
         </div>
-        <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+        <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
           {[...Array(4)].map((_, i) => (
             <div key={i} className="stat-card h-16 animate-pulse" />
           ))}
@@ -72,8 +72,8 @@ export default function AccountSummary({ onModeChange, refetchInterval = 5000 })
   const lastSync = dataUpdatedAt ? new Date(dataUpdatedAt).toLocaleTimeString() : null
 
   return (
-    <div className={`card p-5 ${!isPaper ? 'shadow-[0_0_0_1px_rgba(249,115,22,0.2),0_8px_32px_rgba(249,115,22,0.06)]' : ''}`}>
-      <div className="flex items-center justify-between mb-4">
+    <div className={`card p-4 ${!isPaper ? 'shadow-[0_0_0_1px_rgba(249,115,22,0.2),0_8px_32px_rgba(249,115,22,0.06)]' : ''}`}>
+      <div className="flex items-center justify-between mb-3">
         <div className="flex items-center gap-3">
           <h2 className="text-sm font-semibold text-slate-300">Account Overview</h2>
 
@@ -107,7 +107,7 @@ export default function AccountSummary({ onModeChange, refetchInterval = 5000 })
         </div>
       </div>
 
-      <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+      <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
         <MetricCard
           label="Portfolio Value"
           value={fmt(data.portfolio_value)}
@@ -130,7 +130,7 @@ export default function AccountSummary({ onModeChange, refetchInterval = 5000 })
       </div>
 
       {lastSync && (
-        <p className="text-[10px] text-slate-700 mt-3 text-right">
+        <p className="text-[10px] text-slate-700 mt-2 text-right">
           Synced {lastSync}
         </p>
       )}

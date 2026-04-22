@@ -9,10 +9,11 @@ const SECTIONS = [
   {
     title: 'Trading',
     fields: [
-      { key: 'auto_execute',  label: 'Auto Execute',       type: 'toggle'  },
-      { key: 'risk_pct',      label: 'Risk per Trade %',   type: 'number'  },
-      { key: 'stop_loss_pct', label: 'Stop Loss %',        type: 'number'  },
-      { key: 'max_positions', label: 'Max Positions',      type: 'number'  },
+      { key: 'auto_execute',      label: 'Auto Execute',            type: 'toggle' },
+      { key: 'risk_pct',          label: 'Risk per Trade %',        type: 'number' },
+      { key: 'stop_loss_pct',     label: 'Stop Loss %',             type: 'number' },
+      { key: 'max_position_pct',  label: 'Max Position Size % (cap)', type: 'number' },
+      { key: 'max_positions',     label: 'Max Positions',           type: 'number' },
     ],
   },
   {
@@ -93,10 +94,10 @@ export default function SettingsPanel() {
   }
 
   return (
-    <div className="space-y-6">
+    <div className="space-y-3">
 
       {/* Account & Security */}
-      <div className="bg-card border border-border rounded-xl p-5 space-y-4">
+      <div className="bg-card border border-border rounded-xl p-4 space-y-3">
         <h3 className="text-sm font-semibold text-slate-400 uppercase tracking-wider">Account & Security</h3>
         {me && (
           <div className="flex items-center gap-3 pb-3 border-b border-border">
@@ -113,11 +114,11 @@ export default function SettingsPanel() {
       </div>
 
       {SECTIONS.map(section => (
-        <div key={section.title} className="bg-card border border-border rounded-xl p-5">
-          <h3 className="text-sm font-semibold text-slate-400 uppercase tracking-wider mb-4">
+        <div key={section.title} className="bg-card border border-border rounded-xl p-4">
+          <h3 className="text-sm font-semibold text-slate-400 uppercase tracking-wider mb-3">
             {section.title}
           </h3>
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
             {section.fields.map(f => (
               <div key={f.key} className={f.span ? 'sm:col-span-2' : ''}>
                 <Field

@@ -73,8 +73,8 @@ export default function Navbar({ onModeChange }) {
   }
 
   return (
-    <nav className="sticky top-0 z-40 border-b border-white/[0.05] bg-[#080c14]/80 backdrop-blur-xl px-5 py-3">
-      <div className="max-w-7xl mx-auto flex items-center justify-between gap-4">
+    <nav className="sticky top-0 z-40 border-b border-white/[0.05] bg-[#080c14]/80 backdrop-blur-xl px-4 py-2">
+      <div className="max-w-7xl mx-auto flex items-center justify-between gap-3">
 
         {/* Left — logo */}
         <div className="flex items-center gap-4 min-w-0">

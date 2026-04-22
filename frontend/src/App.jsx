@@ -81,11 +81,11 @@ function Dashboard() {
         </div>
       )}
 
-      <main className="max-w-7xl mx-auto px-4 sm:px-6 py-6 space-y-5">
+      <main className="max-w-7xl mx-auto px-3 sm:px-5 py-3 space-y-3">
 
         {/* Alert banners */}
         {urgent.length > 0 && (
-          <div className="flex items-center gap-3 bg-red-500/8 border border-red-500/20 rounded-2xl px-5 py-3 animate-fade-in">
+          <div className="flex items-center gap-3 bg-red-500/8 border border-red-500/20 rounded-xl px-4 py-2 animate-fade-in">
             <div className="w-2 h-2 rounded-full bg-red-400 animate-pulse flex-shrink-0" />
             <div>
               <span className="text-red-400 font-bold text-xs uppercase tracking-wide">Stage 2 Lost</span>
@@ -94,7 +94,7 @@ function Dashboard() {
           </div>
         )}
         {breakouts.length > 0 && (
-          <div className="flex items-center gap-3 bg-emerald-500/8 border border-emerald-500/20 rounded-2xl px-5 py-3 animate-fade-in">
+          <div className="flex items-center gap-3 bg-emerald-500/8 border border-emerald-500/20 rounded-xl px-4 py-2 animate-fade-in">
             <div className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse flex-shrink-0" />
             <div>
               <span className="text-emerald-400 font-bold text-xs uppercase tracking-wide">Breakout</span>
