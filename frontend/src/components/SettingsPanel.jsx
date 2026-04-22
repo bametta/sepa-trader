@@ -95,11 +95,19 @@ const SECTIONS = [
     ],
   },
   {
-    title: 'Screener — Schedule (ET)',
+    title: 'Minervini Screener — Schedule (ET)',
     fields: [
       { key: 'screener_auto_run',       label: 'Auto-run enabled',                type: 'toggle',    defaultValue: 'true' },
       { key: 'screener_schedule_days',  label: 'Days to run (click to toggle)',   type: 'day_picker', span: true },
       { key: 'screener_schedule_times', label: 'Run times (24h ET, e.g. 20:00)', type: 'time_list',  span: true },
+    ],
+  },
+  {
+    title: 'Pullback Screener — Schedule (ET)',
+    fields: [
+      { key: 'pb_screener_auto_run',       label: 'Auto-run enabled',                type: 'toggle',    defaultValue: 'true' },
+      { key: 'pb_screener_schedule_days',  label: 'Days to run (click to toggle)',   type: 'day_picker', span: true },
+      { key: 'pb_screener_schedule_times', label: 'Run times (24h ET, e.g. 20:00)', type: 'time_list',  span: true },
     ],
   },
   {
