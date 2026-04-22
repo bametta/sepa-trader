@@ -418,11 +418,13 @@ def _execute_signal(db: Session, user_id: int, strategy_name: str,
     # Size: use all available buying power (rotation strategy — 100% allocation)
     account = client.get_account()
     bp      = float(account.buying_power)
-    # Get current price for the target via yfinance (with browser UA to avoid blocks)
-    from ..strategies.yf_client import get_ticker
-    price = float(get_ticker(symbol).history(period="2d", auto_adjust=True)["Close"].iloc[-1])
+    # Get current price for the target via direct Yahoo Finance API
+    from ..strategies.yf_client import get_current_price
+    price = get_current_price(symbol)
     qty   = int(bp * 0.98 / price)  # 98% — leave a small buffer
 
+    if price <= 0:
+        raise HTTPException(502, f"Could not fetch current price for {symbol}")
     if qty < 1:
         logger.warning("execute_signal: insufficient buying power for %s (bp=$%.0f, price=$%.2f)",
                        symbol, bp, price)
