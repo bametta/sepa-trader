@@ -54,22 +54,27 @@ def _fetch_account_data(client, name: str, mode: str) -> dict | None:
         )
 
         # Total P&L (realized + unrealized since account inception).
-        # portfolio history profit_loss[-1] = equity - base_value at period start.
-        # Using a start date before Alpaca existed guarantees we capture all history.
-        total_pl = 0.0
+        # Strategy: try portfolio history period="all" first (most accurate),
+        # fall back to summing open-position unrealized_pl if that fails.
+        total_pl = None
         try:
-            from datetime import datetime, timezone
             from alpaca.trading.requests import GetPortfolioHistoryRequest
             history = client.get_portfolio_history(
-                GetPortfolioHistoryRequest(
-                    start=datetime(2015, 1, 1, tzinfo=timezone.utc),
-                    timeframe="1D",
-                )
+                GetPortfolioHistoryRequest(period="all")
             )
             if history.profit_loss:
-                total_pl = _sf(history.profit_loss[-1], 0.0)
+                total_pl = _sf(history.profit_loss[-1], None)
         except Exception as hist_exc:
-            logger.debug("_fetch_account_data: portfolio history unavailable (%s)", hist_exc)
+            logger.warning("_fetch_account_data(%s, %s): portfolio history failed: %s", name, mode, hist_exc)
+
+        if total_pl is None:
+            # Fallback: unrealized P&L from open positions (excludes already-closed trades)
+            try:
+                positions = client.get_all_positions()
+                total_pl  = sum(_sf(getattr(p, "unrealized_pl", None), 0.0) for p in positions)
+            except Exception as pos_exc:
+                logger.warning("_fetch_account_data(%s, %s): positions fallback failed: %s", name, mode, pos_exc)
+                total_pl = 0.0
 
         return {
             "name":              name,
