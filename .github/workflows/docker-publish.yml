@@ -63,13 +63,16 @@ jobs:
             echo "==> Updating IMAGE_TAG to v${{ github.run_number }}"
             sed -i "s/^IMAGE_TAG=.*/IMAGE_TAG=v${{ github.run_number }}/" .env
 
-            echo "==> Pulling new images"
+            echo "==> Pulling new images from Docker Hub"
             docker compose pull
 
-            echo "==> Restarting containers"
-            docker compose up -d --remove-orphans
+            echo "==> Stopping and removing containers (preserving volumes)"
+            docker compose down --remove-orphans
 
-            echo "==> Cleaning up old images"
+            echo "==> Recreating containers from fresh images"
+            docker compose up -d
+
+            echo "==> Pruning dangling images"
             docker image prune -f
 
             echo "==> Done. Running containers:"
