@@ -218,7 +218,7 @@ def trigger_screener(
 
             from ..screener import run_both_screeners
             _phase("Fetching TradingView data…")
-            results = run_both_screeners(db2, user_id=uid, _phase_cb=_phase)
+            results = run_both_screeners(db2, mode=mode, user_id=uid, _phase_cb=_phase)
             set_user_setting(db2, "screener_status", "done",                         uid)
             set_user_setting(db2, "screener_phase",  f"Done — {len(results)} stocks selected", uid)
             set_user_setting(db2, "screener_count",  str(len(results)),               uid)
@@ -265,7 +265,7 @@ def trigger_minervini_screener(
 
             from ..screener import run_screener
             _phase("Minervini: fetching TradingView data…")
-            results = run_screener(db2, user_id=uid)
+            results = run_screener(db2, mode=mode, user_id=uid)
             set_user_setting(db2, "screener_status", "done",                         uid)
             set_user_setting(db2, "screener_phase",  f"Done — {len(results)} stocks selected", uid)
             set_user_setting(db2, "screener_count",  str(len(results)),               uid)
