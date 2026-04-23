@@ -15,21 +15,59 @@ scheduler = AsyncIOScheduler()
 _ET = pytz.timezone("America/New_York")
 
 
-async def _monitor_job():
+async def _monitor_watchdog():
+    """
+    Runs every minute. Fires the monitor when:
+      1. monitor_enabled == "true"
+      2. It's a weekday between 9:00–16:00 ET
+      3. At least monitor_interval_minutes have elapsed since the last run
+    Tracks last run timestamp in monitor_last_run to prevent double-firing.
+    """
     db = SessionLocal()
     try:
         if get_setting(db, "monitor_enabled", "true") != "true":
             return
-        # Resolve admin user_id so pre-trade gate can load tape context
+
+        now_et = datetime.now(_ET)
+
+        # Only run Mon–Fri 9:00–16:00 ET
+        if now_et.weekday() > 4:
+            return
+        if not (9 <= now_et.hour < 16):
+            return
+
+        interval = int(get_setting(db, "monitor_interval_minutes", "30") or "30")
+
+        last_run_str = get_setting(db, "monitor_last_run", "")
+        if last_run_str:
+            try:
+                last_run = datetime.fromisoformat(last_run_str).replace(tzinfo=_ET)
+                elapsed = (now_et - last_run).total_seconds() / 60
+                if elapsed < interval:
+                    return
+            except ValueError:
+                pass  # malformed timestamp — proceed
+
+        # Mark run before executing so concurrent ticks don't double-fire
+        set_setting(db, "monitor_last_run", now_et.isoformat())
+        db.commit()
+
         admin_row = db.execute(
             text("SELECT id FROM users WHERE role = 'admin' ORDER BY id LIMIT 1")
         ).fetchone()
         admin_uid = admin_row[0] if admin_row else None
-        await run_monitor(db, user_id=admin_uid)
-        from .position_manager import check_post_close
-        check_post_close(db)
     finally:
         db.close()
+
+    db2 = SessionLocal()
+    try:
+        await run_monitor(db2, user_id=admin_uid)
+        from .position_manager import check_post_close
+        check_post_close(db2)
+    except Exception as exc:
+        logger.error("Monitor job failed: %s", exc, exc_info=True)
+    finally:
+        db2.close()
 
 
 async def _monday_open_job():
@@ -421,16 +459,10 @@ async def _dm_watchdog():
 
 
 def start_scheduler():
-    # Every 30 minutes Mon-Fri during market hours (9:00–15:30 ET)
-    # Fires at :00 and :30 of each hour — covers 9:30 open through 15:30
+    # Watchdog fires every minute — interval is controlled by monitor_interval_minutes setting
     scheduler.add_job(
-        _monitor_job,
-        CronTrigger(
-            day_of_week="mon-fri",
-            hour="9-15",
-            minute="*/30",
-            timezone="America/New_York",
-        ),
+        _monitor_watchdog,
+        CronTrigger(minute="*"),
         id="sepa_monitor",
         replace_existing=True,
     )

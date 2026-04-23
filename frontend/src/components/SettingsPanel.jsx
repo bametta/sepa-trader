@@ -70,8 +70,18 @@ const SECTIONS = [
   {
     title: 'Monitor',
     fields: [
-      { key: 'monitor_enabled',     label: 'Monitor enabled (auto-place exits & manage positions)', type: 'toggle', defaultValue: 'true' },
-      { key: 'auto_execute',        label: 'Auto-execute new entries on Monday open',               type: 'toggle', defaultValue: 'true' },
+      { key: 'monitor_enabled',          label: 'Monitor enabled (auto-place exits & manage positions)', type: 'toggle', defaultValue: 'true' },
+      { key: 'monitor_interval_minutes', label: 'Monitor check frequency', type: 'select',
+        options: [
+          { value: '5',  label: 'Every 5 minutes' },
+          { value: '10', label: 'Every 10 minutes' },
+          { value: '15', label: 'Every 15 minutes' },
+          { value: '30', label: 'Every 30 minutes (default)' },
+          { value: '60', label: 'Every 60 minutes' },
+        ],
+        defaultValue: '30',
+      },
+      { key: 'auto_execute',             label: 'Auto-execute new entries on Monday open',               type: 'toggle', defaultValue: 'true' },
       { key: 'risk_pct',            label: 'Risk per trade %',                                     type: 'number' },
       { key: 'stop_loss_pct',       label: 'Default stop loss %',                                  type: 'number' },
       { key: 'max_position_pct',    label: 'Max position size % (hard cap)',                       type: 'number' },
