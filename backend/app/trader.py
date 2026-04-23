@@ -487,9 +487,24 @@ async def run_monitor(db: Session, user_id: int | None = None):
 
             results.append({"sym": sym, "signal": signal})
 
-        # Step 4: Watchlist breakout entries
+        # Step 4: Weekly-plan slot fill — buys PENDING picks when capacity exists.
+        # This is the primary entry mechanism (screener picks → weekly_plan → orders).
+        if auto_execute and market_open:
+            try:
+                from .position_manager import fill_open_slots
+                fill_open_slots(
+                    db=db, mode=mode, portfolio=portfolio,
+                    risk_pct=risk_pct, stop_pct=stop_pct,
+                    positions=positions, user_id=user_id,
+                )
+                # Re-fetch positions so watchlist step has fresh state
+                positions = alp.get_positions(mode)
+            except Exception as exc:
+                logger.error("fill_open_slots failed: %s", exc)
+
+        # Step 5: Watchlist breakout entries (manual watchlist, not screener picks)
         held_symbols = {p.symbol for p in positions}
-        watchlist    = _get_watchlist(db)
+        watchlist    = _get_watchlist(db, user_id)
         max_pos      = _effective_max_positions(db, mode)
 
         if auto_execute and market_open and len(positions) < max_pos:
@@ -541,11 +556,18 @@ async def run_monitor(db: Session, user_id: int | None = None):
         return {"status": "error", "error": str(exc)}
 
 
-def _get_watchlist(db: Session) -> list[str]:
-    row = db.execute(text("SELECT value FROM settings WHERE key = 'watchlist'")).fetchone()
-    if not row or not row[0]:
+def _get_watchlist(db: Session, user_id: int | None = None) -> list[str]:
+    """Return the manual watchlist, preferring user_settings over global settings."""
+    raw = None
+    if user_id:
+        from .database import get_all_user_settings as _gaus
+        raw = _gaus(db, user_id).get("watchlist", "")
+    if not raw:
+        row = db.execute(text("SELECT value FROM settings WHERE key = 'watchlist'")).fetchone()
+        raw = row[0] if row else ""
+    if not raw:
         return []
-    return [s.strip().upper() for s in row[0].split(",") if s.strip()]
+    return [s.strip().upper() for s in raw.split(",") if s.strip()]
 
 
 def _log_signal(db: Session, symbol: str, signal: str, score: int, price, mode: str):

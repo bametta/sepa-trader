@@ -24,6 +24,8 @@ async def _monitor_watchdog():
     Tracks last run timestamp in monitor_last_run to prevent double-firing.
     """
     db = SessionLocal()
+    admin_uid = None
+    mode      = "paper"
     try:
         # Resolve admin user so we read their per-user settings
         admin_row = db.execute(
@@ -34,34 +36,47 @@ async def _monitor_watchdog():
         # Read settings from merged user+global so Settings panel changes are respected
         from .database import get_all_user_settings as _gaus
         merged = _gaus(db, admin_uid) if admin_uid else {}
+        mode   = merged.get("trading_mode", "paper")
 
         if merged.get("monitor_enabled", "true") != "true":
+            logger.debug("Watchdog: monitor_enabled=false — skipping.")
             return
 
         now_et = datetime.now(_ET)
 
         # Only run Mon–Fri 9:00–16:00 ET
         if now_et.weekday() > 4:
+            logger.debug("Watchdog: weekend — skipping.")
             return
         if not (9 <= now_et.hour < 16):
+            logger.debug("Watchdog: outside market hours (%s ET) — skipping.", now_et.strftime("%H:%M"))
             return
 
         interval = int(merged.get("monitor_interval_minutes", "30") or "30")
 
         last_run_str = get_setting(db, "monitor_last_run", "")
+        elapsed_min  = 9999.0
         if last_run_str:
             try:
-                last_run = datetime.fromisoformat(last_run_str)
-                # Ensure both datetimes are UTC-comparable
+                last_run    = datetime.fromisoformat(last_run_str)
                 if last_run.tzinfo is None:
                     last_run = _ET.localize(last_run)
-                elapsed = (now_et - last_run).total_seconds() / 60
-                if elapsed < interval:
+                elapsed_min = (now_et - last_run).total_seconds() / 60
+                if elapsed_min < interval:
+                    logger.debug(
+                        "Watchdog: elapsed=%.1fm < interval=%dm [mode=%s] — skipping.",
+                        elapsed_min, interval, mode,
+                    )
                     return
             except (ValueError, TypeError):
                 pass  # malformed timestamp — proceed
 
-        # Mark run before executing so concurrent ticks don't double-fire
+        logger.info(
+            "Watchdog: FIRING monitor [mode=%s interval=%dm elapsed=%.1fm]",
+            mode, interval, elapsed_min,
+        )
+
+        # Mark run NOW so concurrent ticks don't double-fire
         set_setting(db, "monitor_last_run", now_et.isoformat())
         db.commit()
 
@@ -70,9 +85,11 @@ async def _monitor_watchdog():
 
     db2 = SessionLocal()
     try:
-        await run_monitor(db2, user_id=admin_uid)
+        result = await run_monitor(db2, user_id=admin_uid)
+        if isinstance(result, dict) and result.get("status") == "error":
+            logger.error("Watchdog: monitor returned error: %s", result.get("error"))
         from .position_manager import check_post_close
-        check_post_close(db2)
+        check_post_close(db2, mode=mode)
     except Exception as exc:
         logger.error("Monitor job failed: %s", exc, exc_info=True)
     finally:

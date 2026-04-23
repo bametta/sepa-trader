@@ -387,7 +387,7 @@ def run_monday_open(db: Session):
             logger.error("Monday open: buy failed for %s: %s", sym, exc)
 
 
-def check_post_close(db: Session):
+def check_post_close(db: Session, mode: str | None = None):
     """
     Called in each monitor cycle. Detects newly closed positions then:
       1. Infers why the position closed
@@ -395,7 +395,8 @@ def check_post_close(db: Session):
       3. Runs slot-refill analysis to decide whether to open a replacement
       4. If approved, runs pre-trade gate before executing
     """
-    mode = get_setting(db, "trading_mode", "paper")
+    if mode is None:
+        mode = get_setting(db, "trading_mode", "paper")
 
     try:
         current = {p.symbol for p in alp.get_positions(mode)}
@@ -766,3 +767,142 @@ def _run_claude_analysis(db: Session, closed_sym: str, mode: str):
 
     except Exception as exc:
         logger.warning("Post-close analysis failed for %s: %s", closed_sym, exc)
+
+
+def fill_open_slots(
+    db: Session,
+    mode: str,
+    portfolio: float,
+    risk_pct: float,
+    stop_pct: float,
+    positions: list,
+    user_id: int | None = None,
+):
+    """
+    Called every monitor cycle. Fills open position slots from the current
+    week's PENDING weekly_plan picks whenever capacity exists — not just on
+    Monday morning.
+
+    Respects mv_max_slots / pb_max_slots per-strategy limits.
+    Only buys when the current SEPA signal confirms entry (BREAKOUT or PULLBACK).
+    Runs the AI pre-trade gate before each order.
+    """
+    mv_max  = int(get_setting(db, "mv_max_slots", "3") or "3")
+    pb_max  = int(get_setting(db, "pb_max_slots", "2") or "2")
+    max_pos = _effective_max_positions(db, mode)
+
+    total_held   = len(positions)
+    held_symbols = {p.symbol for p in positions}
+
+    if total_held >= max_pos:
+        return
+
+    mv_held, pb_held = _count_positions_by_type(db, mode, held_symbols)
+    mv_slots = max(0, mv_max - mv_held)
+    pb_slots = max(0, pb_max - pb_held)
+
+    if mv_slots == 0 and pb_slots == 0:
+        logger.debug("fill_open_slots [%s]: all strategy slots full — skipping.", mode)
+        return
+
+    held_tuple = tuple(held_symbols) if held_symbols else ("__none__",)
+
+    rows = db.execute(
+        text("""
+            SELECT symbol, entry_price, stop_price, target1,
+                   COALESCE(screener_type, 'minervini') AS screener_type
+            FROM weekly_plan
+            WHERE week_start = (SELECT MAX(week_start) FROM weekly_plan WHERE mode = :mode)
+              AND mode = :mode
+              AND status = 'PENDING'
+              AND symbol NOT IN :held
+            ORDER BY rank ASC
+        """),
+        {"mode": mode, "held": held_tuple},
+    ).fetchall()
+
+    if not rows:
+        logger.debug("fill_open_slots [%s]: no PENDING picks in weekly plan.", mode)
+        return
+
+    logger.info(
+        "fill_open_slots [%s]: %d PENDING picks | slots mv=%d pb=%d | held=%d/%d",
+        mode, len(rows), mv_slots, pb_slots, total_held, max_pos,
+    )
+
+    from .sepa_analyzer import analyze
+
+    for row in rows:
+        sym    = row[0]
+        entry  = float(row[1] or 0)
+        stop   = float(row[2] or 0)
+        target = float(row[3] or 0)
+        stype  = row[4]
+
+        # Check slot availability for this pick's strategy type
+        if stype in ("minervini", "both"):
+            if mv_slots <= 0:
+                continue
+        elif stype == "pullback":
+            if pb_slots <= 0:
+                continue
+
+        # Confirm current signal before buying — don't buy stale screener picks
+        result  = analyze(sym, db=db)
+        signal  = result.get("signal", "ERROR")
+        price   = result.get("price") or entry
+
+        if signal not in ("BREAKOUT", "PULLBACK_EMA20", "PULLBACK_EMA50", "STAGE2_WATCH"):
+            logger.debug("fill_open_slots: %s signal=%s — skipping.", sym, signal)
+            continue
+
+        if price <= 0:
+            continue
+
+        qty = _size_qty(portfolio, price, stop, risk_pct, stop_pct)
+        if qty < 1:
+            logger.info("fill_open_slots: %s qty<1 (price=$%.2f stop=$%.2f) — skipping.", sym, price, stop)
+            continue
+
+        if not _gate(db, sym, qty, price, stop, target, f"FILL_{signal}", mode, user_id=user_id):
+            logger.info("fill_open_slots: %s blocked by pre-trade gate.", sym)
+            continue
+
+        try:
+            order_desc = _place_entry(db, sym, qty, price, stop, target, f"FILL_{signal}", mode, stype)
+            logger.info(
+                "fill_open_slots [%s]: opened %s qty=%.0f signal=%s — %s",
+                mode, sym, qty, signal, order_desc,
+            )
+
+            db.execute(
+                text("""
+                    UPDATE weekly_plan SET status = 'EXECUTED'
+                    WHERE symbol = :sym AND mode = :mode
+                      AND week_start = (SELECT MAX(week_start) FROM weekly_plan WHERE mode = :mode)
+                """),
+                {"sym": sym, "mode": mode},
+            )
+            db.execute(
+                text("""
+                    INSERT INTO trade_log (symbol, action, qty, price, trigger, mode)
+                    VALUES (:s, 'BUY', :q, :p, :t, :m)
+                """),
+                {"s": sym, "q": qty, "p": price, "t": f"FILL_{signal}", "m": mode},
+            )
+            db.commit()
+
+            held_symbols.add(sym)
+            total_held += 1
+            if stype in ("minervini", "both"):
+                mv_held  += 1
+                mv_slots -= 1
+            else:
+                pb_held  += 1
+                pb_slots -= 1
+
+            if total_held >= max_pos or (mv_slots == 0 and pb_slots == 0):
+                break
+
+        except Exception as exc:
+            logger.error("fill_open_slots: buy failed for %s: %s", sym, exc)
