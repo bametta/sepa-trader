@@ -54,16 +54,14 @@ def _fetch_account_data(client, name: str, mode: str) -> dict | None:
         )
 
         # Total P&L (realized + unrealized since account inception).
-        # Strategy: try portfolio history period="all" first (most accurate),
-        # fall back to summing open-position unrealized_pl if that fails.
+        # Use the raw REST endpoint so this works across all alpaca-py versions.
+        # GET /v2/account/portfolio/history?period=all → profit_loss[-1] = cumulative P&L
         total_pl = None
         try:
-            from alpaca.trading.requests import GetPortfolioHistoryRequest
-            history = client.get_portfolio_history(
-                GetPortfolioHistoryRequest(period="all")
-            )
-            if history.profit_loss:
-                total_pl = _sf(history.profit_loss[-1], None)
+            history  = client.get("/account/portfolio/history", {"period": "all"})
+            pl_list  = history.get("profit_loss") if isinstance(history, dict) else getattr(history, "profit_loss", None)
+            if pl_list:
+                total_pl = _sf(pl_list[-1], None)
         except Exception as hist_exc:
             logger.warning("_fetch_account_data(%s, %s): portfolio history failed: %s", name, mode, hist_exc)
 

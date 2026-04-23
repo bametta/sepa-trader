@@ -18,14 +18,24 @@ _ET = pytz.timezone("America/New_York")
 async def _monitor_watchdog():
     """
     Runs every minute. Fires the monitor when:
-      1. monitor_enabled == "true"
+      1. monitor_enabled == "true"  (reads from merged user+global settings)
       2. It's a weekday between 9:00–16:00 ET
       3. At least monitor_interval_minutes have elapsed since the last run
     Tracks last run timestamp in monitor_last_run to prevent double-firing.
     """
     db = SessionLocal()
     try:
-        if get_setting(db, "monitor_enabled", "true") != "true":
+        # Resolve admin user so we read their per-user settings
+        admin_row = db.execute(
+            text("SELECT id FROM users WHERE role = 'admin' ORDER BY id LIMIT 1")
+        ).fetchone()
+        admin_uid = admin_row[0] if admin_row else None
+
+        # Read settings from merged user+global so Settings panel changes are respected
+        from .database import get_all_user_settings as _gaus
+        merged = _gaus(db, admin_uid) if admin_uid else {}
+
+        if merged.get("monitor_enabled", "true") != "true":
             return
 
         now_et = datetime.now(_ET)
@@ -36,26 +46,25 @@ async def _monitor_watchdog():
         if not (9 <= now_et.hour < 16):
             return
 
-        interval = int(get_setting(db, "monitor_interval_minutes", "30") or "30")
+        interval = int(merged.get("monitor_interval_minutes", "30") or "30")
 
         last_run_str = get_setting(db, "monitor_last_run", "")
         if last_run_str:
             try:
-                last_run = datetime.fromisoformat(last_run_str).replace(tzinfo=_ET)
+                last_run = datetime.fromisoformat(last_run_str)
+                # Ensure both datetimes are UTC-comparable
+                if last_run.tzinfo is None:
+                    last_run = _ET.localize(last_run)
                 elapsed = (now_et - last_run).total_seconds() / 60
                 if elapsed < interval:
                     return
-            except ValueError:
+            except (ValueError, TypeError):
                 pass  # malformed timestamp — proceed
 
         # Mark run before executing so concurrent ticks don't double-fire
         set_setting(db, "monitor_last_run", now_et.isoformat())
         db.commit()
 
-        admin_row = db.execute(
-            text("SELECT id FROM users WHERE role = 'admin' ORDER BY id LIMIT 1")
-        ).fetchone()
-        admin_uid = admin_row[0] if admin_row else None
     finally:
         db.close()
 
