@@ -229,6 +229,39 @@ def get_next_earnings_date(symbol: str) -> "date | None":
     return None
 
 
+def get_revenue_growth(symbol: str) -> float | None:
+    """
+    Return YoY revenue growth as a percentage (e.g. 15.0 = +15%).
+    Uses Yahoo Finance quoteSummary financialData module.
+    Returns None if unavailable.
+    """
+    session = _get_session()
+    crumb   = _get_crumb()
+
+    for host in ("query1", "query2"):
+        try:
+            url    = f"https://{host}.finance.yahoo.com/v10/finance/quoteSummary/{symbol}"
+            params = {"modules": "financialData"}
+            if crumb:
+                params["crumb"] = crumb
+            resp = session.get(url, params=params, timeout=10)
+            resp.raise_for_status()
+            data   = resp.json()
+            result = data.get("quoteSummary", {}).get("result") or []
+            if not result:
+                continue
+            fd     = result[0].get("financialData", {})
+            raw    = fd.get("revenueGrowth", {})
+            value  = raw.get("raw") if isinstance(raw, dict) else raw
+            if value is not None:
+                return round(float(value) * 100, 1)   # convert 0.15 → 15.0
+        except Exception as exc:
+            logger.debug("get_revenue_growth %s [%s]: %s", symbol, host, exc)
+
+    logger.debug("get_revenue_growth %s: unavailable", symbol)
+    return None
+
+
 def get_current_price(symbol: str) -> float:
     """Latest adjusted close price, 0.0 on any failure."""
     df = fetch_history(symbol, period_days=5)

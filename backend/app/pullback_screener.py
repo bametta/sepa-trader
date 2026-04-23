@@ -46,7 +46,19 @@ _PB_COLS = [
     "ADX",
     "Perf.1M",
     "Perf.3M",
+    "sector",                       # Used for sector exclusion filter
 ]
+
+# Sectors excluded by default — commodity/defensive/low-growth sectors that
+# don't fit a momentum-pullback growth strategy.
+DEFAULT_EXCLUDED_SECTORS = (
+    "Consumer Defensive,"
+    "Energy,"
+    "Utilities,"
+    "Real Estate,"
+    "Basic Materials,"
+    "Financial Services"
+)
 
 _TV_HEADERS = {
     "User-Agent": (
@@ -101,6 +113,14 @@ def get_pb_settings(db: Session, user_id: int) -> dict:
             for e in _s("pb_exchanges", "NYSE,NASDAQ").split(",")
             if e.strip()
         ],
+        # Sector exclusion — comma-separated TV sector names to block
+        "excluded_sectors": [
+            s.strip()
+            for s in _s("pb_excluded_sectors", DEFAULT_EXCLUDED_SECTORS).split(",")
+            if s.strip()
+        ],
+        # Minimum YoY revenue growth % (0 = disabled)
+        "min_revenue_growth": float(_s("pb_min_revenue_growth", "0")),
     }
 
 
@@ -221,6 +241,10 @@ def run_pullback_screener(
             f"{abs(c['pct_from_52wh']):.1f}% below 52W high.",
             f"EMA: {ema_ladder}.",
         ]
+        if c.get("sector"):
+            parts.append(f"Sector: {c['sector']}.")
+        if c.get("rev_growth") is not None:
+            parts.append(f"Revenue growth: {c['rev_growth']:+.1f}% YoY.")
         if c.get("days_to_earnings") is not None:
             parts.append(f"Earnings ≥{c['days_to_earnings']}d away.")
         if c.get("ai_chart_grade"):
@@ -387,6 +411,12 @@ def _local_refinement(sym: str, v: dict, cfg: dict) -> dict | None:
     if w52_high and abs(pct_from_52wh) > cfg["52w_high_pct_max"]:
         return None
 
+    # Sector exclusion — block commodity/defensive/low-growth sectors
+    sector = (v.get("sector") or "").strip()
+    if cfg.get("excluded_sectors") and sector and sector in cfg["excluded_sectors"]:
+        logger.debug("Pullback: %s skipped — excluded sector (%s)", sym, sector)
+        return None
+
     # Earnings date from TV (Unix timestamp → date, or None if unavailable)
     tv_earn_ts = v.get("earnings_release_next_date")
     tv_earn_date: date | None = None
@@ -409,6 +439,7 @@ def _local_refinement(sym: str, v: dict, cfg: dict) -> dict | None:
         "rel_vol":       round(rel_vol, 2),
         "market_cap":    v.get("market_cap_basic") or 0,
         "tv_earn_date":  tv_earn_date,   # None → pass-2 will call Yahoo Finance
+        "sector":        sector,
         "ema_spread":    round(ema_spread_pct, 2),
         "adx":           v.get("ADX") or 0,
         "perf_1m":       v.get("Perf.1M") or 0,
@@ -701,6 +732,20 @@ def _score_candidates(
                         )
                         continue
 
+            # ── Revenue growth gate (optional pass-2) ─────────────────────────
+            rev_growth = None
+            if cfg["min_revenue_growth"] > 0:
+                from .strategies.yf_client import get_revenue_growth
+                rev_growth = get_revenue_growth(sym)
+                if rev_growth is None:
+                    logger.debug("Pullback: %s — revenue growth unavailable, allowing through", sym)
+                elif rev_growth < cfg["min_revenue_growth"]:
+                    logger.debug(
+                        "Pullback: %s skipped — revenue growth %.1f%% < min %.1f%%",
+                        sym, rev_growth, cfg["min_revenue_growth"],
+                    )
+                    continue
+
             # ── AI chart review (optional pass-2 gate) ────────────────────────
             ai_grade    = None
             ai_reasoning = None
@@ -731,6 +776,7 @@ def _score_candidates(
                 **c,
                 "ppst_bullish":     ppst_bullish,
                 "days_to_earnings": days_to_earnings,
+                "rev_growth":       rev_growth,
                 "ai_chart_grade":   ai_grade,
                 "ai_chart_reason":  ai_reasoning,
                 "score":            score,
