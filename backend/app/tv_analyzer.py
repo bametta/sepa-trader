@@ -31,7 +31,8 @@ _tv_cookie: str = ""
 def _get_tv_cookie(db=None) -> str:
     """
     Return a cached TV session cookie if TV credentials are configured.
-    Falls back to empty string (unauthenticated) if not set.
+    Reads from the admin user's merged settings (user_settings overrides global).
+    Falls back to empty string (unauthenticated) if credentials not set.
     """
     global _tv_cookie
     if _tv_cookie:
@@ -39,15 +40,23 @@ def _get_tv_cookie(db=None) -> str:
     if db is None:
         return ""
     try:
-        from .database import get_setting as _gs
-        tv_user = _gs(db, "tv_username", "")
-        tv_pass = _gs(db, "tv_password", "")
+        from sqlalchemy import text as _text
+        from .database import get_all_user_settings as _gaus
+        # Get admin user_id
+        admin_row = db.execute(
+            _text("SELECT id FROM users WHERE role = 'admin' ORDER BY id LIMIT 1")
+        ).fetchone()
+        if not admin_row:
+            return ""
+        merged = _gaus(db, admin_row[0])
+        tv_user = merged.get("tv_username", "")
+        tv_pass = merged.get("tv_password", "")
         if not tv_user or not tv_pass:
             return ""
         from .tradingview_client import get_session_cookie
         _tv_cookie = get_session_cookie(tv_user, tv_pass) or ""
         if _tv_cookie:
-            logger.info("tv_analyzer: TV session cookie obtained")
+            logger.info("tv_analyzer: TV session cookie obtained for scanner auth")
     except Exception as exc:
         logger.debug("tv_analyzer: could not get TV cookie: %s", exc)
     return _tv_cookie
@@ -119,15 +128,19 @@ def batch_analyze(
                 return {s: {"signal": "INSUFFICIENT_DATA", "score": 0, "price": None} for s in symbols}
 
         if resp.status_code == 401:
-            logger.error("tv_analyzer: TV scanner still 401 after auth — credentials may be wrong")
+            logger.warning(
+                "tv_analyzer: TV scanner 401 even after auth — "
+                "signal analysis unavailable. Monitor continues managing stops/exits."
+            )
             return {s: {"signal": "INSUFFICIENT_DATA", "score": 0, "price": None} for s in symbols}
 
-        resp.raise_for_status()
+        if not resp.is_success:
+            logger.warning("tv_analyzer: TV scanner returned %d — skipping signal analysis", resp.status_code)
+            return {s: {"signal": "INSUFFICIENT_DATA", "score": 0, "price": None} for s in symbols}
 
     except Exception as exc:
-        logger.error("TradingView scan request failed: %s", exc)
-        err = str(exc)
-        return {s: {"signal": "ERROR", "score": 0, "price": None, "error": err} for s in symbols}
+        logger.warning("tv_analyzer: TV scanner unavailable (%s) — skipping signal analysis", exc)
+        return {s: {"signal": "INSUFFICIENT_DATA", "score": 0, "price": None} for s in symbols}
 
     rows = resp.json().get("data", [])
     results: dict[str, dict] = {}
