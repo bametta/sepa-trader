@@ -66,14 +66,17 @@ jobs:
             echo "==> Pulling new images from Docker Hub"
             docker compose pull
 
-            echo "==> Project: clean (stop + remove containers, preserve volumes)"
-            docker compose down
+            echo "==> Stopping app containers only (db + redis stay running)"
+            docker compose stop backend frontend
+
+            echo "==> Removing old app containers"
+            docker compose rm -f backend frontend
 
             echo "==> Pruning dangling images"
             docker image prune -f
 
-            echo "==> Project: build (recreate containers from new images)"
-            docker compose up -d
+            echo "==> Recreating app containers from new images"
+            docker compose up -d backend frontend
 
             echo "==> Done. Running containers:"
             docker compose ps
