@@ -396,6 +396,18 @@ def _save_plan(db: Session, rows: list[dict], week_start: str, mode: str, user_i
         ).fetchall()
     }
 
+    # Also treat anything bought today (in trade_log) as executed
+    try:
+        bought_today = {r[0] for r in db.execute(
+            text("""SELECT DISTINCT symbol FROM trade_log
+                    WHERE action = 'BUY' AND mode = :mode
+                    AND created_at >= CURRENT_DATE"""),
+            {"mode": mode},
+        ).fetchall()}
+        already_executed |= bought_today
+    except Exception:
+        pass
+
     db.execute(
         text("DELETE FROM weekly_plan WHERE week_start = :w AND mode = :m AND user_id IS NOT DISTINCT FROM :uid"),
         {"w": week_start, "m": mode, "uid": user_id},

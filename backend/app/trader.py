@@ -12,7 +12,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 from . import alpaca_client as alp
 from .sepa_analyzer import analyze
-from .database import get_setting
+from .database import get_setting, get_all_user_settings
 from . import telegram_alerts as tg
 
 logger = logging.getLogger(__name__)
