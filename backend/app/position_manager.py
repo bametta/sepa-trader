@@ -796,6 +796,25 @@ def fill_open_slots(
     total_held   = len(positions)
     held_symbols = {p.symbol for p in positions}
 
+    # Sync Alpaca reality → DB: any symbol currently held must be EXECUTED in
+    # weekly_plan, regardless of what the DB says. Handles screener re-runs that
+    # reset EXECUTED → PENDING, and restarts where DB lost track of open positions.
+    if held_symbols:
+        try:
+            db.execute(
+                text("""
+                    UPDATE weekly_plan SET status = 'EXECUTED'
+                    WHERE week_start = (SELECT MAX(week_start) FROM weekly_plan WHERE mode = :mode)
+                      AND mode   = :mode
+                      AND symbol IN :syms
+                      AND status = 'PENDING'
+                """),
+                {"mode": mode, "syms": tuple(held_symbols)},
+            )
+            db.commit()
+        except Exception as exc:
+            logger.warning("fill_open_slots: position sync failed: %s", exc)
+
     if total_held >= max_pos:
         return
 
