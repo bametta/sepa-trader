@@ -420,6 +420,12 @@ async def run_monitor(db: Session, user_id: int | None = None):
         auto_execute = _s.get("auto_execute", "true").lower() == "true"
         risk_pct     = float(_s.get("risk_pct", "2.0") or "2.0")
         stop_pct     = float(_s.get("stop_loss_pct", "8.0") or "8.0")
+        # Ensure the Alpaca client uses DB-stored credentials (not just .env)
+        # so that keys saved via the Settings panel are respected for both modes.
+        try:
+            alp.configure_from_db_settings(_s, mode, is_admin=True)
+        except ValueError as _creds_err:
+            return {"status": "error", "error": str(_creds_err)}
     else:
         mode         = get_setting(db, "trading_mode", "paper")
         auto_execute = get_setting(db, "auto_execute", "true").lower() == "true"

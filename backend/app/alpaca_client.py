@@ -46,6 +46,42 @@ def get_client_for_keys(api_key: str, secret_key: str, paper: bool) -> TradingCl
     )
 
 
+def configure_from_db_settings(merged: dict, mode: str, is_admin: bool = True) -> None:
+    """
+    Update the global cached client for `mode` using credentials from the merged
+    user+global settings dict (as returned by get_all_user_settings).
+
+    For admin users, falls back to .env credentials when DB credentials are absent
+    — the same logic used by the account route's _resolve_alpaca_client.
+
+    Call this at the start of run_monitor so the live client uses DB-stored keys
+    (saved via Settings panel) rather than the .env-file keys which may be empty.
+    """
+    if mode == "paper":
+        key    = (merged.get("alpaca_paper_key") or "").strip()
+        secret = (merged.get("alpaca_paper_secret") or "").strip()
+        if is_admin:
+            key    = key    or (settings.alpaca_paper_key or "").strip()
+            secret = secret or (settings.alpaca_paper_secret or "").strip()
+        paper = True
+    else:
+        key    = (merged.get("alpaca_live_key") or "").strip()
+        secret = (merged.get("alpaca_live_secret") or "").strip()
+        if is_admin:
+            key    = key    or (settings.alpaca_live_key or "").strip()
+            secret = secret or (settings.alpaca_live_secret or "").strip()
+        paper = False
+
+    if not key or not secret:
+        raise ValueError(f"No Alpaca credentials configured for {mode} mode")
+
+    logger.info(
+        "configure_from_db_settings: updating %s client key_prefix=%s",
+        mode, key[:6],
+    )
+    _clients[mode] = TradingClient(api_key=key, secret_key=secret, paper=paper)
+
+
 def get_account(mode: str = "paper"):
     return get_client(mode).get_account()
 
