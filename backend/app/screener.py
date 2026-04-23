@@ -424,6 +424,21 @@ def run_both_screeners(
     logger.info("Running both screeners (mode=%s, user=%s)…", mode, user_id)
 
     # Fetch account value once — shared by both screeners to avoid double Alpaca calls
+    # Log the key prefix so we can confirm which credentials are being used
+    try:
+        from .database import get_user_setting as _gus
+        from .config import settings as _gs
+        _live_key = _gus(db, "alpaca_live_key", "", user_id) or _gs.alpaca_live_key
+        _paper_key = _gus(db, "alpaca_paper_key", "", user_id) or _gs.alpaca_paper_key
+        logger.info(
+            "Screener credentials check — mode=%s live_key_prefix=%s paper_key_prefix=%s",
+            mode,
+            _live_key[:8] if _live_key else "MISSING",
+            _paper_key[:8] if _paper_key else "MISSING",
+        )
+    except Exception:
+        pass
+
     av = _get_portfolio_value(db, mode, user_id)
     if av <= 0:
         raise RuntimeError(
