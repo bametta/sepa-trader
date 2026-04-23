@@ -118,11 +118,12 @@ def run_screener(db: Session, mode: str = None, user_id: int = None, account_val
     ema50_pct       = float(_s("screener_ema50_pct",     "3.0") or "3.0")
 
     if account_value is None:
-        account_value = _get_portfolio_value(db, mode, user_id)
-    if account_value <= 0:
-        msg = "Screener aborted: could not fetch account value from Alpaca — no positions sized"
-        _log_alert(db, "ERROR", msg)
-        return []
+        try:
+            account_value = _get_portfolio_value(db, mode, user_id)
+        except RuntimeError as exc:
+            msg = f"Screener aborted: {exc}"
+            _log_alert(db, "ERROR", msg)
+            raise
     tier_label    = "PAPER"
 
     # --- Live account graduated overrides ---
@@ -326,49 +327,58 @@ def _log_alert(db: Session, level: str, message: str):
 
 
 def _get_portfolio_value(db: Session, mode: str, user_id: int = None) -> float:
+    """Fetch account portfolio value from Alpaca.
+    Raises RuntimeError with the real Alpaca error on failure so callers can
+    surface the actual cause to the user instead of a generic message.
+    """
+    from . import alpaca_client as alp
+    from .config import settings as global_settings
+
+    if user_id:
+        from .database import get_user_setting as _gus
+        is_admin = db.execute(
+            text("SELECT role FROM users WHERE id = :id"), {"id": user_id}
+        ).scalar() == "admin"
+        if mode == "paper":
+            key    = _gus(db, "alpaca_paper_key",    "", user_id)
+            secret = _gus(db, "alpaca_paper_secret", "", user_id)
+            if is_admin:
+                key    = key    or global_settings.alpaca_paper_key
+                secret = secret or global_settings.alpaca_paper_secret
+            paper = True
+        else:
+            key    = _gus(db, "alpaca_live_key",    "", user_id)
+            secret = _gus(db, "alpaca_live_secret", "", user_id)
+            if is_admin:
+                key    = key    or global_settings.alpaca_live_key
+                secret = secret or global_settings.alpaca_live_secret
+            paper = False
+        if not key or not secret:
+            raise RuntimeError(
+                f"No Alpaca {mode} credentials configured — "
+                f"add alpaca_{mode}_key and alpaca_{mode}_secret in Settings → Alpaca."
+            )
+        try:
+            client = alp.get_client_for_keys(key, secret, paper)
+            return float(client.get_account().portfolio_value)
+        except Exception as exc:
+            logger.error(
+                "_get_portfolio_value: Alpaca %s call failed (user=%s): %r",
+                mode, user_id, exc, exc_info=True,
+            )
+            raise RuntimeError(
+                f"Alpaca {mode} API error: {exc}"
+            ) from exc
+
     try:
-        from . import alpaca_client as alp
-        from .config import settings as global_settings
-
-        if user_id:
-            from .database import get_user_setting as _gus
-            is_admin = db.execute(
-                text("SELECT role FROM users WHERE id = :id"), {"id": user_id}
-            ).scalar() == "admin"
-            if mode == "paper":
-                key    = _gus(db, "alpaca_paper_key",    "", user_id)
-                secret = _gus(db, "alpaca_paper_secret", "", user_id)
-                if is_admin:
-                    key    = key    or global_settings.alpaca_paper_key
-                    secret = secret or global_settings.alpaca_paper_secret
-                paper = True
-            else:
-                key    = _gus(db, "alpaca_live_key",    "", user_id)
-                secret = _gus(db, "alpaca_live_secret", "", user_id)
-                if is_admin:
-                    key    = key    or global_settings.alpaca_live_key
-                    secret = secret or global_settings.alpaca_live_secret
-                paper = False
-            if key and secret:
-                client = alp.get_client_for_keys(key, secret, paper)
-                return float(client.get_account().portfolio_value)
-            else:
-                logger.error(
-                    "_get_portfolio_value: no Alpaca %s credentials found for user_id=%s "
-                    "(is_admin=%s) — configure alpaca_%s_key/secret in Settings",
-                    mode, user_id, is_admin, mode,
-                )
-                return 0.0
-
         acct = alp.get_account(mode)
         return float(acct.portfolio_value)
     except Exception as exc:
         logger.error(
-            "_get_portfolio_value: Alpaca call failed (mode=%s, user_id=%s): %r",
-            mode, user_id, exc,
-            exc_info=True,
+            "_get_portfolio_value: Alpaca %s call failed (global creds): %r",
+            mode, exc, exc_info=True,
         )
-        return 0.0
+        raise RuntimeError(f"Alpaca {mode} API error: {exc}") from exc
 
 
 def _save_plan(db: Session, rows: list[dict], week_start: str, mode: str, user_id: int = None):
@@ -439,12 +449,13 @@ def run_both_screeners(
         (_paper_key[:8] + "…") if _paper_key else "MISSING",
     )
 
-    av = _get_portfolio_value(db, mode, user_id)
-    if av <= 0:
+    try:
+        av = _get_portfolio_value(db, mode, user_id)
+    except RuntimeError as exc:
+        # Re-raise with context so the UI shows the real Alpaca error
         raise RuntimeError(
-            f"Cannot reach Alpaca ({mode} mode) — check credentials in Settings → Alpaca. "
-            "Both screeners aborted."
-        )
+            f"Cannot reach Alpaca ({mode} mode) — {exc}. Both screeners aborted."
+        ) from exc
     logger.info("Account value for screener run: $%.0f (mode=%s)", av, mode)
 
     _phase("Minervini: scanning universe via TradingView…")

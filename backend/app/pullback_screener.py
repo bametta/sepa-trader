@@ -180,10 +180,11 @@ def run_pullback_screener(
     from .screener import _get_portfolio_value, _next_monday
 
     if account_value is None:
-        account_value = _get_portfolio_value(db, mode, user_id)
-    if account_value <= 0:
-        logger.warning("Pullback screener: cannot fetch account value — skipping")
-        return []
+        try:
+            account_value = _get_portfolio_value(db, mode, user_id)
+        except RuntimeError as exc:
+            logger.error("Pullback screener: %s", exc)
+            raise
 
     risk_pct = float(get_user_setting(db, "risk_pct",         "2.0",  user_id))
     stop_pct = float(get_user_setting(db, "stop_loss_pct",    "8.0",  user_id))
