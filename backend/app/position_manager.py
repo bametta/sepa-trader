@@ -796,10 +796,26 @@ def fill_open_slots(
     total_held   = len(positions)
     held_symbols = {p.symbol for p in positions}
 
-    # Sync Alpaca reality → DB: any symbol currently held must be EXECUTED in
-    # weekly_plan, regardless of what the DB says. Handles screener re-runs that
-    # reset EXECUTED → PENDING, and restarts where DB lost track of open positions.
-    if held_symbols:
+    # Sync DB → EXECUTED for any symbol that is currently held OR was bought
+    # today (even if already closed). Prevents re-entering a position that was
+    # stopped out and reset to PENDING by a screener re-run.
+    try:
+        bought_today = {
+            row[0] for row in db.execute(
+                text("""
+                    SELECT DISTINCT symbol FROM trade_log
+                    WHERE action = 'BUY'
+                      AND mode = :mode
+                      AND created_at >= CURRENT_DATE
+                """),
+                {"mode": mode},
+            ).fetchall()
+        }
+    except Exception:
+        bought_today = set()
+
+    already_active = held_symbols | bought_today
+    if already_active:
         try:
             db.execute(
                 text("""
@@ -809,7 +825,7 @@ def fill_open_slots(
                       AND symbol IN :syms
                       AND status = 'PENDING'
                 """),
-                {"mode": mode, "syms": tuple(held_symbols)},
+                {"mode": mode, "syms": tuple(already_active)},
             )
             db.commit()
         except Exception as exc:
