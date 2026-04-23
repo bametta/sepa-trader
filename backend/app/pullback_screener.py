@@ -110,6 +110,7 @@ def run_pullback_screener(
     db: Session,
     mode: str = None,
     user_id: int = None,
+    account_value: float = None,
 ) -> list[dict]:
     """
     Run the Pullback-to-MA screener.
@@ -178,7 +179,8 @@ def run_pullback_screener(
     # ── Position sizing ───────────────────────────────────────────────────────
     from .screener import _get_portfolio_value, _next_monday
 
-    account_value = _get_portfolio_value(db, mode, user_id)
+    if account_value is None:
+        account_value = _get_portfolio_value(db, mode, user_id)
     if account_value <= 0:
         logger.warning("Pullback screener: cannot fetch account value — skipping")
         return []

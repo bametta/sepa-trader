@@ -76,7 +76,7 @@ def _generate_rationale(symbol: str, result: dict) -> str:
     return " ".join(parts)
 
 
-def run_screener(db: Session, mode: str = None, user_id: int = None) -> list[dict]:
+def run_screener(db: Session, mode: str = None, user_id: int = None, account_value: float = None) -> list[dict]:
     """
     Scan the stock universe, select top-N SEPA candidates, save to
     weekly_plan table, and update the watchlist setting.
@@ -85,6 +85,9 @@ def run_screener(db: Session, mode: str = None, user_id: int = None) -> list[dic
     Paper accounts use settings as configured — no overrides.
     Live accounts apply graduated limits from get_live_account_limits()
     which automatically unlock as the account grows across tier boundaries.
+
+    account_value: pass explicitly when calling from run_both_screeners to
+    avoid a second Alpaca API call (the value was already fetched).
     """
     def _s(key, default=""):
         return get_user_setting(db, key, default, user_id)
@@ -114,7 +117,8 @@ def run_screener(db: Session, mode: str = None, user_id: int = None) -> list[dic
     ema20_pct       = float(_s("screener_ema20_pct",     "2.0") or "2.0")
     ema50_pct       = float(_s("screener_ema50_pct",     "3.0") or "3.0")
 
-    account_value = _get_portfolio_value(db, mode, user_id)
+    if account_value is None:
+        account_value = _get_portfolio_value(db, mode, user_id)
     if account_value <= 0:
         msg = "Screener aborted: could not fetch account value from Alpaca — no positions sized"
         _log_alert(db, "ERROR", msg)
@@ -419,10 +423,19 @@ def run_both_screeners(
 
     logger.info("Running both screeners (mode=%s, user=%s)…", mode, user_id)
 
+    # Fetch account value once — shared by both screeners to avoid double Alpaca calls
+    av = _get_portfolio_value(db, mode, user_id)
+    if av <= 0:
+        raise RuntimeError(
+            f"Cannot reach Alpaca ({mode} mode) — check credentials in Settings → Alpaca. "
+            "Both screeners aborted."
+        )
+    logger.info("Account value for screener run: $%.0f (mode=%s)", av, mode)
+
     _phase("Minervini: scanning universe via TradingView…")
-    min_rows = run_screener(db, mode=mode, user_id=user_id)   # saves its own plan
+    min_rows = run_screener(db, mode=mode, user_id=user_id, account_value=av)
     _phase(f"Minervini done — {len(min_rows)} candidates. Running Pullback screener…")
-    pb_rows  = run_pullback_screener(db, mode=mode, user_id=user_id)
+    pb_rows  = run_pullback_screener(db, mode=mode, user_id=user_id, account_value=av)
     _phase(f"Pullback done — {len(pb_rows)} candidates. Merging results…")
 
     # Merge: Minervini first, then Pullback, dedup by symbol
