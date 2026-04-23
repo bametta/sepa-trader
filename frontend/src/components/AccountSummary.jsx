@@ -65,6 +65,7 @@ function AccountCard({ acct, onModeChange }) {
         <div className={`stat-card ${(acct.unrealized_pl ?? 0) >= 0 ? 'border-emerald-500/10' : 'border-red-500/10'}`}>
           <div className="label mb-1">Total P&L</div>
           <div className={`text-sm font-bold num ${totalPlColor}`}>{fmt(acct.unrealized_pl ?? 0, true)}</div>
+          <div className="text-[10px] text-slate-600">realized + unrealized</div>
         </div>
       </div>
     </div>

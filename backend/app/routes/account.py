@@ -48,18 +48,28 @@ def _fetch_account_data(client, name: str, mode: str) -> dict | None:
         last_eq = _sf(acct.last_equity, 0.0)
         day_pnl = equity - last_eq
 
-        # unrealized_pl lives on individual Position objects, not on the Account.
-        # Sum it across all open positions for the true total unrealized P&L.
-        try:
-            positions     = client.get_all_positions()
-            unrealized_pl = sum(_sf(getattr(p, "unrealized_pl", None), 0.0) for p in positions)
-        except Exception:
-            unrealized_pl = 0.0
-
         non_marginable_bp = _sf(
             getattr(acct, "non_marginable_buying_power", None),
             _sf(acct.buying_power, 0.0),
         )
+
+        # Total P&L (realized + unrealized since account inception).
+        # portfolio history profit_loss[-1] = equity - base_value at period start.
+        # Using a start date before Alpaca existed guarantees we capture all history.
+        total_pl = 0.0
+        try:
+            from datetime import datetime, timezone
+            from alpaca.trading.requests import GetPortfolioHistoryRequest
+            history = client.get_portfolio_history(
+                GetPortfolioHistoryRequest(
+                    start=datetime(2015, 1, 1, tzinfo=timezone.utc),
+                    timeframe="1D",
+                )
+            )
+            if history.profit_loss:
+                total_pl = _sf(history.profit_loss[-1], 0.0)
+        except Exception as hist_exc:
+            logger.debug("_fetch_account_data: portfolio history unavailable (%s)", hist_exc)
 
         return {
             "name":              name,
@@ -71,7 +81,7 @@ def _fetch_account_data(client, name: str, mode: str) -> dict | None:
             "equity":            equity,
             "day_pnl":           day_pnl,
             "day_pnl_pct":       (day_pnl / last_eq * 100) if last_eq else 0.0,
-            "unrealized_pl":     unrealized_pl,
+            "unrealized_pl":     total_pl,
         }
     except Exception as exc:
         logger.warning("_fetch_account_data(%s, %s): %s", name, mode, exc)
