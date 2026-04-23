@@ -157,6 +157,8 @@ const SECTIONS = [
   },
 ]
 
+const DEFAULT_OPEN = new Set(['Trading', 'Monitor', 'Alpaca Credentials'])
+
 export default function SettingsPanel() {
   const qc            = useQueryClient()
   const { data = {} } = useQuery('settings', fetchSettings)
@@ -166,6 +168,15 @@ export default function SettingsPanel() {
   const [tvList, setTvList]   = useState([])
   const [tvLoading, setTvLoading] = useState(false)
   const [tvError, setTvError] = useState('')
+  const [openSections, setOpenSections] = useState(DEFAULT_OPEN)
+
+  function toggleSection(title) {
+    setOpenSections(prev => {
+      const next = new Set(prev)
+      if (next.has(title)) next.delete(title); else next.add(title)
+      return next
+    })
+  }
 
   async function loadTvScreeners() {
     setTvLoading(true); setTvError('')
@@ -198,47 +209,86 @@ export default function SettingsPanel() {
     <div className="space-y-3">
 
       {/* Account & Security */}
-      <div className="bg-card border border-border rounded-xl p-4 space-y-3">
-        <h3 className="text-sm font-semibold text-slate-400 uppercase tracking-wider">Account & Security</h3>
-        {me && (
-          <div className="flex items-center gap-3 pb-3 border-b border-border">
-            <div className="w-9 h-9 rounded-full bg-accent/20 text-accent flex items-center justify-center font-bold">
-              {me.username[0].toUpperCase()}
-            </div>
-            <div>
-              <p className="text-sm text-slate-200 font-medium">{me.username}</p>
-              <p className="text-xs text-slate-500">{me.email} · <span className="capitalize">{me.role}</span></p>
-            </div>
-          </div>
-        )}
-        <TwoFactorSetup enabled={me?.totp_enabled ?? false} onChanged={refetchMe} />
-      </div>
-
-      {SECTIONS.map(section => (
-        <div key={section.title} className="bg-card border border-border rounded-xl p-4">
-          <h3 className="text-sm font-semibold text-slate-400 uppercase tracking-wider mb-3">
-            {section.title}
-          </h3>
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-            {section.fields.map(f => (
-              <div key={f.key} className={f.span ? 'sm:col-span-2' : ''}>
-                <Field
-                  field={f}
-                  value={data[f.key] ?? ''}
-                  saving={saving === f.key}
-                  onSave={val => save(f.key, val)}
-                  tvScreeners={f.type === 'tv_screener' ? tvList : undefined}
-                  tvLoading={f.type === 'tv_screener' ? tvLoading : undefined}
-                  tvError={f.type === 'tv_screener' ? tvError : undefined}
-                  tvOpen={f.type === 'tv_screener' ? tvOpen : undefined}
-                  onBrowseTv={f.type === 'tv_screener' ? loadTvScreeners : undefined}
-                  onCloseTv={f.type === 'tv_screener' ? () => setTvOpen(false) : undefined}
-                />
+      {(() => {
+        const isOpen = openSections.has('Account & Security')
+        return (
+          <div className="bg-card border border-border rounded-xl overflow-hidden">
+            <button
+              onClick={() => toggleSection('Account & Security')}
+              className="w-full flex items-center justify-between px-4 py-3 hover:bg-white/5 transition-colors"
+            >
+              <h3 className="text-sm font-semibold text-slate-300 uppercase tracking-wider">Account & Security</h3>
+              <svg className={`w-4 h-4 text-slate-400 transition-transform duration-200 ${isOpen ? 'rotate-180' : ''}`}
+                   fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                <path strokeLinecap="round" strokeLinejoin="round" d="M19 9l-7 7-7-7" />
+              </svg>
+            </button>
+            {isOpen && (
+              <div className="px-4 pb-4 border-t border-border mt-0 space-y-3 pt-3">
+                {me && (
+                  <div className="flex items-center gap-3 pb-3 border-b border-border">
+                    <div className="w-9 h-9 rounded-full bg-accent/20 text-accent flex items-center justify-center font-bold">
+                      {me.username[0].toUpperCase()}
+                    </div>
+                    <div>
+                      <p className="text-sm text-slate-200 font-medium">{me.username}</p>
+                      <p className="text-xs text-slate-500">{me.email} · <span className="capitalize">{me.role}</span></p>
+                    </div>
+                  </div>
+                )}
+                <TwoFactorSetup enabled={me?.totp_enabled ?? false} onChanged={refetchMe} />
               </div>
-            ))}
+            )}
           </div>
-        </div>
-      ))}
+        )
+      })()}
+
+      {SECTIONS.map(section => {
+        const isOpen = openSections.has(section.title)
+        return (
+          <div key={section.title} className="bg-card border border-border rounded-xl overflow-hidden">
+            {/* Header — always visible, click to toggle */}
+            <button
+              onClick={() => toggleSection(section.title)}
+              className="w-full flex items-center justify-between px-4 py-3 hover:bg-white/5 transition-colors"
+            >
+              <h3 className="text-sm font-semibold text-slate-300 uppercase tracking-wider">
+                {section.title}
+              </h3>
+              <svg
+                className={`w-4 h-4 text-slate-400 transition-transform duration-200 ${isOpen ? 'rotate-180' : ''}`}
+                fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}
+              >
+                <path strokeLinecap="round" strokeLinejoin="round" d="M19 9l-7 7-7-7" />
+              </svg>
+            </button>
+
+            {/* Body — shown only when open */}
+            {isOpen && (
+              <div className="px-4 pb-4 border-t border-border">
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 mt-3">
+                  {section.fields.map(f => (
+                    <div key={f.key} className={f.span ? 'sm:col-span-2' : ''}>
+                      <Field
+                        field={f}
+                        value={data[f.key] ?? ''}
+                        saving={saving === f.key}
+                        onSave={val => save(f.key, val)}
+                        tvScreeners={f.type === 'tv_screener' ? tvList : undefined}
+                        tvLoading={f.type === 'tv_screener' ? tvLoading : undefined}
+                        tvError={f.type === 'tv_screener' ? tvError : undefined}
+                        tvOpen={f.type === 'tv_screener' ? tvOpen : undefined}
+                        onBrowseTv={f.type === 'tv_screener' ? loadTvScreeners : undefined}
+                        onCloseTv={f.type === 'tv_screener' ? () => setTvOpen(false) : undefined}
+                      />
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+        )
+      })}
     </div>
   )
 }
