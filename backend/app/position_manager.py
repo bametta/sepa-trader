@@ -864,7 +864,7 @@ def fill_open_slots(
             logger.info("fill_open_slots: %s qty<1 (price=$%.2f stop=$%.2f) — skipping.", sym, price, stop)
             continue
 
-        if not _gate(db, sym, qty, price, stop, target, f"FILL_{signal}", mode, user_id=user_id):
+        if not _gate(db, sym, qty, price, stop, target, f"FILL_{signal}", mode):
             logger.info("fill_open_slots: %s blocked by pre-trade gate.", sym)
             continue
 
