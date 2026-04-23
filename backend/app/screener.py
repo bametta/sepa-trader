@@ -382,6 +382,20 @@ def _get_portfolio_value(db: Session, mode: str, user_id: int = None) -> float:
 
 
 def _save_plan(db: Session, rows: list[dict], week_start: str, mode: str, user_id: int = None):
+    # Preserve EXECUTED status for symbols already bought — don't reset them to PENDING
+    # when the screener re-runs mid-week (e.g. a manual run).
+    already_executed = {
+        row[0] for row in db.execute(
+            text("""
+                SELECT symbol FROM weekly_plan
+                WHERE week_start = :w AND mode = :m
+                  AND user_id IS NOT DISTINCT FROM :uid
+                  AND status = 'EXECUTED'
+            """),
+            {"w": week_start, "m": mode, "uid": user_id},
+        ).fetchall()
+    }
+
     db.execute(
         text("DELETE FROM weekly_plan WHERE week_start = :w AND mode = :m AND user_id IS NOT DISTINCT FROM :uid"),
         {"w": week_start, "m": mode, "uid": user_id},
@@ -389,6 +403,9 @@ def _save_plan(db: Session, rows: list[dict], week_start: str, mode: str, user_i
     for r in rows:
         row = {**r, "user_id": user_id}
         row.setdefault("screener_type", "minervini")
+        # Keep EXECUTED status for symbols already bought this week
+        if row.get("symbol") in already_executed:
+            row["status"] = "EXECUTED"
         db.execute(
             text("""
                 INSERT INTO weekly_plan
