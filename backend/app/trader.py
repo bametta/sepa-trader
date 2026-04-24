@@ -494,6 +494,7 @@ async def run_monitor(db: Session, user_id: int | None = None):
                 from .position_manager import fill_open_slots
                 fill_open_slots(
                     db=db, mode=mode, portfolio=portfolio,
+                    cash=cash, buying_power=buying_power,
                     risk_pct=risk_pct, stop_pct=stop_pct,
                     positions=positions, user_id=user_id,
                 )

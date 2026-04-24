@@ -777,9 +777,11 @@ def fill_open_slots(
     db: Session,
     mode: str,
     portfolio: float,
-    risk_pct: float,
-    stop_pct: float,
-    positions: list,
+    cash: float = 0.0,
+    buying_power: float = 0.0,
+    risk_pct: float = 2.0,
+    stop_pct: float = 8.0,
+    positions: list = None,
     user_id: int | None = None,
 ):
     """
@@ -934,10 +936,16 @@ def fill_open_slots(
         qty = _size_qty(portfolio, price, stop, risk_pct, stop_pct)
         # Cap at max_position_pct of portfolio
         max_position_pct = float(get_setting(db, "max_position_pct", "20.0") or "20.0")
+        min_cash_pct     = float(get_setting(db, "min_cash_pct",     "10.0") or "10.0")
         if price > 0:
-            max_shares = int(portfolio * max_position_pct / 100 / price)
-            if max_shares > 0:
-                qty = min(qty, max_shares)
+            max_pos_shares  = int(portfolio * max_position_pct / 100 / price)
+            if max_pos_shares > 0:
+                qty = min(qty, max_pos_shares)
+            # Never spend cash that would drop below the min_cash_pct buffer
+            available_cash = (buying_power or cash or portfolio) - portfolio * min_cash_pct / 100
+            if available_cash > 0:
+                max_cash_shares = int(available_cash / price)
+                qty = min(qty, max_cash_shares)
         if qty < 1:
             logger.info("fill_open_slots: %s qty<1 (price=$%.2f stop=$%.2f) — skipping.", sym, price, stop)
             continue
