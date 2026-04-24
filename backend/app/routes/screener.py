@@ -553,14 +553,20 @@ def trigger_analysis(current_user: dict = Depends(get_current_user), db: Session
         tape_ctx = None
 
     try:
-        # 1 — Plain-text analysis for the log (existing behaviour)
-        text_analysis = analyze_picks(db, picks, user_id=uid, mode=mode)
-        log_analysis(db, "manual", None, text_analysis, mode, user_id=uid)
-
-        # 2 — Structured per-stock analysis
+        # Single AI call — structured result is the source of truth.
+        # The plain-text log is derived from it so card and log always agree.
         structured = analyze_picks_structured(db, picks, tape_context=tape_ctx, user_id=uid, mode=mode)
 
-        # 3 — Persist per-stock JSON back into weekly_plan.ai_analysis
+        # Build log text from the same structured result (no second AI call)
+        log_lines = []
+        for i, item in enumerate(structured, 1):
+            decision  = item.get("decision", "?")
+            rationale = item.get("rationale", "")
+            log_lines.append(f"{i}. **{item['symbol']}** — {decision}: {rationale}")
+        text_analysis = "\n".join(log_lines) if log_lines else "(no pending picks)"
+        log_analysis(db, "manual", None, text_analysis, mode, user_id=uid)
+
+        # Persist per-stock JSON back into weekly_plan.ai_analysis
         week_start = db.execute(
             text("SELECT MAX(week_start) FROM weekly_plan WHERE mode = :mode AND user_id = :uid"),
             {"mode": mode, "uid": uid},
