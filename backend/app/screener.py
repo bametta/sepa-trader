@@ -527,8 +527,12 @@ def run_both_screeners(
         reverse=True,
     )
 
+    total_picks = len(merged)
     for i, row in enumerate(merged, 1):
         row["rank"] = i
+        if row.get("screener_type") == "rs_momentum":
+            # Score = percentile within this plan (rank 1 of N = 99th, last = ~0th)
+            row["score"] = int((1 - (i - 1) / total_picks) * 99) if total_picks > 0 else 50
 
     week_start = merged[0]["week_start"] if merged else _next_monday().isoformat()
     _save_plan(db, merged, week_start, mode, user_id)
