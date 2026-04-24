@@ -263,7 +263,9 @@ def run_rs_screener(
             if (price - ema50) / ema50 * 100 > cfg["max_extension"]:
                 continue
 
-        rs = score_map.get(sym) if score_map else _rs_score(v)
+        rs = (score_map.get(sym) if score_map else None)
+        if rs is None:
+            rs = _rs_score(v)
         if rs <= -50:
             continue
 
