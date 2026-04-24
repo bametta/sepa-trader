@@ -458,8 +458,11 @@ def analyze_picks(db: Session, picks: list[dict], closed_position: dict | None =
         sp = p.get("stop_price")  or 0
         t1 = p.get("target1")     or 0
         rr = round((t1 - ep) / (ep - sp), 2) if ep > sp > 0 and t1 > ep else "N/A"
+        src = p.get("screener_type", "minervini")
+        score_raw = p.get("score", "?")
+        score_str = f"RS-pct={score_raw}/99" if src == "rs_momentum" else f"score={score_raw}/6"
         lines.append(
-            f"{i}. {p['symbol']}  score={p.get('score','?')}/6  signal={p.get('signal','?')}"
+            f"{i}. {p['symbol']}  {score_str}  signal={p.get('signal','?')}"
             f"  entry=${ep:.2f}  stop=${sp:.2f}  t1=${t1:.2f}  R:R={rr}"
             f"  status={p.get('status','?')}  note: {p.get('rationale','')}"
         )
@@ -468,6 +471,7 @@ def analyze_picks(db: Session, picks: list[dict], closed_position: dict | None =
         "You are a professional swing-trader assistant using Minervini SEPA criteria.\n"
         "For each PENDING pick above give a one-line recommendation: EXECUTE, WAIT, or SKIP "
         "with a brief reason (≤15 words). Consider score, R:R ratio, and signal quality.\n"
+        "RS Momentum picks (signal=RS_MOMENTUM) use EMA50 structural stops — R:R ≥1.2 is acceptable for them.\n"
         "Output a numbered list only — no preamble."
     )
 
@@ -581,9 +585,19 @@ def analyze_picks_structured(
         t2   = float(p.get("target2")     or 0)
         rr   = round((t1 - ep) / (ep - sp), 2) if ep > sp > 0 and t1 > ep else "N/A"
         src  = p.get("screener_type", "minervini")
-        src_label = {"minervini": "Minervini/SEPA", "pullback": "Pullback-to-MA (PPST+EMA)", "both": "Both screeners"}.get(src, src)
+        src_label = {
+            "minervini":  "Minervini/SEPA",
+            "pullback":   "Pullback-to-MA (PPST+EMA)",
+            "rs_momentum": "RS Momentum (IBD-style)",
+            "both":       "Both screeners",
+        }.get(src, src)
+        score_raw = p.get("score", "?")
+        if src == "rs_momentum":
+            score_str = f"RS-percentile={score_raw}/99 (plan rank, not SEPA score)"
+        else:
+            score_str = f"SEPA-score={score_raw}/6"
         pick_lines.append(
-            f"{i}. [{p['symbol']}]  source={src_label}  score={p.get('score','?')}/8"
+            f"{i}. [{p['symbol']}]  source={src_label}  {score_str}"
             f"  signal={p.get('signal','?')}"
             f"  entry=${ep:.2f}  stop=${sp:.2f}  t1=${t1:.2f}  t2=${t2:.2f}  R:R={rr}x"
             f"  note: {str(p.get('rationale',''))[:120]}"
@@ -619,9 +633,9 @@ INSTRUCTIONS:
 - guardrails: concrete cut rule + any condition to avoid the trade (e.g. "Cut on daily close below ${'{stop}'}; skip if VIX > 30")
 - rationale: one sentence max (≤20 words) explaining the decision
 
-Use EXECUTE for high-quality setups (score ≥5, R:R ≥2, clean signal).
+Use EXECUTE for high-quality setups (SEPA score ≥5 and R:R ≥2 for Minervini/Pullback; RS Momentum picks require R:R ≥1.2 — their stop is structural EMA50 support, not a raw % stop).
 Use WAIT for borderline setups worth monitoring.
-Use SKIP for low-quality setups or when tape is unfavorable for that setup type.
+Use SKIP for low-quality setups or when tape is unfavorable for that setup type. Do NOT penalise RS Momentum picks for R:R < 2 — they use a tighter stop methodology.
 
 Respond ONLY with a valid JSON array. No markdown fences, no explanation.
 [
