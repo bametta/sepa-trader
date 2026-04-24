@@ -35,7 +35,7 @@ _RS_COLS = [
     "Perf.1M",
     "Perf.3M",
     "Perf.6M",
-    "Perf.1Y",
+    "Perf.Y",      # TradingView uses Perf.Y for 1-year, not Perf.1Y
     "sector",
     "exchange",
 ]
@@ -65,7 +65,7 @@ def _rs_score(v: dict) -> float:
     p1m = v.get("Perf.1M") or 0.0
     p3m = v.get("Perf.3M") or 0.0
     p6m = v.get("Perf.6M") or 0.0
-    p1y = v.get("Perf.1Y") or 0.0
+    p1y = v.get("Perf.Y")  or 0.0   # TV column is Perf.Y, not Perf.1Y
     return (p3m * 0.40) + (p6m * 0.20) + (p1y * 0.20) + (p1m * 0.20)
 
 
@@ -281,7 +281,7 @@ def run_rs_screener(
         p1m = v.get("Perf.1M") or 0.0
         p3m = v.get("Perf.3M") or 0.0
         p6m = v.get("Perf.6M") or 0.0
-        p1y = v.get("Perf.1Y") or 0.0
+        p1y = v.get("Perf.Y")  or 0.0
 
         rationale = (
             f"RS Rank #{i} of {len(top_bucket)} | RS Score {item['rs_score']:.1f} | "

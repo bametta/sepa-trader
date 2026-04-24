@@ -46,6 +46,13 @@ EDITABLE_KEYS = {
     "pb_excluded_sectors", "pb_min_revenue_growth",
     "mv_entry_order_type", "mv_entry_slippage_pct",
     "pb_entry_order_type", "pb_entry_slippage_pct",
+    # RS Momentum screener settings
+    "rs_screener_enabled",
+    "rs_price_min", "rs_price_max",
+    "rs_avg_vol_min", "rs_market_cap_min",
+    "rs_min_percentile", "rs_require_stage2",
+    "rs_max_extension", "rs_top_n", "rs_max_slots",
+    "rs_exchanges", "rs_excluded_sectors",
 }
 
 
