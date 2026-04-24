@@ -257,14 +257,17 @@ def run_rs_screener(
 
         if allowed_exchanges and exch not in allowed_exchanges:
             continue
-        if not sector:
-            logger.debug("RS screener: %s has no sector from TV, keeping.", sym)
-        elif any(excl in sector.lower() or sector.lower() in excl for excl in excluded_sectors):
-            continue
+        if excluded_sectors:
+            if not sector:
+                logger.warning("RS screener: %s has no sector from TV — skipping (can't verify).", sym)
+                continue
+            if any(excl in sector.lower() or sector.lower() in excl for excl in excluded_sectors):
+                continue
         if cfg["require_stage2"] and ema50 > 0:
             if (price - ema50) / ema50 * 100 > cfg["max_extension"]:
                 continue
 
+        logger.debug("RS screener: %s sector='%s' exch=%s kept.", sym, sector, exch)
         rs = (score_map.get(sym) if score_map else None)
         if rs is None:
             rs = _rs_score(v)
