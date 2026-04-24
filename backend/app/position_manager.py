@@ -151,21 +151,21 @@ def _place_entry(
     trigger: str,
     mode: str,
     screener_type: str = "minervini",
+    target2: float = 0.0,
 ) -> str:
     """
     Submit the entry buy using the user-configured order type.
     Returns a short description string for logging.
 
+    When target2 > 0 and qty >= 2, places two bracket orders (split-lot):
+      Lot 1: qty//2 shares with take-profit at target (T1)
+      Lot 2: remaining shares with take-profit at target2 (T2)
+    stop_limit entries cannot carry brackets — split-lot falls back to T1-only
+    for stop_limit order type.
+
     Settings are split by screener source:
       mv_entry_order_type / mv_entry_slippage_pct  — Minervini/breakout picks
       pb_entry_order_type / pb_entry_slippage_pct  — Pullback-to-MA picks
-
-    order_type values:
-      market     — market order + bracket exits (original behaviour)
-      limit      — DAY limit at entry×(1+slippage%), bracket exits attached
-      stop_limit — DAY stop-limit at entry price, limit at entry×(1+slippage%);
-                   Alpaca does not support brackets here so exits are added by
-                   the monitor on the next cycle after fill
     """
     if screener_type == "pullback":
         order_type   = get_setting(db, "pb_entry_order_type",   "limit")
@@ -173,16 +173,28 @@ def _place_entry(
     else:  # minervini (default)
         order_type   = get_setting(db, "mv_entry_order_type",   "stop_limit")
         slippage_pct = float(get_setting(db, "mv_entry_slippage_pct", "1.0"))
-    has_exits    = stop > 0 and target > 0
+
+    has_exits   = stop > 0 and target > 0
+    use_split   = target2 > 0 and int(qty) >= 2 and order_type != "stop_limit"
 
     if order_type == "limit":
         limit_px = round(entry * (1 + slippage_pct / 100), 2)
+        if has_exits and use_split:
+            try:
+                alp.place_split_limit_bracket_buy(sym, qty, entry, stop, target, target2, slippage_pct, mode)
+                qty1 = int(qty) // 2
+                return (f"split limit bracket (lim=${limit_px} stop=${stop:.2f} "
+                        f"T1=${target:.2f}×{qty1}sh T2=${target2:.2f}×{int(qty)-qty1}sh)")
+            except ValueError:
+                pass  # qty too small — fall through to single bracket
+            except Exception as exc:
+                logger.error("_place_entry: split limit bracket FAILED for %s: %s — single bracket fallback", sym, exc)
         if has_exits:
             try:
                 alp.place_limit_bracket_buy(sym, qty, entry, stop, target, slippage_pct, mode)
                 return f"limit bracket (lim=${limit_px} stop=${stop:.2f} tgt=${target:.2f})"
             except Exception as exc:
-                logger.error("_place_entry: limit bracket FAILED for %s: %s — falling back to market bracket", sym, exc)
+                logger.error("_place_entry: limit bracket FAILED for %s: %s — market bracket fallback", sym, exc)
                 alp.place_bracket_buy(sym, qty, stop, target, mode)
                 return f"market bracket [limit fallback] (stop=${stop:.2f} tgt=${target:.2f})"
         else:
@@ -192,9 +204,20 @@ def _place_entry(
     elif order_type == "stop_limit":
         limit_px = round(entry * (1 + slippage_pct / 100), 2)
         alp.place_stop_limit_buy(sym, qty, entry, slippage_pct, mode)
-        return f"stop-limit (stop=${entry:.2f} lim=${limit_px}) — exits pending fill"
+        note = " [T2 exits added post-fill by monitor]" if target2 > 0 else " — exits pending fill"
+        return f"stop-limit (stop=${entry:.2f} lim=${limit_px}){note}"
 
-    else:  # "market" or unrecognised — original behaviour
+    else:  # "market" or unrecognised
+        if has_exits and use_split:
+            try:
+                alp.place_split_bracket_buy(sym, qty, stop, target, target2, mode)
+                qty1 = int(qty) // 2
+                return (f"split market bracket (stop=${stop:.2f} "
+                        f"T1=${target:.2f}×{qty1}sh T2=${target2:.2f}×{int(qty)-qty1}sh)")
+            except ValueError:
+                pass  # qty too small — fall through to single bracket
+            except Exception as exc:
+                logger.error("_place_entry: split market bracket FAILED for %s: %s — single bracket fallback", sym, exc)
         if has_exits:
             try:
                 alp.place_bracket_buy(sym, qty, stop, target, mode)
@@ -303,7 +326,7 @@ def run_monday_open(db: Session, mode: str | None = None):
     # Fetch Minervini picks (screener_type = 'minervini' or 'both')
     mv_rows = db.execute(
         text("""
-            SELECT symbol, entry_price, stop_price, target1,
+            SELECT symbol, entry_price, stop_price, target1, target2,
                    COALESCE(screener_type, 'minervini') AS screener_type
             FROM weekly_plan
             WHERE week_start = (SELECT MAX(week_start) FROM weekly_plan WHERE mode = :mode)
@@ -318,7 +341,7 @@ def run_monday_open(db: Session, mode: str | None = None):
     # Fetch Pullback picks (screener_type = 'pullback')
     pb_rows = db.execute(
         text("""
-            SELECT symbol, entry_price, stop_price, target1,
+            SELECT symbol, entry_price, stop_price, target1, target2,
                    COALESCE(screener_type, 'minervini') AS screener_type
             FROM weekly_plan
             WHERE week_start = (SELECT MAX(week_start) FROM weekly_plan WHERE mode = :mode)
@@ -348,11 +371,12 @@ def run_monday_open(db: Session, mode: str | None = None):
     held     = {p.symbol for p in positions}
 
     for row in rows:
-        sym    = row[0]
-        entry  = float(row[1] or 0)
-        stop   = float(row[2] or 0)
-        target = float(row[3] or 0)
-        stype  = row[4]
+        sym     = row[0]
+        entry   = float(row[1] or 0)
+        stop    = float(row[2] or 0)
+        target  = float(row[3] or 0)
+        target2 = float(row[4] or 0)
+        stype   = row[5]
 
         if sym in held or entry <= 0:
             continue
@@ -366,7 +390,7 @@ def run_monday_open(db: Session, mode: str | None = None):
             continue
 
         try:
-            order_desc   = _place_entry(db, sym, qty, entry, stop, target, "MONDAY_OPEN", mode, stype)
+            order_desc   = _place_entry(db, sym, qty, entry, stop, target, "MONDAY_OPEN", mode, stype, target2=target2)
             order_placed = True
             logger.info("Monday open: %s qty=%.0f — %s", sym, qty, order_desc)
 
@@ -538,7 +562,7 @@ def _refill_slot(
 
     pending_rows = db.execute(
         text("""
-            SELECT symbol, score, signal, entry_price, stop_price, target1, rationale, rank,
+            SELECT symbol, score, signal, entry_price, stop_price, target1, target2, rationale, rank,
                    COALESCE(screener_type, 'minervini') AS screener_type
             FROM weekly_plan
             WHERE week_start = (
@@ -656,10 +680,11 @@ def _execute_specific_pick(db: Session, mode: str, symbol: str, pending_picks: l
         logger.warning("Slot refill: recommended symbol %s not found in pending picks.", symbol)
         return
 
-    entry  = float(pick.get("entry_price")   or 0)
-    stop   = float(pick.get("stop_price")   or 0)
-    target = float(pick.get("target1")      or 0)
-    stype  = pick.get("screener_type", "minervini")
+    entry   = float(pick.get("entry_price") or 0)
+    stop    = float(pick.get("stop_price")  or 0)
+    target  = float(pick.get("target1")     or 0)
+    target2 = float(pick.get("target2")     or 0)
+    stype   = pick.get("screener_type", "minervini")
 
     if entry <= 0:
         logger.warning("Slot refill: %s has no entry price — skipping.", symbol)
@@ -684,7 +709,7 @@ def _execute_specific_pick(db: Session, mode: str, symbol: str, pending_picks: l
         return
 
     try:
-        order_desc = _place_entry(db, symbol, qty, entry, stop, target, "SLOT_REFILL", mode, stype)
+        order_desc = _place_entry(db, symbol, qty, entry, stop, target, "SLOT_REFILL", mode, stype, target2=target2)
         logger.info("Slot refill: %s qty=%.0f — %s [%s]", symbol, qty, order_desc, mode)
 
         db.execute(
@@ -715,7 +740,7 @@ def _execute_next_pick(db: Session, mode: str, held: set):
     """Fallback — execute the next PENDING pick without slot-refill analysis."""
     row = db.execute(
         text("""
-            SELECT symbol, entry_price, stop_price, target1,
+            SELECT symbol, entry_price, stop_price, target1, target2,
                    COALESCE(screener_type, 'minervini') AS screener_type
             FROM weekly_plan
             WHERE week_start = (
@@ -733,11 +758,12 @@ def _execute_next_pick(db: Session, mode: str, held: set):
         logger.info("Post-close fallback: no PENDING picks left for mode=%s.", mode)
         return
 
-    sym    = row[0]
-    entry  = float(row[1] or 0)
-    stop   = float(row[2] or 0)
-    target = float(row[3] or 0)
-    stype  = row[4]
+    sym     = row[0]
+    entry   = float(row[1] or 0)
+    stop    = float(row[2] or 0)
+    target  = float(row[3] or 0)
+    target2 = float(row[4] or 0)
+    stype   = row[5]
 
     if sym in held or entry <= 0:
         return
@@ -759,7 +785,7 @@ def _execute_next_pick(db: Session, mode: str, held: set):
         return
 
     try:
-        order_desc = _place_entry(db, sym, qty, entry, stop, target, "POST_CLOSE", mode, stype)
+        order_desc = _place_entry(db, sym, qty, entry, stop, target, "POST_CLOSE", mode, stype, target2=target2)
         logger.info("Post-close fallback: %s qty=%.0f — %s", sym, qty, order_desc)
 
         db.execute(
@@ -908,7 +934,7 @@ def fill_open_slots(
 
     rows = db.execute(
         text("""
-            SELECT symbol, entry_price, stop_price, target1,
+            SELECT symbol, entry_price, stop_price, target1, target2,
                    COALESCE(screener_type, 'minervini') AS screener_type
             FROM weekly_plan
             WHERE week_start = (SELECT MAX(week_start) FROM weekly_plan WHERE mode = :mode)
@@ -948,11 +974,12 @@ def fill_open_slots(
     from .sepa_analyzer import analyze
 
     for row in rows:
-        sym    = row[0]
-        entry  = float(row[1] or 0)
-        stop   = float(row[2] or 0)
-        target = float(row[3] or 0)
-        stype  = row[4]
+        sym     = row[0]
+        entry   = float(row[1] or 0)
+        stop    = float(row[2] or 0)
+        target  = float(row[3] or 0)
+        target2 = float(row[4] or 0)
+        stype   = row[5]
 
         # Skip symbols that were just sold — don't re-enter same day
         if sym in sold_recently:
@@ -1010,7 +1037,7 @@ def fill_open_slots(
             continue
 
         try:
-            order_desc = _place_entry(db, sym, qty, price, stop, target, f"FILL_{signal}", mode, stype)
+            order_desc = _place_entry(db, sym, qty, price, stop, target, f"FILL_{signal}", mode, stype, target2=target2)
             logger.info(
                 "fill_open_slots [%s]: opened %s qty=%.0f signal=%s — %s",
                 mode, sym, qty, signal, order_desc,

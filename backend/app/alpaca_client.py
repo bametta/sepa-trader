@@ -280,6 +280,102 @@ def place_oca_exit(
     return get_client(mode).submit_order(req)
 
 
+def place_split_bracket_buy(
+    symbol: str,
+    qty: float,
+    stop_price: float,
+    t1_price: float,
+    t2_price: float,
+    mode: str = "paper",
+):
+    """
+    Place two market bracket orders for a split-lot T1/T2 exit strategy.
+    Lot 1: qty//2 shares — stop=stop_price, take-profit=t1_price.
+    Lot 2: remaining shares — stop=stop_price, take-profit=t2_price.
+    Both stop legs are identical so trailing stop logic treats them uniformly.
+    Raises ValueError if qty < 2 (can't split into two 1-share lots).
+    """
+    qty_int = int(round(qty))
+    qty1    = qty_int // 2
+    qty2    = qty_int - qty1
+    if qty1 < 1 or qty2 < 1:
+        raise ValueError(f"qty {qty_int} too small to split into T1/T2 lots (min 2 shares)")
+    client = get_client(mode)
+    o1 = client.submit_order(MarketOrderRequest(
+        symbol=symbol, qty=qty1, side=OrderSide.BUY,
+        time_in_force=TimeInForce.DAY, order_class=OrderClass.BRACKET,
+        stop_loss=StopLossRequest(stop_price=round(stop_price, 2)),
+        take_profit=TakeProfitRequest(limit_price=round(t1_price, 2)),
+    ))
+    o2 = client.submit_order(MarketOrderRequest(
+        symbol=symbol, qty=qty2, side=OrderSide.BUY,
+        time_in_force=TimeInForce.DAY, order_class=OrderClass.BRACKET,
+        stop_loss=StopLossRequest(stop_price=round(stop_price, 2)),
+        take_profit=TakeProfitRequest(limit_price=round(t2_price, 2)),
+    ))
+    return o1, o2
+
+
+def place_split_limit_bracket_buy(
+    symbol: str,
+    qty: float,
+    entry_price: float,
+    stop_price: float,
+    t1_price: float,
+    t2_price: float,
+    slippage_pct: float = 0.5,
+    mode: str = "paper",
+):
+    """
+    Place two DAY limit bracket orders for a split-lot T1/T2 exit strategy.
+    Raises ValueError if qty < 2.
+    """
+    qty_int     = int(round(qty))
+    qty1        = qty_int // 2
+    qty2        = qty_int - qty1
+    if qty1 < 1 or qty2 < 1:
+        raise ValueError(f"qty {qty_int} too small to split into T1/T2 lots (min 2 shares)")
+    limit_price = round(entry_price * (1 + slippage_pct / 100), 2)
+    client      = get_client(mode)
+    o1 = client.submit_order(LimitOrderRequest(
+        symbol=symbol, qty=qty1, side=OrderSide.BUY,
+        time_in_force=TimeInForce.DAY, limit_price=limit_price,
+        order_class=OrderClass.BRACKET,
+        stop_loss=StopLossRequest(stop_price=round(stop_price, 2)),
+        take_profit=TakeProfitRequest(limit_price=round(t1_price, 2)),
+    ))
+    o2 = client.submit_order(LimitOrderRequest(
+        symbol=symbol, qty=qty2, side=OrderSide.BUY,
+        time_in_force=TimeInForce.DAY, limit_price=limit_price,
+        order_class=OrderClass.BRACKET,
+        stop_loss=StopLossRequest(stop_price=round(stop_price, 2)),
+        take_profit=TakeProfitRequest(limit_price=round(t2_price, 2)),
+    ))
+    return o1, o2
+
+
+def replace_split_oca_exits(
+    symbol: str,
+    qty1: float,
+    qty2: float,
+    new_stop: float,
+    t1_price: float,
+    t2_price: float,
+    mode: str = "paper",
+):
+    """
+    Cancel all exit orders for a split-lot position and re-place two OCOs
+    with an updated stop (trailing stop update). T1 and T2 targets are preserved.
+    """
+    cancelled = cancel_symbol_exit_orders(symbol, mode)
+    if cancelled:
+        cleared = wait_for_orders_cancelled(symbol, mode, timeout=6.0, poll_interval=0.4)
+        if not cleared:
+            logger.warning("replace_split_oca_exits: cancellation timeout for %s", symbol)
+    place_oca_exit(symbol, qty1, new_stop, t1_price, mode)
+    place_oca_exit(symbol, qty2, new_stop, t2_price, mode)
+
+
 def cancel_symbol_exit_orders(symbol: str, mode: str = "paper") -> list[str]:
     """
     Cancel all open sell orders for a symbol (OCO, bracket, or standalone).
