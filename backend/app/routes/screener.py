@@ -619,3 +619,83 @@ def update_plan_status(
     )
     db.commit()
     return {"symbol": symbol, "status": status, "mode": mode}
+
+
+@router.get("/news")
+def get_weekly_news(current_user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
+    """
+    Fetch Alpaca news headlines for every symbol in the current week's plan.
+    Returns {symbol: [{headline, source, url, published_at}, ...]} — up to 5 per symbol.
+    """
+    from ..claude_analyst import _fetch_alpaca_news
+    import httpx
+
+    uid  = current_user["id"]
+    mode = get_user_setting(db, "trading_mode", "paper", uid)
+
+    rows = db.execute(
+        text("""
+            SELECT symbol FROM weekly_plan
+            WHERE week_start = (
+                SELECT MAX(week_start) FROM weekly_plan WHERE mode = :mode AND user_id = :uid
+            )
+              AND mode = :mode AND user_id = :uid
+            ORDER BY rank ASC
+        """),
+        {"mode": mode, "uid": uid},
+    ).fetchall()
+    symbols = [r[0] for r in rows]
+    if not symbols:
+        return {}
+
+    # Re-use the same fetcher but grab richer article data here
+    from ..config import settings as _cfg
+    from ..database import get_user_setting as _gus
+    from sqlalchemy import text as _text
+    from datetime import datetime, timezone, timedelta
+
+    try:
+        is_admin = db.execute(
+            _text("SELECT role FROM users WHERE id = :id"), {"id": uid}
+        ).scalar() == "admin"
+
+        if mode == "live":
+            key    = _gus(db, "alpaca_live_key",    "", uid) or (_cfg.alpaca_live_key    if is_admin else "")
+            secret = _gus(db, "alpaca_live_secret", "", uid) or (_cfg.alpaca_live_secret if is_admin else "")
+        else:
+            key    = _gus(db, "alpaca_paper_key",    "", uid) or (_cfg.alpaca_paper_key    if is_admin else "")
+            secret = _gus(db, "alpaca_paper_secret", "", uid) or (_cfg.alpaca_paper_secret if is_admin else "")
+
+        if not key or not secret:
+            return {s: [] for s in symbols}
+
+        start = (datetime.now(timezone.utc) - timedelta(hours=72)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        resp  = httpx.get(
+            "https://data.alpaca.markets/v1beta1/news",
+            params={
+                "symbols":          ",".join(symbols),
+                "limit":            min(5 * len(symbols), 50),
+                "start":            start,
+                "sort":             "desc",
+                "include_content":  "false",
+            },
+            headers={"APCA-API-KEY-ID": key.strip(), "APCA-API-SECRET-KEY": secret.strip()},
+            timeout=10,
+        )
+        resp.raise_for_status()
+
+        news_map: dict = {s: [] for s in symbols}
+        for article in resp.json().get("news", []):
+            for sym in article.get("symbols", []):
+                if sym in news_map and len(news_map[sym]) < 5:
+                    news_map[sym].append({
+                        "headline":     article.get("headline", ""),
+                        "source":       article.get("source", ""),
+                        "url":          article.get("url", ""),
+                        "published_at": article.get("created_at", ""),
+                    })
+        return news_map
+
+    except Exception as exc:
+        log.warning("get_weekly_news: failed (%s)", exc)
+        return {s: [] for s in symbols}

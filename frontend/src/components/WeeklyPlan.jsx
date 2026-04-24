@@ -5,6 +5,7 @@ import {
   runScreener, runMinerviniScreener, runPullbackScreener,
   exportWatchlist, updatePlanStatus,
   fetchAnalyses, runAnalysis, fetchSettings,
+  fetchWeeklyNews,
 } from '../api/client'
 import TapeCheck from './TapeCheck'
 
@@ -90,6 +91,12 @@ export default function WeeklyPlan() {
     { enabled: plan.length > 0, staleTime: 6 * 60 * 60 * 1000, refetchOnWindowFocus: false },
   )
   const ddMap = Object.fromEntries(ddList.map(d => [d.symbol, d]))
+
+  const { data: newsMap = {} } = useQuery(
+    'weeklyNews',
+    fetchWeeklyNews,
+    { enabled: plan.length > 0, staleTime: 15 * 60 * 1000, refetchOnWindowFocus: false },
+  )
 
   async function handleRefreshDD() {
     await forceRefreshDD()
@@ -337,6 +344,7 @@ export default function WeeklyPlan() {
               row={row}
               dd={ddMap[row.symbol]}
               ddLoading={ddLoading}
+              news={newsMap[row.symbol] || []}
               onStatusChange={handleStatus}
               tvLayoutId={tvLayoutId}
             />
@@ -387,9 +395,10 @@ const AI_DECISION_META = {
   SKIP:    { label: 'Skip',    cls: 'bg-red-500/20     text-red-300     border border-red-500/30'     },
 }
 
-function PlanCard({ row, dd, ddLoading, onStatusChange, tvLayoutId }) {
-  const [expanded, setExpanded] = useState(false)
-  const [ddOpen, setDdOpen]     = useState(false)
+function PlanCard({ row, dd, ddLoading, news = [], onStatusChange, tvLayoutId }) {
+  const [expanded, setExpanded]   = useState(false)
+  const [ddOpen, setDdOpen]       = useState(false)
+  const [newsOpen, setNewsOpen]   = useState(false)
 
   const tvUrl = tvLayoutId
     ? `https://www.tradingview.com/chart/${tvLayoutId}/?symbol=${row.symbol}`
@@ -498,10 +507,57 @@ function PlanCard({ row, dd, ddLoading, onStatusChange, tvLayoutId }) {
 
           {ddOpen && <DDPanel dd={dd} loading={ddLoading} symbol={row.symbol} />}
 
+          <button
+            onClick={() => setNewsOpen(o => !o)}
+            className="flex items-center gap-1.5 text-xs text-sky-400 hover:text-sky-300"
+          >
+            <span className={`transition-transform inline-block ${newsOpen ? 'rotate-90' : ''}`}>▶</span>
+            {newsOpen ? 'Hide' : 'Show'} News
+            {news.length > 0 && (
+              <span className="ml-1 px-1.5 py-0.5 rounded-full bg-sky-500/20 text-sky-300 text-[10px]">
+                {news.length}
+              </span>
+            )}
+          </button>
+
+          {newsOpen && <NewsPanel news={news} symbol={row.symbol} />}
+
           {/* Structured AI analysis */}
           <AiAnalysisBlock ai={row.ai_analysis} />
         </div>
       )}
+    </div>
+  )
+}
+
+function NewsPanel({ news, symbol }) {
+  if (!news || news.length === 0) {
+    return (
+      <div className="bg-slate-800/60 border border-slate-700/50 rounded-xl p-4 text-xs text-slate-500">
+        No recent news found for {symbol} in the last 72h.
+      </div>
+    )
+  }
+  return (
+    <div className="bg-slate-800/60 border border-slate-700/50 rounded-xl p-4 space-y-3">
+      <p className="text-[10px] font-semibold uppercase tracking-wider text-slate-500">Recent News — {symbol}</p>
+      {news.map((item, i) => (
+        <div key={i} className="border-b border-slate-700/40 pb-2 last:border-0 last:pb-0">
+          <a
+            href={item.url || '#'}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="text-xs text-slate-200 hover:text-sky-300 leading-snug"
+          >
+            {item.headline}
+          </a>
+          <div className="flex gap-2 mt-1 text-[10px] text-slate-500">
+            <span>{item.source}</span>
+            <span>·</span>
+            <span>{item.published_at ? new Date(item.published_at).toLocaleDateString() : ''}</span>
+          </div>
+        </div>
+      ))}
     </div>
   )
 }
