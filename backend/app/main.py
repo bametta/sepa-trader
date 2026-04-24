@@ -130,6 +130,15 @@ def _run_migrations():
             WHERE key = 'screener_top_n' AND value = '10'
         """))
 
+        # ── Migrate rs_excluded_sectors from GICS names to TV sector names ────
+        db.execute(text("""
+            UPDATE settings SET value =
+                'Energy Minerals,Industrial Services,Non-Energy Minerals,Process Industries,Utilities,Consumer Non-Durables'
+            WHERE key = 'rs_excluded_sectors'
+              AND value LIKE '%Energy,%'
+              AND value NOT LIKE '%Energy Minerals%'
+        """))
+
         # ── Add 2FA columns to users table (idempotent) ──────────────────────
         db.execute(text("""
             ALTER TABLE users
@@ -207,7 +216,7 @@ def _run_migrations():
                 ('rs_top_n',                    '5'),
                 ('rs_max_slots',                '2'),
                 ('rs_exchanges',                'NYSE,NASDAQ'),
-                ('rs_excluded_sectors',         'Consumer Defensive,Energy,Utilities,Real Estate,Basic Materials')
+                ('rs_excluded_sectors',         'Energy Minerals,Industrial Services,Non-Energy Minerals,Process Industries,Utilities,Consumer Non-Durables')
             ON CONFLICT (key) DO NOTHING
         """))
 

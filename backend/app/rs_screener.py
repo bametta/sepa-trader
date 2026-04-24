@@ -50,14 +50,63 @@ _TV_HEADERS = {
     "Referer": "https://www.tradingview.com/",
 }
 
-# Sectors that don't fit a momentum strategy — excluded by default
-_DEFAULT_EXCLUDED_SECTORS = {
-    "Consumer Defensive",
-    "Energy",
-    "Utilities",
-    "Real Estate",
-    "Basic Materials",
+# TradingView's actual sector taxonomy (from scanner.tradingview.com/america/scan).
+# TV uses its own classification — NOT GICS. Full list as of 2025:
+#   Commercial Services, Communications, Consumer Durables, Consumer Non-Durables,
+#   Consumer Services, Distribution Services, Electronic Technology, Energy Minerals,
+#   Finance, Government, Health Services, Health Technology, Industrial Services,
+#   Miscellaneous, Non-Energy Minerals, Process Industries, Producer Manufacturing,
+#   Retail Trade, Technology Services, Transportation, Utilities
+
+# Mapping from common GICS names (used in UI/settings) → TV sector names.
+# Allows users to type familiar names while still matching TV's responses.
+_GICS_TO_TV: dict[str, set[str]] = {
+    "energy":              {"energy minerals", "industrial services"},  # drillers/oilfield svcs
+    "basic materials":     {"non-energy minerals", "process industries"},
+    "consumer defensive":  {"consumer non-durables"},
+    "consumer staples":    {"consumer non-durables"},
+    "real estate":         {"finance"},           # TV places REITs inside Finance
+    "financials":          {"finance"},
+    "financial services":  {"finance"},
+    "healthcare":          {"health technology", "health services"},
+    "technology":          {"electronic technology", "technology services"},
+    "communication services": {"communications"},
+    "industrials":         {"commercial services", "industrial services",
+                            "distribution services", "producer manufacturing", "transportation"},
+    "consumer cyclical":   {"consumer durables", "consumer services", "retail trade"},
+    "consumer discretionary": {"consumer durables", "consumer services", "retail trade"},
+    "utilities":           {"utilities"},
+    "government":          {"government"},
+    "miscellaneous":       {"miscellaneous"},
 }
+
+# Default exclusions use TV sector names directly (most reliable).
+# Mirrors what GICS calls: Energy, Basic Materials, Utilities, Consumer Defensive.
+# "Industrial Services" is added to catch contract drillers (e.g. VAL) that TV
+# places there instead of Energy Minerals.
+_DEFAULT_EXCLUDED_SECTORS = {
+    "Energy Minerals",
+    "Industrial Services",
+    "Non-Energy Minerals",
+    "Process Industries",
+    "Utilities",
+    "Consumer Non-Durables",
+}
+
+
+def _resolve_excluded(cfg_sectors: list[str]) -> set[str]:
+    """
+    Expand a list of sector names (which may be GICS-style or TV-style) into
+    the full set of lowercase TV sector names to check against.
+    """
+    resolved: set[str] = set()
+    for name in cfg_sectors:
+        lower = name.strip().lower()
+        if lower in _GICS_TO_TV:
+            resolved |= _GICS_TO_TV[lower]
+        else:
+            resolved.add(lower)   # assume it's already a TV sector name
+    return resolved
 
 
 def _rs_score(v: dict) -> float:
@@ -243,8 +292,11 @@ def run_rs_screener(
             logger.error("RS screener: TV call for pick data failed: %s", exc)
             return []
 
-    excluded_sectors = {s.lower() for s in cfg["excluded_sectors"]}
+    # Resolve GICS names (from settings UI) → TV sector names; also accepts TV names directly
+    excluded_tv = _resolve_excluded(cfg["excluded_sectors"])
     allowed_exchanges = cfg["exchanges"]
+
+    logger.info("RS screener: excluded TV sectors: %s", excluded_tv)
 
     # ── Pass 2: Local scoring and filtering ───────────────────────────────────
     scored: list[dict] = []
@@ -257,11 +309,11 @@ def run_rs_screener(
 
         if allowed_exchanges and exch not in allowed_exchanges:
             continue
-        if excluded_sectors:
+        if excluded_tv:
             if not sector:
-                logger.warning("RS screener: %s has no sector from TV — skipping (can't verify).", sym)
+                logger.warning("RS screener: %s has no sector from TV — skipping.", sym)
                 continue
-            if any(excl in sector.lower() or sector.lower() in excl for excl in excluded_sectors):
+            if sector.lower() in excluded_tv:
                 continue
         if cfg["require_stage2"] and ema50 > 0:
             if (price - ema50) / ema50 * 100 > cfg["max_extension"]:

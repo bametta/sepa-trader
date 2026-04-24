@@ -7,18 +7,32 @@ const DAYS = ['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sun
 const EXCHANGES = ['NYSE', 'NASDAQ', 'AMEX', 'CBOE', 'OTC']
 
 // All TradingView sectors with short display labels and growth classification
+// Growth = sectors that fit momentum strategies; non-growth = typically excluded by default.
+// TV names (used by RS screener) are listed alongside GICS aliases for Minervini/Pullback screeners.
 const ALL_SECTORS = [
-  { name: 'Technology',             short: 'Tech',         growth: true  },
-  { name: 'Communication Services', short: 'Comms',        growth: true  },
-  { name: 'Consumer Cyclical',      short: 'Cons. Cycl.',  growth: true  },
-  { name: 'Healthcare',             short: 'Healthcare',   growth: true  },
-  { name: 'Industrials',            short: 'Industrials',  growth: true  },
-  { name: 'Consumer Defensive',     short: 'Cons. Def.',   growth: false },
-  { name: 'Financial Services',     short: 'Financials',   growth: false },
-  { name: 'Basic Materials',        short: 'Materials',    growth: false },
-  { name: 'Energy',                 short: 'Energy',       growth: false },
-  { name: 'Real Estate',            short: 'Real Estate',  growth: false },
-  { name: 'Utilities',              short: 'Utilities',    growth: false },
+  // ── Growth / momentum-friendly ───────────────────────────────────────────
+  { name: 'Electronic Technology',  short: 'Tech HW',      growth: true  },  // TV: semiconductors, hardware
+  { name: 'Technology Services',    short: 'Tech SW',      growth: true  },  // TV: software, IT services
+  { name: 'Health Technology',      short: 'Biotech/Pharma', growth: true },  // TV: biotech, pharma, med-tech
+  { name: 'Health Services',        short: 'Health Svc',   growth: true  },  // TV: hospitals, managed care
+  { name: 'Communications',         short: 'Comms',        growth: true  },  // TV: telecom, media
+  { name: 'Consumer Durables',      short: 'Cons. Dur.',   growth: true  },  // TV: autos, appliances
+  { name: 'Consumer Services',      short: 'Cons. Svc.',   growth: true  },  // TV: restaurants, hotels
+  { name: 'Retail Trade',           short: 'Retail',       growth: true  },  // TV: e-commerce, specialty retail
+  { name: 'Commercial Services',    short: 'Comm. Svc.',   growth: true  },  // TV: business/professional services
+  { name: 'Producer Manufacturing', short: 'Mfg',          growth: true  },  // TV: machinery, aerospace
+  { name: 'Distribution Services',  short: 'Distribution', growth: true  },  // TV: wholesale distribution
+  { name: 'Transportation',         short: 'Transport',    growth: true  },  // TV: airlines, shipping
+  { name: 'Finance',                short: 'Finance',      growth: true  },  // TV: banks, insurance, REITs
+  // ── Defensive / commodity — excluded by default from RS screener ─────────
+  { name: 'Energy Minerals',        short: 'Energy',       growth: false },  // TV: oil/gas producers
+  { name: 'Industrial Services',    short: 'Oilfield Svc', growth: false },  // TV: contract drillers, oilfield svc
+  { name: 'Non-Energy Minerals',    short: 'Mining',       growth: false },  // TV: metals, mining
+  { name: 'Process Industries',     short: 'Chemicals',    growth: false },  // TV: chemicals, plastics
+  { name: 'Consumer Non-Durables',  short: 'Cons. Def.',   growth: false },  // TV: food, household products
+  { name: 'Utilities',              short: 'Utilities',    growth: false },  // TV: same as GICS
+  { name: 'Government',             short: 'Government',   growth: false },  // TV: government entities
+  { name: 'Miscellaneous',          short: 'Misc',         growth: false },  // TV: uncategorised
 ]
 
 const SECTIONS = [
@@ -90,8 +104,8 @@ const SECTIONS = [
       { key: 'rs_top_n',             label: 'Top N picks from RS screener (default 5)',               type: 'number' },
       { key: 'rs_require_stage2',    label: 'Require Stage 2 uptrend (price > EMA50 > EMA200)',       type: 'toggle', defaultValue: 'true' },
       { key: 'rs_exchanges',         label: 'Exchanges to scan (default NYSE,NASDAQ)',                 type: 'exchange_picker', span: true, defaultValue: 'NYSE,NASDAQ' },
-      { key: 'rs_excluded_sectors',  label: 'Excluded sectors',                                       type: 'sector_picker',   span: true,
-        defaultValue: 'Consumer Defensive,Energy,Utilities,Real Estate,Basic Materials' },
+      { key: 'rs_excluded_sectors',  label: 'Excluded sectors (uses TradingView sector names)',         type: 'sector_picker',   span: true,
+        defaultValue: 'Energy Minerals,Industrial Services,Non-Energy Minerals,Process Industries,Utilities,Consumer Non-Durables' },
     ],
   },
   {
@@ -444,7 +458,7 @@ function Field({ field, value, saving, onSave,
   }
 
   if (field.type === 'sector_picker') {
-    const defaultVal = field.defaultValue || 'Consumer Defensive,Energy,Utilities,Real Estate,Basic Materials,Financial Services'
+    const defaultVal = field.defaultValue || 'Energy Minerals,Industrial Services,Non-Energy Minerals,Process Industries,Utilities,Consumer Non-Durables'
     const excluded = new Set(
       (current || defaultVal).split(',').map(s => s.trim()).filter(Boolean)
     )
