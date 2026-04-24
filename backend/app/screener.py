@@ -451,7 +451,7 @@ def run_both_screeners(
     RS screener can be disabled via the rs_screener_enabled setting.
     """
     from .pullback_screener import run_pullback_screener
-    from .rs_screener import run_rs_screener
+    from .rs_screener import run_rs_screener, fetch_rs_score_map, get_rs_settings
 
     def _phase(msg):
         logger.info("Screener phase: %s", msg)
@@ -484,17 +484,28 @@ def run_both_screeners(
     pb_rows  = run_pullback_screener(db, mode=mode, user_id=user_id, account_value=av)
 
     rs_enabled = _gus2(db, "rs_screener_enabled", "true", user_id).lower() == "true"
+    score_map: dict[str, float] = {}
     rs_rows: list[dict] = []
     if rs_enabled:
-        _phase(f"Pullback done — {len(pb_rows)} candidates. Running RS Momentum screener…")
+        _phase(f"Pullback done — {len(pb_rows)} candidates. Fetching global RS scores…")
         try:
-            rs_rows = run_rs_screener(db, mode=mode, user_id=user_id, account_value=av)
+            rs_cfg   = get_rs_settings(db, user_id)
+            score_map = fetch_rs_score_map(rs_cfg)
+        except Exception as exc:
+            logger.error("RS score fetch failed (non-fatal): %s", exc)
+
+        _phase(f"RS scores fetched ({len(score_map)} symbols). Running RS Momentum screener…")
+        try:
+            rs_rows = run_rs_screener(
+                db, mode=mode, user_id=user_id, account_value=av,
+                score_map=score_map or None,
+            )
         except Exception as exc:
             logger.error("RS screener failed (non-fatal): %s", exc)
     else:
         _phase(f"Pullback done — {len(pb_rows)} candidates. RS screener disabled.")
 
-    _phase(f"RS done — {len(rs_rows)} candidates. Merging results…")
+    _phase(f"RS done — {len(rs_rows)} candidates. Merging and re-ranking by RS score…")
 
     # Merge: Minervini wins on overlap, then Pullback, then RS
     seen: dict[str, dict] = {}
@@ -509,7 +520,12 @@ def run_both_screeners(
         if r["symbol"] not in seen:
             seen[r["symbol"]] = r
 
-    merged = list(seen.values())
+    # Re-rank all picks globally by RS score so highest-momentum stocks buy first
+    merged = sorted(
+        seen.values(),
+        key=lambda r: score_map.get(r["symbol"], -999.0),
+        reverse=True,
+    )
 
     for i, row in enumerate(merged, 1):
         row["rank"] = i

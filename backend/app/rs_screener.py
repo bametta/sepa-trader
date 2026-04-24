@@ -106,26 +106,19 @@ def _build_tv_filters(cfg: dict) -> list[dict]:
     """Build TradingView server-side filter conditions."""
     filters = []
 
-    # Price
     filters.append({"left": "close", "operation": "greater", "right": cfg["price_min"]})
     if cfg["price_max"] > 0:
         filters.append({"left": "close", "operation": "less", "right": cfg["price_max"]})
-
-    # Volume
     filters.append({
         "left": "average_volume_30d_calc",
         "operation": "greater",
         "right": cfg["avg_vol_min"],
     })
-
-    # Market cap
     filters.append({
         "left": "market_cap_basic",
         "operation": "greater",
         "right": cfg["market_cap_min"],
     })
-
-    # Stage 2: EMA alignment (server-side pre-filter — local check adds extension guard)
     if cfg["require_stage2"]:
         filters.append({"left": "EMA50",  "operation": "greater", "right": "EMA200"})
         filters.append({"left": "close",  "operation": "greater", "right": "EMA50"})
@@ -133,16 +126,63 @@ def _build_tv_filters(cfg: dict) -> list[dict]:
     return filters
 
 
+def fetch_rs_score_map(cfg: dict) -> dict[str, float]:
+    """
+    Single TradingView batch call. Returns {symbol: rs_score} for every stock
+    that passes basic quality filters. Cast wider than the RS screener's own
+    filters (no percentile cutoff, no extension guard) so all Minervini and
+    Pullback picks that qualify can be scored for global re-ranking.
+    """
+    # Use a looser filter so we catch Minervini/Pullback picks too
+    broad_filters = [
+        {"left": "close",                  "operation": "greater", "right": cfg["price_min"]},
+        {"left": "average_volume_30d_calc", "operation": "greater", "right": cfg["avg_vol_min"]},
+        {"left": "market_cap_basic",        "operation": "greater", "right": cfg["market_cap_min"]},
+    ]
+    try:
+        resp = httpx.post(
+            SCAN_URL,
+            json={
+                "filter":  broad_filters,
+                "columns": _RS_COLS,
+                "range":   [0, 500],
+                "sort":    {"sortBy": "market_cap_basic", "sortOrder": "desc"},
+                "markets": ["america"],
+            },
+            timeout=30,
+            headers=_TV_HEADERS,
+        )
+        resp.raise_for_status()
+    except Exception as exc:
+        logger.error("fetch_rs_score_map: TV call failed: %s", exc)
+        return {}
+
+    score_map: dict[str, float] = {}
+    for row in resp.json().get("data", []):
+        sym   = row["s"].split(":")[-1]
+        v     = dict(zip(_RS_COLS, row["d"]))
+        score = _rs_score(v)
+        score_map[sym] = score
+
+    logger.info("fetch_rs_score_map: scored %d symbols.", len(score_map))
+    return score_map
+
+
 def run_rs_screener(
     db: Session,
     mode: str = None,
     user_id: int = None,
     account_value: float = None,
+    score_map: dict[str, float] | None = None,
 ) -> list[dict]:
     """
     Scan the US market for top RS momentum stocks.
     Returns a list of weekly_plan-compatible row dicts (not saved — caller handles).
     Each row has screener_type='rs_momentum'.
+
+    If score_map is supplied (pre-fetched by the caller), the TV batch call is
+    skipped — avoids a redundant network round-trip when run_both_screeners
+    has already fetched scores for global re-ranking.
     """
     if mode is None:
         mode = get_user_setting(db, "trading_mode", "paper", user_id)
@@ -152,32 +192,56 @@ def run_rs_screener(
     stop_pct = float(get_user_setting(db, "stop_loss_pct",   "8.0",  user_id) or "8.0")
     max_ppct = float(get_user_setting(db, "max_position_pct", "20.0", user_id) or "20.0")
 
-    logger.info(
-        "RS screener: scanning US market via TradingView (stage2=%s, min_pct=%.0f)…",
-        cfg["require_stage2"], cfg["min_percentile"],
-    )
-
-    # ── Pass 1: TradingView batch scan ────────────────────────────────────────
-    try:
-        resp = httpx.post(
-            SCAN_URL,
-            json={
-                "filter":  _build_tv_filters(cfg),
-                "columns": _RS_COLS,
-                "range":   [0, 400],
-                "sort":    {"sortBy": "market_cap_basic", "sortOrder": "desc"},
-                "markets": ["america"],
-            },
-            timeout=30,
-            headers=_TV_HEADERS,
+    # ── Pass 1: fetch RS scores (reuse caller's map if available) ─────────────
+    if score_map is None:
+        logger.info(
+            "RS screener: fetching scores from TradingView (stage2=%s, min_pct=%.0f)…",
+            cfg["require_stage2"], cfg["min_percentile"],
         )
-        resp.raise_for_status()
-    except Exception as exc:
-        logger.error("RS screener: TradingView batch call failed: %s", exc)
-        return []
+        try:
+            resp = httpx.post(
+                SCAN_URL,
+                json={
+                    "filter":  _build_tv_filters(cfg),
+                    "columns": _RS_COLS,
+                    "range":   [0, 400],
+                    "sort":    {"sortBy": "market_cap_basic", "sortOrder": "desc"},
+                    "markets": ["america"],
+                },
+                timeout=30,
+                headers=_TV_HEADERS,
+            )
+            resp.raise_for_status()
+        except Exception as exc:
+            logger.error("RS screener: TradingView batch call failed: %s", exc)
+            return []
 
-    raw_rows = resp.json().get("data", [])
-    logger.info("RS screener: TV returned %d pre-filtered candidates.", len(raw_rows))
+        raw_rows = resp.json().get("data", [])
+        logger.info("RS screener: TV returned %d pre-filtered candidates.", len(raw_rows))
+        tv_data = {row["s"].split(":")[-1]: dict(zip(_RS_COLS, row["d"])) for row in raw_rows}
+    else:
+        # score_map was pre-fetched — reconstruct tv_data from a fresh targeted call
+        # using the RS-specific (stricter) filters so extension/stage2 guards apply
+        logger.info("RS screener: using pre-fetched score_map (%d symbols).", len(score_map))
+        try:
+            resp = httpx.post(
+                SCAN_URL,
+                json={
+                    "filter":  _build_tv_filters(cfg),
+                    "columns": _RS_COLS,
+                    "range":   [0, 400],
+                    "sort":    {"sortBy": "market_cap_basic", "sortOrder": "desc"},
+                    "markets": ["america"],
+                },
+                timeout=30,
+                headers=_TV_HEADERS,
+            )
+            resp.raise_for_status()
+            raw_rows = resp.json().get("data", [])
+            tv_data  = {row["s"].split(":")[-1]: dict(zip(_RS_COLS, row["d"])) for row in raw_rows}
+        except Exception as exc:
+            logger.error("RS screener: TV call for pick data failed: %s", exc)
+            return []
 
     excluded_sectors = {s.lower() for s in cfg["excluded_sectors"]}
     allowed_exchanges = cfg["exchanges"]
@@ -185,53 +249,38 @@ def run_rs_screener(
     # ── Pass 2: Local scoring and filtering ───────────────────────────────────
     scored: list[dict] = []
 
-    for row in raw_rows:
-        sym = row["s"].split(":")[-1]
-        v   = dict(zip(_RS_COLS, row["d"]))
-
+    for sym, v in tv_data.items():
         price  = v.get("close")                or 0.0
         ema50  = v.get("EMA50")                or 0.0
-        ema200 = v.get("EMA200")               or 0.0
-        avgvol = v.get("average_volume_30d_calc") or 0.0
-        mktcap = v.get("market_cap_basic")     or 0.0
         sector = (v.get("sector") or "").strip()
         exch   = (v.get("exchange") or "").strip().upper()
 
-        # Exchange filter
         if allowed_exchanges and exch not in allowed_exchanges:
             continue
-
-        # Sector exclusion
         if sector.lower() in excluded_sectors:
             continue
-
-        # Extension guard: too far above EMA50 = chasing
         if cfg["require_stage2"] and ema50 > 0:
-            extension_pct = (price - ema50) / ema50 * 100
-            if extension_pct > cfg["max_extension"]:
+            if (price - ema50) / ema50 * 100 > cfg["max_extension"]:
                 continue
 
-        # RS score — skip stocks with no meaningful performance data
-        score = _rs_score(v)
-        if score <= -50:   # deep negative momentum — not a candidate
+        rs = score_map.get(sym) if score_map else _rs_score(v)
+        if rs <= -50:
             continue
 
-        scored.append({"symbol": sym, "rs_score": score, "price": price, "tv": v})
+        scored.append({"symbol": sym, "rs_score": rs, "price": price, "tv": v})
 
     if not scored:
         logger.info("RS screener: no candidates after local filtering.")
         return []
 
-    # Rank by RS score descending
     scored.sort(key=lambda x: x["rs_score"], reverse=True)
 
-    # Apply percentile cutoff — keep only the top N% of this batch
     cutoff_idx = max(1, int(len(scored) * (1 - cfg["min_percentile"] / 100)))
     top_bucket = scored[:cutoff_idx]
 
     logger.info(
         "RS screener: %d/%d passed local filters, top %d by RS (≥%dth percentile)",
-        len(scored), len(raw_rows), len(top_bucket), int(cfg["min_percentile"]),
+        len(scored), len(tv_data), len(top_bucket), int(cfg["min_percentile"]),
     )
 
     # ── Position sizing ───────────────────────────────────────────────────────
