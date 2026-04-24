@@ -10,7 +10,8 @@ from ..database import (
 router = APIRouter(prefix="/api/settings", tags=["settings"])
 
 EDITABLE_KEYS = {
-    "trading_mode", "auto_execute", "monitor_enabled", "monitor_interval_minutes",
+    "trading_mode", "auto_execute", "paper_auto_execute", "live_auto_execute",
+    "monitor_enabled", "monitor_interval_minutes",
     "mv_max_slots", "pb_max_slots",
     "risk_pct", "stop_loss_pct", "max_positions", "max_position_pct",
     "watchlist", "webhook_secret",

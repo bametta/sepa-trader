@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from datetime import datetime
 
@@ -15,28 +16,56 @@ scheduler = AsyncIOScheduler()
 _ET = pytz.timezone("America/New_York")
 
 
+async def _run_monitor_for_mode(admin_uid: int | None, mode: str) -> None:
+    """
+    Runs the full monitor cycle (trailing stops → exit guard → slot fill) for
+    one specific mode.  Uses an independent DB session so paper and live can
+    run concurrently without sharing a connection.
+    """
+    db = SessionLocal()
+    try:
+        result = await run_monitor(db, user_id=admin_uid, mode=mode)
+        if isinstance(result, dict) and result.get("status") == "error":
+            logger.error("Watchdog [%s]: monitor error — %s", mode, result.get("error"))
+        else:
+            logger.info(
+                "Watchdog [%s]: monitor done — portfolio=$%.0f positions=%d",
+                mode,
+                result.get("portfolio", 0),
+                len(result.get("results", [])),
+            )
+        from .position_manager import check_post_close
+        check_post_close(db, mode=mode)
+    except Exception as exc:
+        logger.error("Watchdog [%s]: monitor failed — %s", mode, exc, exc_info=True)
+    finally:
+        db.close()
+
+
 async def _monitor_watchdog():
     """
-    Runs every minute. Fires the monitor when:
-      1. monitor_enabled == "true"  (reads from merged user+global settings)
+    Runs every minute.  Fires the monitor for BOTH paper AND live modes when:
+      1. monitor_enabled == "true"
       2. It's a weekday between 9:00–16:00 ET
       3. At least monitor_interval_minutes have elapsed since the last run
-    Tracks last run timestamp in monitor_last_run to prevent double-firing.
+
+    Paper and live monitors run concurrently so a live account NEVER misses a
+    trade because the operator is viewing/testing the paper account at the time.
+
+    Each mode's auto_execute is controlled independently:
+      • paper_auto_execute (default true)
+      • live_auto_execute  (default false — must be explicitly enabled)
     """
     db = SessionLocal()
     admin_uid = None
-    mode      = "paper"
     try:
-        # Resolve admin user so we read their per-user settings
         admin_row = db.execute(
             text("SELECT id FROM users WHERE role = 'admin' ORDER BY id LIMIT 1")
         ).fetchone()
         admin_uid = admin_row[0] if admin_row else None
 
-        # Read settings from merged user+global so Settings panel changes are respected
         from .database import get_all_user_settings as _gaus
         merged = _gaus(db, admin_uid) if admin_uid else {}
-        mode   = merged.get("trading_mode", "paper")
 
         if merged.get("monitor_enabled", "true") != "true":
             logger.debug("Watchdog: monitor_enabled=false — skipping.")
@@ -44,7 +73,6 @@ async def _monitor_watchdog():
 
         now_et = datetime.now(_ET)
 
-        # Only run Mon–Fri 9:00–16:00 ET
         if now_et.weekday() > 4:
             logger.debug("Watchdog: weekend — skipping.")
             return
@@ -58,22 +86,22 @@ async def _monitor_watchdog():
         elapsed_min  = 9999.0
         if last_run_str:
             try:
-                last_run    = datetime.fromisoformat(last_run_str)
+                last_run = datetime.fromisoformat(last_run_str)
                 if last_run.tzinfo is None:
                     last_run = _ET.localize(last_run)
                 elapsed_min = (now_et - last_run).total_seconds() / 60
                 if elapsed_min < interval:
                     logger.debug(
-                        "Watchdog: elapsed=%.1fm < interval=%dm [mode=%s] — skipping.",
-                        elapsed_min, interval, mode,
+                        "Watchdog: elapsed=%.1fm < interval=%dm — skipping (both modes).",
+                        elapsed_min, interval,
                     )
                     return
             except (ValueError, TypeError):
-                pass  # malformed timestamp — proceed
+                pass
 
         logger.info(
-            "Watchdog: FIRING monitor [mode=%s interval=%dm elapsed=%.1fm]",
-            mode, interval, elapsed_min,
+            "Watchdog: FIRING monitor for both modes [interval=%dm elapsed=%.1fm]",
+            interval, elapsed_min,
         )
 
         # Mark run NOW so concurrent ticks don't double-fire
@@ -83,27 +111,29 @@ async def _monitor_watchdog():
     finally:
         db.close()
 
-    db2 = SessionLocal()
-    try:
-        result = await run_monitor(db2, user_id=admin_uid)
-        if isinstance(result, dict) and result.get("status") == "error":
-            logger.error("Watchdog: monitor returned error: %s", result.get("error"))
-        from .position_manager import check_post_close
-        check_post_close(db2, mode=mode)
-    except Exception as exc:
-        logger.error("Monitor job failed: %s", exc, exc_info=True)
-    finally:
-        db2.close()
+    # Run paper and live monitors in parallel — independent DB sessions
+    await asyncio.gather(
+        _run_monitor_for_mode(admin_uid, "paper"),
+        _run_monitor_for_mode(admin_uid, "live"),
+        return_exceptions=True,
+    )
 
 
 async def _monday_open_job():
-    """Fires once on Monday at 9:35 ET to fill position slots from the weekly plan."""
-    db = SessionLocal()
-    try:
-        from .position_manager import run_monday_open
-        run_monday_open(db)
-    finally:
-        db.close()
+    """
+    Fires once on Monday at 9:35 ET.
+    Fills position slots from the weekly plan for BOTH paper and live modes.
+    Each mode reads its own auto_execute flag so live is skip-safe by default.
+    """
+    for mode in ("paper", "live"):
+        db = SessionLocal()
+        try:
+            from .position_manager import run_monday_open
+            run_monday_open(db, mode=mode)
+        except Exception as exc:
+            logger.error("Monday open [%s] failed: %s", mode, exc)
+        finally:
+            db.close()
 
 
 async def _screener_watchdog():
@@ -262,12 +292,40 @@ async def _pb_screener_watchdog():
         db2.close()
 
 
+async def _run_screener_for_mode(uid: int, mode: str) -> int:
+    """
+    Runs all three screeners (Minervini + Pullback + RS) for one mode and
+    saves picks to weekly_plan.  Returns the number of picks saved.
+    Uses an independent DB session.
+    """
+    from .screener import run_both_screeners
+    from .database import set_user_setting as _sus, get_all_user_settings as _gaus
+
+    db = SessionLocal()
+    try:
+        results = run_both_screeners(db, mode=mode, user_id=uid)
+        _sus(db, f"screener_last_run_{mode}", datetime.now(_ET).isoformat(), uid)
+        logger.info(
+            "Market-close screener [%s]: %d stocks selected.", mode, len(results)
+        )
+        return len(results)
+    except Exception as exc:
+        logger.error("Market-close screener [%s] failed: %s", mode, exc)
+        return 0
+    finally:
+        db.close()
+
+
 async def _market_close_screener():
     """
-    Fires Mon–Fri at 4:05 PM ET — runs both screeners (Minervini + Pullback)
-    for every active user (currently just the admin user).
+    Fires Mon–Fri at 4:05 PM ET.
+
+    Runs all three screeners for BOTH paper AND live modes so picks are ready
+    for whichever mode the monitor fires next.  Live screener failure is
+    non-fatal — paper picks are always saved even if live credentials are missing.
     """
     db = SessionLocal()
+    uid = None
     try:
         from sqlalchemy import text as _text
         admin_row = db.execute(
@@ -277,32 +335,36 @@ async def _market_close_screener():
             return
         uid = admin_row[0]
 
-        set_setting(db, "screener_status", "running")
-        set_setting(db, "screener_error",  "")
+        from .database import set_user_setting as _sus
+        _sus(db, "screener_status", "running", uid)
+        _sus(db, "screener_error",  "",         uid)
         db.commit()
-
-        logger.info("Market-close screener starting (both screeners)…")
+        logger.info("Market-close screener starting (paper + live)…")
     finally:
         db.close()
 
+    # Run paper and live screeners concurrently
+    results = await asyncio.gather(
+        _run_screener_for_mode(uid, "paper"),
+        _run_screener_for_mode(uid, "live"),
+        return_exceptions=True,
+    )
+
+    paper_count = results[0] if isinstance(results[0], int) else 0
+    live_count  = results[1] if isinstance(results[1], int) else 0
+
     db2 = SessionLocal()
     try:
-        from .screener import run_both_screeners
         from .database import set_user_setting as _sus
-        results = run_both_screeners(db2, user_id=uid)
-        _sus(db2, "screener_status", "done",           uid)
-        _sus(db2, "screener_count",  str(len(results)), uid)
+        total = paper_count + live_count
+        _sus(db2, "screener_status", "done",      uid)
+        _sus(db2, "screener_count",  str(total),   uid)
         logger.info(
-            "Market-close screener done. %d total stocks selected.", len(results)
+            "Market-close screener done. paper=%d live=%d picks.",
+            paper_count, live_count,
         )
     except Exception as exc:
-        logger.error("Market-close screener failed: %s", exc)
-        db3 = SessionLocal()
-        try:
-            set_setting(db3, "screener_status", "error")
-            set_setting(db3, "screener_error",  str(exc)[:500])
-        finally:
-            db3.close()
+        logger.error("Market-close screener status update failed: %s", exc)
     finally:
         db2.close()
 

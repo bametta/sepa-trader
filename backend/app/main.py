@@ -130,6 +130,15 @@ def _run_migrations():
             WHERE key = 'screener_top_n' AND value = '10'
         """))
 
+        # ── Seed parallel-mode auto_execute flags (idempotent) ───────────────
+        # paper defaults on; live defaults off — must be explicitly enabled for safety
+        db.execute(text("""
+            INSERT INTO settings (key, value) VALUES
+                ('paper_auto_execute', 'true'),
+                ('live_auto_execute',  'false')
+            ON CONFLICT (key) DO NOTHING
+        """))
+
         # ── Migrate rs_excluded_sectors from GICS names to TV sector names ────
         db.execute(text("""
             UPDATE settings SET value =
@@ -216,7 +225,9 @@ def _run_migrations():
                 ('rs_top_n',                    '5'),
                 ('rs_max_slots',                '2'),
                 ('rs_exchanges',                'NYSE,NASDAQ'),
-                ('rs_excluded_sectors',         'Energy Minerals,Industrial Services,Non-Energy Minerals,Process Industries,Utilities,Consumer Non-Durables')
+                ('rs_excluded_sectors',         'Energy Minerals,Industrial Services,Non-Energy Minerals,Process Industries,Utilities,Consumer Non-Durables'),
+                ('paper_auto_execute',           'true'),
+                ('live_auto_execute',            'false')
             ON CONFLICT (key) DO NOTHING
         """))
 

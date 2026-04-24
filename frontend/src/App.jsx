@@ -11,7 +11,7 @@ import SettingsPanel from './components/SettingsPanel'
 import WeeklyPlan from './components/WeeklyPlan'
 import AdminPanel from './components/AdminPanel'
 import DualMomentumTab from './components/DualMomentumTab'
-import { fetchPositions, updateSetting } from './api/client'
+import { fetchPositions, updateSetting, fetchSettings } from './api/client'
 
 const POSITIONS_INTERVAL = 5000
 const ACCOUNT_INTERVAL   = 5000
@@ -63,6 +63,11 @@ function Dashboard() {
     }
   }
 
+  const { data: settings = {} } = useQuery('settings', fetchSettings, { staleTime: 30000 })
+
+  const paperAE = settings.paper_auto_execute !== 'false'
+  const liveAE  = settings.live_auto_execute  === 'true'
+
   const urgent    = positions.filter(p => p.signal === 'NO_SETUP')
   const breakouts = positions.filter(p => p.signal === 'BREAKOUT')
 
@@ -102,6 +107,32 @@ function Dashboard() {
             </div>
           </div>
         )}
+
+        {/* Dual-mode status bar — always visible */}
+        <div className="flex items-center gap-2 flex-wrap">
+          <span className="text-[10px] font-bold uppercase tracking-widest text-slate-600">Monitor</span>
+          {/* Paper */}
+          <span className={`inline-flex items-center gap-1.5 text-[11px] font-semibold px-2.5 py-1 rounded-lg border ${
+            paperAE
+              ? 'bg-blue-500/10 border-blue-500/25 text-blue-300'
+              : 'bg-white/3 border-white/8 text-slate-500'
+          }`}>
+            <span className={`w-1.5 h-1.5 rounded-full ${paperAE ? 'bg-blue-400 animate-pulse' : 'bg-slate-600'}`} />
+            Paper {paperAE ? 'AUTO' : 'observe'}
+          </span>
+          {/* Live */}
+          <span className={`inline-flex items-center gap-1.5 text-[11px] font-semibold px-2.5 py-1 rounded-lg border ${
+            liveAE
+              ? 'bg-orange-500/10 border-orange-500/30 text-orange-300'
+              : 'bg-white/3 border-white/8 text-slate-500'
+          }`}>
+            <span className={`w-1.5 h-1.5 rounded-full ${liveAE ? 'bg-orange-400 animate-pulse' : 'bg-slate-600'}`} />
+            Live {liveAE ? '⚡ AUTO' : 'observe'}
+          </span>
+          {liveAE && (
+            <span className="text-[10px] text-orange-400/70 italic">Real money orders will execute</span>
+          )}
+        </div>
 
         <AccountSummary onModeChange={handleModeChange} refetchInterval={ACCOUNT_INTERVAL} />
 

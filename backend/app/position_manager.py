@@ -253,7 +253,7 @@ def _get_symbol_screener_type(db: Session, symbol: str, mode: str) -> str:
     return row[0] if row else "minervini"
 
 
-def run_monday_open(db: Session):
+def run_monday_open(db: Session, mode: str | None = None):
     """
     Called every Monday at 9:35 ET. Fills available position slots from the
     current week's PENDING picks using dedicated per-strategy slot allocation.
@@ -262,10 +262,15 @@ def run_monday_open(db: Session):
     pb_max_slots — max Pullback positions at any time (default 2)
     Both are still capped by the overall max_positions setting.
     """
-    mode      = get_setting(db, "trading_mode", "paper")
-    auto_exec = get_setting(db, "auto_execute", "true").lower() == "true"
+    if mode is None:
+        mode = get_setting(db, "trading_mode", "paper")
+    # Use mode-specific auto_execute — live is fail-safe (default off)
+    if mode == "live":
+        auto_exec = get_setting(db, "live_auto_execute", "false").lower() == "true"
+    else:
+        auto_exec = get_setting(db, "paper_auto_execute", get_setting(db, "auto_execute", "true")).lower() == "true"
     if not auto_exec:
-        logger.info("Monday open: auto_execute off — skipping.")
+        logger.info("Monday open [%s]: auto_execute off — skipping.", mode)
         return
 
     max_pos = _effective_max_positions(db, mode)
@@ -425,7 +430,11 @@ def check_post_close(db: Session, mode: str | None = None):
     logger.info("[%s] Detected closed positions: %s", mode, closed)
 
     api_key   = get_setting(db, "claude_api_key", "")
-    auto_exec = get_setting(db, "auto_execute", "true").lower() == "true"
+    # Use mode-specific auto_execute — live is fail-safe (default off)
+    if mode == "live":
+        auto_exec = get_setting(db, "live_auto_execute", "false").lower() == "true"
+    else:
+        auto_exec = get_setting(db, "paper_auto_execute", get_setting(db, "auto_execute", "true")).lower() == "true"
     max_pos   = _effective_max_positions(db, mode)
 
     for sym in closed:

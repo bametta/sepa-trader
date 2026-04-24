@@ -411,26 +411,47 @@ def _gate(
 
 # ── Main monitor ──────────────────────────────────────────────────────────────
 
-async def run_monitor(db: Session, user_id: int | None = None):
-    # Use merged user+global settings so UI changes to trading_mode are respected
+async def run_monitor(db: Session, user_id: int | None = None, mode: str | None = None):
+    """
+    mode — if passed explicitly (by scheduler for parallel runs) the monitor
+    operates in that exact mode and does not read trading_mode from settings.
+    If None, falls back to reading trading_mode from user/global settings.
+    """
     if user_id:
         from .database import get_all_user_settings as _gaus
         _s = _gaus(db, user_id)
-        mode         = _s.get("trading_mode", "paper")
-        auto_execute = _s.get("auto_execute", "true").lower() == "true"
+        if mode is None:
+            mode = _s.get("trading_mode", "paper")
+        # Per-mode auto_execute flags — live mode is FAIL-SAFE (defaults off):
+        #   paper_auto_execute: default "true"
+        #   live_auto_execute:  default "false" — must be EXPLICITLY set to "true"
+        # Live mode never inherits a "true" default even if the key is absent.
+        if mode == "live":
+            auto_execute = _s.get("live_auto_execute", "false").lower() == "true"
+        else:
+            auto_execute = _s.get("paper_auto_execute", _s.get("auto_execute", "true")).lower() == "true"
         risk_pct     = float(_s.get("risk_pct", "2.0") or "2.0")
         stop_pct     = float(_s.get("stop_loss_pct", "8.0") or "8.0")
-        # Ensure the Alpaca client uses DB-stored credentials (not just .env)
-        # so that keys saved via the Settings panel are respected for both modes.
         try:
             alp.configure_from_db_settings(_s, mode, is_admin=True)
         except ValueError as _creds_err:
+            logger.warning("run_monitor [%s]: credential error — %s", mode, _creds_err)
             return {"status": "error", "error": str(_creds_err)}
     else:
-        mode         = get_setting(db, "trading_mode", "paper")
-        auto_execute = get_setting(db, "auto_execute", "true").lower() == "true"
+        if mode is None:
+            mode = get_setting(db, "trading_mode", "paper")
+        if mode == "live":
+            auto_execute = get_setting(db, "live_auto_execute",  "false").lower() == "true"
+        else:
+            auto_execute = get_setting(db, "paper_auto_execute", get_setting(db, "auto_execute", "true")).lower() == "true"
         risk_pct     = float(get_setting(db, "risk_pct", "2.0"))
         stop_pct     = float(get_setting(db, "stop_loss_pct", "8.0"))
+
+    if mode == "live" and auto_execute:
+        logger.warning(
+            "LIVE AUTO-EXECUTE IS ENABLED — monitor will place real-money orders [user=%s]",
+            user_id,
+        )
 
     try:
         clock       = alp.get_clock(mode)

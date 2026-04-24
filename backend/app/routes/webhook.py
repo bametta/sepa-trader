@@ -26,8 +26,12 @@ async def tradingview(alert: TVAlert, db: Session = Depends(get_db)):
     if webhook_secret and alert.secret != webhook_secret:
         raise HTTPException(status_code=403, detail="Invalid webhook secret")
 
-    mode         = get_setting(db, "trading_mode", "paper")
-    auto_execute = get_setting(db, "auto_execute", "true").lower() == "true"
+    mode = get_setting(db, "trading_mode", "paper")
+    # Use mode-specific auto_execute — live is fail-safe (default off)
+    if mode == "live":
+        auto_execute = get_setting(db, "live_auto_execute", "false").lower() == "true"
+    else:
+        auto_execute = get_setting(db, "paper_auto_execute", get_setting(db, "auto_execute", "true")).lower() == "true"
     risk_pct     = float(get_setting(db, "risk_pct", "2.0"))
     stop_pct     = float(get_setting(db, "stop_loss_pct", "8.0"))
 

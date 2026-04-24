@@ -39,8 +39,10 @@ const SECTIONS = [
   {
     title: 'Trading',
     fields: [
-      { key: 'trading_mode', label: 'Trading Mode', type: 'select',
+      { key: 'trading_mode', label: 'View Mode (display only — both modes always run)', type: 'select',
         options: [{ value: 'paper', label: 'Paper' }, { value: 'live', label: 'Live' }] },
+      { key: 'paper_auto_execute', label: 'Paper auto-execute (place simulated orders)',  type: 'toggle', defaultValue: 'true'  },
+      { key: 'live_auto_execute',  label: 'Live auto-execute ⚠️ REAL MONEY — enable only when ready', type: 'toggle', defaultValue: 'false' },
     ],
   },
   {
