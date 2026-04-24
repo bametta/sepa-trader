@@ -48,11 +48,12 @@ const SECTIONS = [
   {
     title: 'Screener — Selection',
     fields: [
-      { key: 'screener_universe',  label: 'Universe (CSV — leave blank for default 96)',  type: 'text',   span: true },
-      { key: 'screener_top_n',     label: 'Stocks to select (0 = auto from position cap)', type: 'number' },
-      { key: 'screener_min_score', label: 'Min score (0 = adaptive)',                     type: 'number' },
-      { key: 'screener_price_min', label: 'Min price $ (0 = off)',                        type: 'number' },
-      { key: 'screener_price_max', label: 'Max price $ (0 = off)',                        type: 'number' },
+      { key: 'screener_universe',          label: 'Universe (CSV — leave blank for default 96)',  type: 'text',   span: true },
+      { key: 'screener_top_n',             label: 'Stocks to select (0 = auto from position cap)', type: 'number' },
+      { key: 'screener_min_score',         label: 'Min score (0 = adaptive)',                     type: 'number' },
+      { key: 'screener_price_min',         label: 'Min price $ (0 = off)',                        type: 'number' },
+      { key: 'screener_price_max',         label: 'Max price $ (0 = off)',                        type: 'number' },
+      { key: 'screener_excluded_sectors',  label: 'Excluded sectors (Minervini)',                 type: 'sector_picker', span: true, defaultValue: '' },
     ],
   },
   {

@@ -117,6 +117,11 @@ def run_screener(db: Session, mode: str = None, user_id: int = None, account_val
     ema20_pct       = float(_s("screener_ema20_pct",     "2.0") or "2.0")
     ema50_pct       = float(_s("screener_ema50_pct",     "3.0") or "3.0")
 
+    # Sector exclusion — reuse the same GICS→TV name resolver as the RS screener
+    from .rs_screener import _resolve_excluded as _rs_resolve
+    _excluded_raw = [s.strip() for s in _s("screener_excluded_sectors", "").split(",") if s.strip()]
+    excluded_sectors = _rs_resolve(_excluded_raw) if _excluded_raw else set()
+
     if account_value is None:
         try:
             account_value = _get_portfolio_value(db, mode, user_id)
@@ -191,7 +196,7 @@ def run_screener(db: Session, mode: str = None, user_id: int = None, account_val
         ema50_pct=ema50_pct,
     )
 
-    # Build scored list; apply price filter
+    # Build scored list; apply price + sector filters
     all_scored = []
     for sym, result in results_map.items():
         if not result.get("price") or result.get("signal") in ("ERROR", "INSUFFICIENT_DATA"):
@@ -201,6 +206,14 @@ def run_screener(db: Session, mode: str = None, user_id: int = None, account_val
             continue
         if price_max > 0 and price > price_max:
             continue
+        if excluded_sectors:
+            sector = (result.get("sector") or "").strip().lower()
+            if not sector:
+                logger.debug("Minervini screener: %s has no sector — skipping (exclusion list active).", sym)
+                continue
+            if sector in excluded_sectors:
+                logger.debug("Minervini screener: %s excluded (sector=%s).", sym, sector)
+                continue
         all_scored.append({"symbol": sym, **result})
 
     all_scored.sort(
