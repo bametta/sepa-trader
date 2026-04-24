@@ -15,6 +15,82 @@ from .database import get_setting, get_user_setting
 
 logger = logging.getLogger(__name__)
 
+# ── Alpaca news fetcher ───────────────────────────────────────────────────────
+
+def _fetch_alpaca_news(
+    symbols: list[str],
+    db: Session,
+    user_id: int = None,
+    limit: int = 3,
+    hours: int = 48,
+) -> dict[str, list[str]]:
+    """
+    Fetch recent news headlines from Alpaca for a batch of symbols.
+    Returns {symbol: ["Headline (Source, Date)", ...]} — empty list if none found.
+    Falls back silently on any error so analysis still runs without news.
+    """
+    import httpx
+    from datetime import datetime, timezone, timedelta
+    from .config import settings as _cfg
+    from .database import get_user_setting as _gus
+
+    try:
+        # Resolve credentials — same logic as _get_portfolio_value
+        if user_id:
+            from sqlalchemy import text as _text
+            is_admin = db.execute(
+                _text("SELECT role FROM users WHERE id = :id"), {"id": user_id}
+            ).scalar() == "admin"
+            key    = _gus(db, "alpaca_paper_key", "", user_id) or (
+                _cfg.alpaca_paper_key if is_admin else ""
+            )
+            secret = _gus(db, "alpaca_paper_secret", "", user_id) or (
+                _cfg.alpaca_paper_secret if is_admin else ""
+            )
+        else:
+            key    = (_cfg.alpaca_paper_key    or "").strip()
+            secret = (_cfg.alpaca_paper_secret or "").strip()
+
+        if not key or not secret:
+            return {}
+
+        start = (datetime.now(timezone.utc) - timedelta(hours=hours)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        resp = httpx.get(
+            "https://data.alpaca.markets/v1beta1/news",
+            params={
+                "symbols": ",".join(symbols),
+                "limit":   min(limit * len(symbols), 50),
+                "start":   start,
+                "sort":    "desc",
+                "include_content": "false",
+            },
+            headers={"APCA-API-KEY-ID": key.strip(), "APCA-API-SECRET-KEY": secret.strip()},
+            timeout=10,
+        )
+        resp.raise_for_status()
+
+        news_map: dict[str, list[str]] = {s: [] for s in symbols}
+        for article in resp.json().get("news", []):
+            headline  = article.get("headline", "").strip()
+            source    = article.get("source", "").strip()
+            published = article.get("created_at", "")[:10]   # YYYY-MM-DD
+            for sym in article.get("symbols", []):
+                if sym in news_map and len(news_map[sym]) < limit:
+                    news_map[sym].append(f'"{headline}" ({source}, {published})')
+
+        return news_map
+
+    except Exception as exc:
+        logger.warning("_fetch_alpaca_news: failed (%s) — continuing without news.", exc)
+        return {}
+
+
+def _news_block(news: list[str]) -> str:
+    if not news:
+        return ""
+    return "\n   news: " + " | ".join(news)
+
+
 # ── Provider-aware call helper ────────────────────────────────────────────────
 
 def _call_ai(
@@ -157,6 +233,12 @@ Breadth   : {f"{breadth}% sector ETFs above 50MA" if breadth is not None else 'N
 Note: Tape is context only — it does not override position-sizing rules. A CAUTION/UNFAVORABLE tape warrants a WARN unless rules are clearly violated (ABORT).
 """
 
+    symbol_news = _fetch_alpaca_news([symbol], db, user_id).get(symbol, [])
+    news_block  = (
+        "\n--- RECENT NEWS (last 48h) ---\n" + "\n".join(f"• {h}" for h in symbol_news)
+        if symbol_news else ""
+    )
+
     prompt = f"""You are a risk management AI for a Minervini SEPA swing trading system.
 Evaluate this proposed trade and respond in EXACTLY this format — no other text:
 
@@ -192,8 +274,9 @@ Account tier:    {account_tier}
 3. Trade cost must not exceed buying power. Cost: ${trade_cost:,.2f}, BP: ${buying_power:,.2f}
 4. Single position must not exceed {max_position_pct}% of portfolio. Current: {pct_of_portfolio:.1f}%
 5. Cash after trade must remain >= {min_cash_pct}% of portfolio. After trade: {cash_after_pct:.1f}%
-
+{news_block}
 Use WARN for borderline cases (R:R 1.5–2.0, size near the limit).
+If recent news reveals earnings miss, guidance cut, FDA rejection, or major legal/regulatory risk — use WARN or ABORT even if position sizing rules pass.
 Use ABORT only for clear rule violations.
 Use PROCEED when all rules pass."""
 
@@ -452,6 +535,9 @@ def analyze_picks(db: Session, picks: list[dict], closed_position: dict | None =
             f"  Reason: {closed_position.get('reason', 'position closed')}"
         )
 
+    all_symbols = [p["symbol"] for p in picks]
+    news_map    = _fetch_alpaca_news(all_symbols, db, user_id)
+
     lines = []
     for i, p in enumerate(picks, 1):
         ep = p.get("entry_price") or 0
@@ -465,12 +551,14 @@ def analyze_picks(db: Session, picks: list[dict], closed_position: dict | None =
             f"{i}. {p['symbol']}  {score_str}  signal={p.get('signal','?')}"
             f"  entry=${ep:.2f}  stop=${sp:.2f}  t1=${t1:.2f}  R:R={rr}"
             f"  status={p.get('status','?')}  note: {p.get('rationale','')}"
+            + _news_block(news_map.get(p["symbol"], []))
         )
     parts.append("Current week's top picks:\n" + "\n".join(lines))
     parts.append(
         "You are a professional swing-trader assistant using Minervini SEPA criteria.\n"
         "For each PENDING pick above give a one-line recommendation: EXECUTE, WAIT, or SKIP "
-        "with a brief reason (≤15 words). Consider score, R:R ratio, and signal quality.\n"
+        "with a brief reason (≤15 words). Consider score, R:R ratio, signal quality, and any recent news.\n"
+        "If news reveals an earnings miss, guidance cut, FDA rejection, or legal/regulatory risk, flag it.\n"
         "RS Momentum picks (signal=RS_MOMENTUM) use EMA50 structural stops — R:R ≥1.2 is acceptable for them.\n"
         "Output a numbered list only — no preamble."
     )
@@ -576,6 +664,8 @@ def analyze_picks_structured(
     if not pending:
         return []
 
+    news_map = _fetch_alpaca_news([p["symbol"] for p in pending], db, user_id)
+
     # Build pick context lines
     pick_lines = []
     for i, p in enumerate(pending, 1):
@@ -601,6 +691,7 @@ def analyze_picks_structured(
             f"  signal={p.get('signal','?')}"
             f"  entry=${ep:.2f}  stop=${sp:.2f}  t1=${t1:.2f}  t2=${t2:.2f}  R:R={rr}x"
             f"  note: {str(p.get('rationale',''))[:120]}"
+            + _news_block(news_map.get(p["symbol"], []))
         )
 
     tape_block = ""
@@ -631,11 +722,12 @@ INSTRUCTIONS:
 - entry_zone: exact price zone and condition for entry (e.g. "Buy $152-155 on EMA20 touch with vol surge")
 - exit_strategy: scale-out plan using the provided targets (e.g. "Take 50% at 2R ${'{t1}'}, trail stop to BE at 3R")
 - guardrails: concrete cut rule + any condition to avoid the trade (e.g. "Cut on daily close below ${'{stop}'}; skip if VIX > 30")
-- rationale: one sentence max (≤20 words) explaining the decision
+- rationale: one sentence max (≤20 words) explaining the decision. If news influenced the decision, briefly reference it.
 
 Use EXECUTE for high-quality setups (SEPA score ≥5 and R:R ≥2 for Minervini/Pullback; RS Momentum picks require R:R ≥1.2 — their stop is structural EMA50 support, not a raw % stop).
 Use WAIT for borderline setups worth monitoring.
 Use SKIP for low-quality setups or when tape is unfavorable for that setup type. Do NOT penalise RS Momentum picks for R:R < 2 — they use a tighter stop methodology.
+If recent news (provided in the pick's "news:" field) reveals an earnings miss, guidance cut, FDA rejection, analyst downgrade, or legal/regulatory risk — downgrade the decision by one level (EXECUTE→WAIT, WAIT→SKIP) and flag it in guardrails.
 
 Respond ONLY with a valid JSON array. No markdown fences, no explanation.
 [
