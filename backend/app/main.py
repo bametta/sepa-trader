@@ -368,6 +368,15 @@ async def lifespan(app: FastAPI):
     _run_migrations()
     start_scheduler()
 
+    # Trade-updates WebSocket — push-based fill notifications. Augments the
+    # polling watchdog (which stays as the safety net) so DB state catches up
+    # to fills in seconds instead of waiting for the next monitor tick.
+    try:
+        from .trade_stream import start_trade_streams
+        start_trade_streams()
+    except Exception as exc:
+        logger.warning("Trade stream startup skipped: %s", exc)
+
     # Startup reconciliation: catch positions held in Alpaca that are missing
     # from the DB after a mid-day restart, before the next monitor cycle (up
     # to 30 min away). Failures are logged but never block startup.
@@ -387,6 +396,13 @@ async def lifespan(app: FastAPI):
         logger.warning("Startup reconciliation skipped: %s", exc)
 
     yield
+
+    try:
+        from .trade_stream import stop_trade_streams
+        await stop_trade_streams()
+    except Exception as exc:
+        logger.warning("Trade stream shutdown error: %s", exc)
+
     stop_scheduler()
 
 
