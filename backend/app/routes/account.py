@@ -6,6 +6,7 @@ from ..database import get_db, get_current_user, get_all_user_settings
 from ..config import settings as global_settings
 from .. import alpaca_client as alp
 from ..utils import sf as _sf
+from ..crypto import decrypt as _dec
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/account", tags=["account"])
@@ -105,10 +106,12 @@ def accounts_overview(
     is_admin     = current_user["role"] == "admin"
     user_settings = get_all_user_settings(db, uid)
 
-    # Strategy configs with potentially separate keys
+    # Strategy configs with potentially separate keys.
+    # Each strategy has one row per trading_mode; load both and pick the
+    # row matching the mode we're rendering inside the loop below.
     strategy_rows = db.execute(
         text("""
-            SELECT strategy_name,
+            SELECT strategy_name, trading_mode,
                    alpaca_paper_key, alpaca_paper_secret,
                    alpaca_live_key,  alpaca_live_secret
             FROM strategy_config
@@ -136,11 +139,17 @@ def accounts_overview(
 
         # ── Strategy accounts (only if they have DEDICATED keys) ──────────────
         for row in strategy_rows:
-            strat_name, pk, ps, lk, ls = row
+            strat_name, row_mode, pk, ps, lk, ls = row
+            if row_mode != mode:
+                continue
             if mode == "paper":
-                key, secret = pk, ps
+                enc_key, enc_secret = pk, ps
             else:
-                key, secret = lk, ls
+                enc_key, enc_secret = lk, ls
+
+            # Stored credentials are encrypted at rest — decrypt before use.
+            key    = _dec(enc_key or "")
+            secret = _dec(enc_secret or "")
 
             # Skip if no dedicated keys or same as main account credentials
             main_key = user_settings.get(f"alpaca_{mode}_key", "")
