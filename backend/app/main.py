@@ -56,6 +56,14 @@ def _run_migrations():
             )
         """))
 
+        db.execute(text("""
+            CREATE TABLE IF NOT EXISTS earnings_cache (
+                symbol        VARCHAR(10) PRIMARY KEY,
+                next_earnings DATE,
+                fetched_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+        """))
+
         # ── Auth tables ───────────────────────────────────────────────────────
         db.execute(text("""
             CREATE TABLE IF NOT EXISTS users (

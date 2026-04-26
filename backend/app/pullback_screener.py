@@ -737,6 +737,65 @@ Respond ONLY with a single compact JSON object on one line — no markdown fence
         return {"grade": "?", "pass": True, "reasoning": f"AI review error: {exc}"}
 
 
+# ── Earnings cache ────────────────────────────────────────────────────────────
+
+def _get_cached_earnings(db, symbol: str) -> "date | None":
+    """Earnings date with persistent cache.
+
+    Yahoo Finance frequently returns null for valid symbols, which previously
+    caused `block_unknown_earnings=true` to silently zero out the universe on
+    bad-data days. Cache positive hits for 7 days, null hits for 1 day so a
+    single-day yfinance hiccup doesn't immediately invalidate good data.
+
+    Returns the cached date (which may be None) when fresh; on cache miss or
+    TTL expiry, fetches from yfinance and stores the result (including None).
+    Falls through to a live fetch if `db` is None or the cache lookup errors.
+    """
+    from .strategies.yf_client import get_next_earnings_date
+    from sqlalchemy import text as _text
+
+    if db is None:
+        return get_next_earnings_date(symbol)
+
+    try:
+        row = db.execute(
+            _text("""
+                SELECT next_earnings,
+                       EXTRACT(EPOCH FROM (NOW() - fetched_at)) AS age_sec
+                FROM earnings_cache
+                WHERE symbol = :s
+            """),
+            {"s": symbol},
+        ).fetchone()
+    except Exception as exc:
+        logger.debug("earnings_cache lookup failed for %s: %s", symbol, exc)
+        return get_next_earnings_date(symbol)
+
+    if row is not None:
+        cached_date, age_sec = row[0], float(row[1] or 0)
+        ttl_sec = 86400 if cached_date is None else 7 * 86400   # 1d for null, 7d for known
+        if age_sec < ttl_sec:
+            return cached_date
+
+    fresh = get_next_earnings_date(symbol)
+    try:
+        db.execute(
+            _text("""
+                INSERT INTO earnings_cache (symbol, next_earnings, fetched_at)
+                VALUES (:s, :d, NOW())
+                ON CONFLICT (symbol) DO UPDATE
+                  SET next_earnings = EXCLUDED.next_earnings,
+                      fetched_at    = EXCLUDED.fetched_at
+            """),
+            {"s": symbol, "d": fresh},
+        )
+        db.commit()
+    except Exception as exc:
+        db.rollback()
+        logger.debug("earnings_cache write failed for %s: %s", symbol, exc)
+    return fresh
+
+
 # ── Pass 2: PPST + earnings ───────────────────────────────────────────────────
 
 def _score_candidates(
@@ -750,7 +809,7 @@ def _score_candidates(
     optionally run AI chart review (pb_ai_chart_review=true).
     Returns the filtered + scored subset.
     """
-    from .strategies.yf_client import fetch_ohlcv, get_next_earnings_date
+    from .strategies.yf_client import fetch_ohlcv
 
     today        = date.today()
     out          = []
@@ -783,8 +842,8 @@ def _score_candidates(
             if cfg["earnings_days_min"] > 0:
                 next_earn = c.get("tv_earn_date")   # from TV pass-1 (free)
                 if next_earn is None:
-                    # TV had no date — try Yahoo Finance as fallback
-                    next_earn = get_next_earnings_date(sym)
+                    # TV had no date — try cached Yahoo Finance fallback
+                    next_earn = _get_cached_earnings(db, sym)
                     if next_earn is not None:
                         logger.debug("Pullback: %s earnings from Yahoo Finance: %s", sym, next_earn)
 
