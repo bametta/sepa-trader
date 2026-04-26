@@ -62,168 +62,177 @@ const SECTIONS = [
     ],
   },
 
-  // ── Minervini ──────────────────────────────────────────────────────────────
+  // ── Minervini ─────────────────────────────────────────────────────────────
   {
-    title: 'Minervini Screener — Universe & Filters',
-    description: 'SEPA breakout setups. Market-wide TV scan ranks the top candidates by score.',
-    fields: [
-      { key: 'screener_universe',         label: 'Universe override (CSV — blank = market-wide TV scan)', type: 'text', span: true },
-      { key: 'screener_top_n',            label: 'Stocks to select (0 = auto from position cap)', type: 'number' },
-      { key: 'screener_min_score',        label: 'Min score (0 = adaptive)',                       type: 'number' },
-      { key: 'screener_price_min',        label: 'Min price $ (0 = off)',                          type: 'number' },
-      { key: 'screener_price_max',        label: 'Max price $ (0 = off)',                          type: 'number' },
-      { key: 'screener_vol_surge_pct',    label: 'Volume surge threshold % above avg (e.g. 40 = 1.4×)', type: 'number' },
-      { key: 'screener_ema20_pct',        label: 'EMA20 proximity band %',                         type: 'number' },
-      { key: 'screener_ema50_pct',        label: 'EMA50 proximity band %',                         type: 'number' },
-    ],
-  },
-  {
-    title: 'Minervini Screener — Sectors',
-    description: 'Sectors blocked from the Minervini universe.',
-    fields: [
-      { key: 'mv_excluded_sectors',  label: 'Excluded sectors', type: 'sector_picker', span: true, defaultValue: '' },
-    ],
-  },
-  {
-    title: 'Minervini Screener — Entry Order',
-    fields: [
-      { key: 'mv_entry_order_type', label: 'Entry order type', type: 'select',
-        options: [
-          { value: 'stop_limit', label: 'Stop-limit — activates only when price breaks out (recommended for Minervini)' },
-          { value: 'limit',      label: 'Limit — fills up to entry + slippage%' },
-          { value: 'market',     label: 'Market — immediate fill at any price' },
-        ]
+    title: 'Minervini Screener',
+    description: 'SEPA breakout setups — market-wide TV scan ranks the top candidates by score.',
+    subsections: [
+      {
+        title: 'Universe & Filters',
+        fields: [
+          { key: 'screener_universe',         label: 'Universe override (CSV — blank = market-wide TV scan)', type: 'text', span: true },
+          { key: 'screener_top_n',            label: 'Stocks to select (0 = auto from position cap)', type: 'number' },
+          { key: 'screener_min_score',        label: 'Min score (0 = adaptive)',                       type: 'number' },
+          { key: 'screener_price_min',        label: 'Min price $ (0 = off)',                          type: 'number' },
+          { key: 'screener_price_max',        label: 'Max price $ (0 = off)',                          type: 'number' },
+          { key: 'screener_vol_surge_pct',    label: 'Volume surge threshold % above avg (e.g. 40 = 1.4×)', type: 'number' },
+          { key: 'screener_ema20_pct',        label: 'EMA20 proximity band %',                         type: 'number' },
+          { key: 'screener_ema50_pct',        label: 'EMA50 proximity band %',                         type: 'number' },
+        ],
       },
-      { key: 'mv_entry_slippage_pct', label: 'Slippage tolerance % (default 1.0)', type: 'number' },
-    ],
-  },
-  {
-    title: 'Minervini Screener — Schedule (ET)',
-    fields: [
-      { key: 'screener_auto_run',       label: 'Auto-run enabled',                type: 'toggle',    defaultValue: 'true' },
-      { key: 'screener_schedule_days',  label: 'Days to run (click to toggle)',   type: 'day_picker', span: true },
-      { key: 'screener_schedule_times', label: 'Run times (24h ET, e.g. 20:00)', type: 'time_list',  span: true },
+      {
+        title: 'Sectors',
+        fields: [
+          { key: 'mv_excluded_sectors', label: 'Excluded sectors', type: 'sector_picker', span: true, defaultValue: '' },
+        ],
+      },
+      {
+        title: 'Entry Order',
+        fields: [
+          { key: 'mv_entry_order_type', label: 'Entry order type', type: 'select',
+            options: [
+              { value: 'stop_limit', label: 'Stop-limit — activates only when price breaks out (recommended for Minervini)' },
+              { value: 'limit',      label: 'Limit — fills up to entry + slippage%' },
+              { value: 'market',     label: 'Market — immediate fill at any price' },
+            ]
+          },
+          { key: 'mv_entry_slippage_pct', label: 'Slippage tolerance % (default 1.0)', type: 'number' },
+        ],
+      },
+      {
+        title: 'Schedule (ET)',
+        fields: [
+          { key: 'screener_auto_run',       label: 'Auto-run enabled',                type: 'toggle',    defaultValue: 'true' },
+          { key: 'screener_schedule_days',  label: 'Days to run (click to toggle)',   type: 'day_picker', span: true },
+          { key: 'screener_schedule_times', label: 'Run times (24h ET, e.g. 20:00)', type: 'time_list',  span: true },
+        ],
+      },
     ],
   },
 
-  // ── Pullback ───────────────────────────────────────────────────────────────
+  // ── Pullback ──────────────────────────────────────────────────────────────
   {
-    title: 'Pullback Screener — Source & Universe',
-    description: 'Pullback-to-MA setups. Use a saved TV screener or the in-app filters below.',
-    fields: [
-      { key: 'pb_tv_screener_name', label: 'TradingView Screener name (leave blank to use app filters below)', type: 'tv_screener', span: true },
-      { key: 'pb_exchanges',        label: 'Exchanges to scan', type: 'exchange_picker', span: true, defaultValue: 'NYSE,NASDAQ' },
-      { key: 'pb_top_n',            label: 'Top N from pullback screener (default 5)', type: 'number' },
-    ],
-  },
-  {
-    title: 'Pullback Screener — Filters',
-    fields: [
-      { key: 'pb_price_min',         label: 'Min price $ (default 10)',             type: 'number' },
-      { key: 'pb_price_max',         label: 'Max price $ (default 200)',            type: 'number' },
-      { key: 'pb_rsi_min',           label: 'RSI min (reset zone, default 40)',     type: 'number' },
-      { key: 'pb_rsi_max',           label: 'RSI max (reset zone, default 60)',     type: 'number' },
-      { key: 'pb_avg_vol_min',       label: 'Avg 10D volume min (default 1000000)', type: 'number' },
-      { key: 'pb_rel_vol_min',       label: 'Relative volume min (default 0.75)',   type: 'number' },
-      { key: 'pb_market_cap_min',    label: 'Min market cap $ (default 500000000)', type: 'number' },
-      { key: 'pb_week_change_min',   label: '1-week change min % (default -3)',     type: 'number' },
-      { key: 'pb_ema50_proximity',   label: 'Max % from EMA50 (default 8)',         type: 'number' },
-      { key: 'pb_beta_max',          label: 'Max beta (default 2.5)',               type: 'number' },
-      { key: 'pb_earnings_days_min', label: 'Min days to earnings (default 15)',    type: 'number' },
-      { key: 'pb_ema_spread_min',    label: 'Min EMA20/50 spread % — rejects flat EMA structures (default 1)', type: 'number' },
-      { key: 'pb_adx_min',           label: 'Min ADX — trend strength gate (default 20, 0 = off)',            type: 'number' },
-      { key: 'pb_52w_high_pct_max',  label: 'Max % below 52-week high — Stage 2 guard (default 30)',           type: 'number' },
-      { key: 'pb_3m_perf_min',       label: 'Min 3-month performance % (default -5, e.g. -10 = lenient)',      type: 'number' },
-      { key: 'pb_min_revenue_growth', label: 'Min revenue growth % YoY (0 = off, e.g. 10 = require ≥10% top-line growth)', type: 'number', defaultValue: '0' },
-      { key: 'pb_block_unknown_earnings', label: 'Block stocks with unknown earnings date (recommended)', type: 'toggle', defaultValue: 'true' },
-    ],
-  },
-  {
-    title: 'Pullback Screener — EMA Ladder',
-    description: 'Each step independently togglable for the Stage-2 trend test.',
-    fields: [
-      { key: 'pb_price_above_ema20',   label: 'Require price > EMA20',   type: 'toggle', defaultValue: 'true' },
-      { key: 'pb_ema20_above_ema50',   label: 'Require EMA20 > EMA50',   type: 'toggle', defaultValue: 'true' },
-      { key: 'pb_ema50_above_ema100',  label: 'Require EMA50 > EMA100',  type: 'toggle', defaultValue: 'true' },
-      { key: 'pb_ema100_above_ema200', label: 'Require EMA100 > EMA200', type: 'toggle', defaultValue: 'true' },
-    ],
-  },
-  {
-    title: 'Pullback Screener — PPST Confirmation',
-    description: 'Pivot-Point Super Trend bullish confirmation overlay.',
-    fields: [
-      { key: 'pb_ppst_required',     label: 'Require PPST bullish confirmation', type: 'toggle', defaultValue: 'true' },
-      { key: 'pb_ppst_pivot_period', label: 'Pivot Point Period (TV default 2)', type: 'number' },
-      { key: 'pb_ppst_multiplier',   label: 'ATR Factor (TV default 3)',         type: 'number' },
-      { key: 'pb_ppst_period',       label: 'ATR Period (TV default 10)',        type: 'number' },
-    ],
-  },
-  {
-    title: 'Pullback Screener — AI Chart Review',
-    description: 'Per-candidate price-action analysis before finalising. Requires AI key.',
-    fields: [
-      { key: 'pb_ai_chart_review',    label: 'Enable AI chart review', type: 'toggle', defaultValue: 'false' },
-      { key: 'pb_ai_chart_min_grade', label: 'Minimum AI chart grade to pass',
-        type: 'select', options: [
-          { value: 'A', label: 'A — Pristine setups only' },
-          { value: 'B', label: 'B — Solid setups (recommended)' },
-          { value: 'C', label: 'C — Allow marginal setups' },
-        ] },
-    ],
-  },
-  {
-    title: 'Pullback Screener — Sectors',
-    description: 'Sectors blocked from the Pullback universe.',
-    fields: [
-      { key: 'pb_excluded_sectors', label: 'Excluded sectors', type: 'sector_picker', span: true,
-        defaultValue: 'Consumer Defensive,Energy,Utilities,Real Estate,Basic Materials,Financial Services' },
-    ],
-  },
-  {
-    title: 'Pullback Screener — Entry Order',
-    fields: [
-      { key: 'pb_entry_order_type', label: 'Entry order type', type: 'select',
-        options: [
-          { value: 'limit',      label: 'Limit — fills up to entry + slippage% (recommended for pullbacks)' },
-          { value: 'stop_limit', label: 'Stop-limit — activates only when price reaches entry' },
-          { value: 'market',     label: 'Market — immediate fill at any price' },
-        ]
+    title: 'Pullback Screener',
+    description: 'Pullback-to-MA setups — saved TV screener or in-app filters.',
+    subsections: [
+      {
+        title: 'Source & Universe',
+        fields: [
+          { key: 'pb_tv_screener_name', label: 'TradingView Screener name (leave blank to use app filters below)', type: 'tv_screener', span: true },
+          { key: 'pb_exchanges',        label: 'Exchanges to scan', type: 'exchange_picker', span: true, defaultValue: 'NYSE,NASDAQ' },
+          { key: 'pb_top_n',            label: 'Top N from pullback screener (default 5)', type: 'number' },
+        ],
       },
-      { key: 'pb_entry_slippage_pct', label: 'Slippage tolerance % (default 0.5)', type: 'number' },
-    ],
-  },
-  {
-    title: 'Pullback Screener — Schedule (ET)',
-    fields: [
-      { key: 'pb_screener_auto_run',       label: 'Auto-run enabled',                type: 'toggle',    defaultValue: 'true' },
-      { key: 'pb_screener_schedule_days',  label: 'Days to run (click to toggle)',   type: 'day_picker', span: true },
-      { key: 'pb_screener_schedule_times', label: 'Run times (24h ET, e.g. 20:00)', type: 'time_list',  span: true },
+      {
+        title: 'Filters',
+        fields: [
+          { key: 'pb_price_min',         label: 'Min price $ (default 10)',             type: 'number' },
+          { key: 'pb_price_max',         label: 'Max price $ (default 200)',            type: 'number' },
+          { key: 'pb_rsi_min',           label: 'RSI min (reset zone, default 40)',     type: 'number' },
+          { key: 'pb_rsi_max',           label: 'RSI max (reset zone, default 60)',     type: 'number' },
+          { key: 'pb_avg_vol_min',       label: 'Avg 10D volume min (default 1000000)', type: 'number' },
+          { key: 'pb_rel_vol_min',       label: 'Relative volume min (default 0.75)',   type: 'number' },
+          { key: 'pb_market_cap_min',    label: 'Min market cap $ (default 500000000)', type: 'number' },
+          { key: 'pb_week_change_min',   label: '1-week change min % (default -3)',     type: 'number' },
+          { key: 'pb_ema50_proximity',   label: 'Max % from EMA50 (default 8)',         type: 'number' },
+          { key: 'pb_beta_max',          label: 'Max beta (default 2.5)',               type: 'number' },
+          { key: 'pb_earnings_days_min', label: 'Min days to earnings (default 15)',    type: 'number' },
+          { key: 'pb_ema_spread_min',    label: 'Min EMA20/50 spread % — rejects flat EMA structures (default 1)', type: 'number' },
+          { key: 'pb_adx_min',           label: 'Min ADX — trend strength gate (default 20, 0 = off)',            type: 'number' },
+          { key: 'pb_52w_high_pct_max',  label: 'Max % below 52-week high — Stage 2 guard (default 30)',           type: 'number' },
+          { key: 'pb_3m_perf_min',       label: 'Min 3-month performance % (default -5, e.g. -10 = lenient)',      type: 'number' },
+          { key: 'pb_min_revenue_growth', label: 'Min revenue growth % YoY (0 = off, e.g. 10 = require ≥10% top-line growth)', type: 'number', defaultValue: '0' },
+          { key: 'pb_block_unknown_earnings', label: 'Block stocks with unknown earnings date (recommended)', type: 'toggle', defaultValue: 'true' },
+        ],
+      },
+      {
+        title: 'EMA Ladder',
+        fields: [
+          { key: 'pb_price_above_ema20',   label: 'Require price > EMA20',   type: 'toggle', defaultValue: 'true' },
+          { key: 'pb_ema20_above_ema50',   label: 'Require EMA20 > EMA50',   type: 'toggle', defaultValue: 'true' },
+          { key: 'pb_ema50_above_ema100',  label: 'Require EMA50 > EMA100',  type: 'toggle', defaultValue: 'true' },
+          { key: 'pb_ema100_above_ema200', label: 'Require EMA100 > EMA200', type: 'toggle', defaultValue: 'true' },
+        ],
+      },
+      {
+        title: 'PPST Confirmation',
+        fields: [
+          { key: 'pb_ppst_required',     label: 'Require PPST bullish confirmation', type: 'toggle', defaultValue: 'true' },
+          { key: 'pb_ppst_pivot_period', label: 'Pivot Point Period (TV default 2)', type: 'number' },
+          { key: 'pb_ppst_multiplier',   label: 'ATR Factor (TV default 3)',         type: 'number' },
+          { key: 'pb_ppst_period',       label: 'ATR Period (TV default 10)',        type: 'number' },
+        ],
+      },
+      {
+        title: 'AI Chart Review',
+        fields: [
+          { key: 'pb_ai_chart_review',    label: 'Enable AI chart review', type: 'toggle', defaultValue: 'false' },
+          { key: 'pb_ai_chart_min_grade', label: 'Minimum AI chart grade to pass',
+            type: 'select', options: [
+              { value: 'A', label: 'A — Pristine setups only' },
+              { value: 'B', label: 'B — Solid setups (recommended)' },
+              { value: 'C', label: 'C — Allow marginal setups' },
+            ] },
+        ],
+      },
+      {
+        title: 'Sectors',
+        fields: [
+          { key: 'pb_excluded_sectors', label: 'Excluded sectors', type: 'sector_picker', span: true,
+            defaultValue: 'Consumer Defensive,Energy,Utilities,Real Estate,Basic Materials,Financial Services' },
+        ],
+      },
+      {
+        title: 'Entry Order',
+        fields: [
+          { key: 'pb_entry_order_type', label: 'Entry order type', type: 'select',
+            options: [
+              { value: 'limit',      label: 'Limit — fills up to entry + slippage% (recommended for pullbacks)' },
+              { value: 'stop_limit', label: 'Stop-limit — activates only when price reaches entry' },
+              { value: 'market',     label: 'Market — immediate fill at any price' },
+            ]
+          },
+          { key: 'pb_entry_slippage_pct', label: 'Slippage tolerance % (default 0.5)', type: 'number' },
+        ],
+      },
+      {
+        title: 'Schedule (ET)',
+        fields: [
+          { key: 'pb_screener_auto_run',       label: 'Auto-run enabled',                type: 'toggle',    defaultValue: 'true' },
+          { key: 'pb_screener_schedule_days',  label: 'Days to run (click to toggle)',   type: 'day_picker', span: true },
+          { key: 'pb_screener_schedule_times', label: 'Run times (24h ET, e.g. 20:00)', type: 'time_list',  span: true },
+        ],
+      },
     ],
   },
 
-  // ── RS Momentum ────────────────────────────────────────────────────────────
+  // ── RS Momentum ───────────────────────────────────────────────────────────
   {
-    title: 'RS Momentum Screener — Universe & Filters',
+    title: 'RS Momentum Screener',
     description: 'Top relative-strength leaders. Runs alongside Minervini and Pullback.',
-    fields: [
-      { key: 'rs_screener_enabled',  label: 'Enable RS Momentum screener',                            type: 'toggle', defaultValue: 'true', span: true },
-      { key: 'rs_exchanges',         label: 'Exchanges to scan',                                       type: 'exchange_picker', span: true, defaultValue: 'NYSE,NASDAQ' },
-      { key: 'rs_price_min',         label: 'Min price $ (default 10)',                                type: 'number' },
-      { key: 'rs_price_max',         label: 'Max price $ (0 = no ceiling)',                            type: 'number' },
-      { key: 'rs_avg_vol_min',       label: 'Min avg daily volume (default 500000)',                   type: 'number' },
-      { key: 'rs_market_cap_min',    label: 'Min market cap $ (default 500000000)',                    type: 'number' },
-      { key: 'rs_min_percentile',    label: 'Min RS percentile to qualify (default 70 = top 30%)',     type: 'number' },
-      { key: 'rs_max_extension',     label: 'Max % above EMA50 — rejects over-extended stocks (default 15)', type: 'number' },
-      { key: 'rs_top_n',             label: 'Top N picks (default 5)',                                 type: 'number' },
-      { key: 'rs_require_stage2',    label: 'Require Stage 2 uptrend (price > EMA50 > EMA200)',        type: 'toggle', defaultValue: 'true' },
-    ],
-  },
-  {
-    title: 'RS Momentum Screener — Sectors',
-    description: 'Sectors blocked from the RS universe.',
-    fields: [
-      { key: 'rs_excluded_sectors',  label: 'Excluded sectors', type: 'sector_picker', span: true,
-        defaultValue: 'Energy Minerals,Industrial Services,Non-Energy Minerals,Process Industries,Utilities,Consumer Non-Durables' },
+    subsections: [
+      {
+        title: 'Universe & Filters',
+        fields: [
+          { key: 'rs_screener_enabled',  label: 'Enable RS Momentum screener',                            type: 'toggle', defaultValue: 'true', span: true },
+          { key: 'rs_exchanges',         label: 'Exchanges to scan',                                       type: 'exchange_picker', span: true, defaultValue: 'NYSE,NASDAQ' },
+          { key: 'rs_price_min',         label: 'Min price $ (default 10)',                                type: 'number' },
+          { key: 'rs_price_max',         label: 'Max price $ (0 = no ceiling)',                            type: 'number' },
+          { key: 'rs_avg_vol_min',       label: 'Min avg daily volume (default 500000)',                   type: 'number' },
+          { key: 'rs_market_cap_min',    label: 'Min market cap $ (default 500000000)',                    type: 'number' },
+          { key: 'rs_min_percentile',    label: 'Min RS percentile to qualify (default 70 = top 30%)',     type: 'number' },
+          { key: 'rs_max_extension',     label: 'Max % above EMA50 — rejects over-extended stocks (default 15)', type: 'number' },
+          { key: 'rs_top_n',             label: 'Top N picks (default 5)',                                 type: 'number' },
+          { key: 'rs_require_stage2',    label: 'Require Stage 2 uptrend (price > EMA50 > EMA200)',        type: 'toggle', defaultValue: 'true' },
+        ],
+      },
+      {
+        title: 'Sectors',
+        fields: [
+          { key: 'rs_excluded_sectors',  label: 'Excluded sectors', type: 'sector_picker', span: true,
+            defaultValue: 'Energy Minerals,Industrial Services,Non-Energy Minerals,Process Industries,Utilities,Consumer Non-Durables' },
+        ],
+      },
     ],
   },
 
@@ -291,9 +300,9 @@ const SECTIONS = [
 const DEFAULT_OPEN = new Set([
   'Trading Mode',
   'Risk & Position Sizing',
-  'Minervini Screener — Universe & Filters',
-  'Pullback Screener — Source & Universe',
-  'RS Momentum Screener — Universe & Filters',
+  'Minervini Screener',
+  'Pullback Screener',
+  'RS Momentum Screener',
 ])
 
 export default function SettingsPanel() {
@@ -410,24 +419,54 @@ export default function SettingsPanel() {
             {/* Body — shown only when open */}
             {isOpen && (
               <div className="px-4 pb-4 border-t border-border">
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 mt-3">
-                  {section.fields.map(f => (
-                    <div key={f.key} className={f.span ? 'sm:col-span-2' : ''}>
-                      <Field
-                        field={f}
-                        value={data[f.key] ?? ''}
-                        saving={saving === f.key}
-                        onSave={val => save(f.key, val)}
-                        tvScreeners={f.type === 'tv_screener' ? tvList : undefined}
-                        tvLoading={f.type === 'tv_screener' ? tvLoading : undefined}
-                        tvError={f.type === 'tv_screener' ? tvError : undefined}
-                        tvOpen={f.type === 'tv_screener' ? tvOpen : undefined}
-                        onBrowseTv={f.type === 'tv_screener' ? loadTvScreeners : undefined}
-                        onCloseTv={f.type === 'tv_screener' ? () => setTvOpen(false) : undefined}
-                      />
-                    </div>
-                  ))}
-                </div>
+                {section.subsections ? (
+                  <div className="space-y-5 mt-4">
+                    {section.subsections.map(sub => (
+                      <div key={sub.title}>
+                        <h4 className="text-xs font-semibold text-slate-400 uppercase tracking-wider mb-2 pb-1 border-b border-border/50">
+                          {sub.title}
+                        </h4>
+                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                          {sub.fields.map(f => (
+                            <div key={f.key} className={f.span ? 'sm:col-span-2' : ''}>
+                              <Field
+                                field={f}
+                                value={data[f.key] ?? ''}
+                                saving={saving === f.key}
+                                onSave={val => save(f.key, val)}
+                                tvScreeners={f.type === 'tv_screener' ? tvList : undefined}
+                                tvLoading={f.type === 'tv_screener' ? tvLoading : undefined}
+                                tvError={f.type === 'tv_screener' ? tvError : undefined}
+                                tvOpen={f.type === 'tv_screener' ? tvOpen : undefined}
+                                onBrowseTv={f.type === 'tv_screener' ? loadTvScreeners : undefined}
+                                onCloseTv={f.type === 'tv_screener' ? () => setTvOpen(false) : undefined}
+                              />
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 mt-3">
+                    {section.fields.map(f => (
+                      <div key={f.key} className={f.span ? 'sm:col-span-2' : ''}>
+                        <Field
+                          field={f}
+                          value={data[f.key] ?? ''}
+                          saving={saving === f.key}
+                          onSave={val => save(f.key, val)}
+                          tvScreeners={f.type === 'tv_screener' ? tvList : undefined}
+                          tvLoading={f.type === 'tv_screener' ? tvLoading : undefined}
+                          tvError={f.type === 'tv_screener' ? tvError : undefined}
+                          tvOpen={f.type === 'tv_screener' ? tvOpen : undefined}
+                          onBrowseTv={f.type === 'tv_screener' ? loadTvScreeners : undefined}
+                          onCloseTv={f.type === 'tv_screener' ? () => setTvOpen(false) : undefined}
+                        />
+                      </div>
+                    ))}
+                  </div>
+                )}
               </div>
             )}
           </div>
