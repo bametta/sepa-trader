@@ -11,7 +11,20 @@ from .database import SessionLocal, get_setting, set_setting
 from .trader import run_monitor
 
 logger = logging.getLogger(__name__)
-scheduler = AsyncIOScheduler()
+scheduler = AsyncIOScheduler(
+    job_defaults={
+        # Prevent overlap of the same job (already APScheduler default, set
+        # explicitly so a future config change can't accidentally relax it).
+        "max_instances": 1,
+        # If the scheduler stalls or restarts, collapse all missed firings of
+        # an every-minute job into one — don't let a backlog avalanche the
+        # monitor or screener watchdogs.
+        "coalesce": True,
+        # Skip a missed job if it's >60s late by the time APScheduler gets to
+        # it — a stale "monday open at 9:35" should not fire at 10:30.
+        "misfire_grace_time": 60,
+    }
+)
 
 _ET = pytz.timezone("America/New_York")
 

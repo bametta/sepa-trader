@@ -34,8 +34,8 @@ def _resolve_alpaca_client(user_settings: dict, mode: str, is_admin: bool = Fals
     if not key or not secret:
         raise HTTPException(status_code=400, detail="alpaca_credentials_missing")
     logger.info(
-        "_resolve_alpaca_client: mode=%s paper=%s key_prefix=%s secret_len=%d",
-        mode, paper, key[:6] if key else "NONE", len(secret) if secret else 0,
+        "_resolve_alpaca_client: mode=%s paper=%s credentials=set",
+        mode, paper,
     )
     return alp.get_client_for_keys(key, secret, paper)
 
