@@ -237,6 +237,17 @@ def _adjust_trailing_stops(
             )
         except Exception as exc:
             logger.error("Trailing stop update failed for %s: %s", sym, exc)
+            # The replace cancelled the old OCO before placing the new one,
+            # so a placement failure leaves the position naked until the next
+            # monitor cycle. Alert immediately.
+            try:
+                from . import telegram_alerts as tg
+                tg.alert_system_error_sync(
+                    f"NAKED POSITION [{mode}] {sym} — trailing-stop replace failed",
+                    exc,
+                )
+            except Exception:
+                pass
 
 
 # ── Exit guard ────────────────────────────────────────────────────────────────
@@ -282,6 +293,30 @@ def _ensure_exit_orders(
     """
     oco_covered, orphan_order_ids = _classify_exit_orders(open_orders_by_symbol)
     client = alp.get_client(mode)
+
+    # Cancel exit orders for symbols that have no live position (e.g., user
+    # closed manually, or a previous close left dangling legs). Otherwise the
+    # orphan OCO can fire against a fresh re-entry, prematurely closing the
+    # new position.
+    held_symbols = {p.symbol for p in positions}
+    for sym in list(open_orders_by_symbol.keys()):
+        if sym in held_symbols:
+            continue
+        for o in open_orders_by_symbol.get(sym, []):
+            side = str(getattr(o, "side", "") or "").lower()
+            if "sell" not in side:
+                continue
+            try:
+                client.cancel_order_by_id(str(o.id))
+                logger.info(
+                    "Exit guard: cancelled orphan exit %s for %s (no live position) [%s]",
+                    o.id, sym, mode,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Exit guard: could not cancel orphan %s for %s: %s",
+                    o.id, sym, exc,
+                )
 
     for pos in positions:
         sym   = pos.symbol
@@ -337,6 +372,14 @@ def _ensure_exit_orders(
                             )
                         except Exception as exc:
                             logger.error("Exit guard: T2 OCO replacement failed for %s: %s", sym, exc)
+                            try:
+                                from . import telegram_alerts as tg
+                                tg.alert_system_error_sync(
+                                    f"NAKED POSITION [{mode}] {sym} — T2 OCO replace failed",
+                                    exc,
+                                )
+                            except Exception:
+                                pass
                     else:
                         logger.debug("Exit guard: %s T2 OCO in place — no action.", sym)
             else:
@@ -355,6 +398,14 @@ def _ensure_exit_orders(
                         logger.info("Exit guard: replaced OCO for %s stop=$%.2f target=$%.2f [%s]", sym, stop, target, mode)
                     except Exception as exc:
                         logger.error("Exit guard: OCO replacement failed for %s: %s", sym, exc)
+                        try:
+                            from . import telegram_alerts as tg
+                            tg.alert_system_error_sync(
+                                f"NAKED POSITION [{mode}] {sym} — OCO replace failed",
+                                exc,
+                            )
+                        except Exception:
+                            pass
                 else:
                     logger.debug("Exit guard: %s OCO in place and matches plan — no action.", sym)
             continue

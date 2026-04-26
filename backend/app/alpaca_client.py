@@ -426,7 +426,24 @@ def replace_oca_exit(
                 "cancellation may not be fully settled for %s", symbol,
             )
 
-    return place_oca_exit(symbol, qty, new_stop, target_price, mode)
+    # CRITICAL: cancel succeeded; if the replacement place fails, the position
+    # is naked until the next monitor cycle. Retry the placement once before
+    # giving up so transient API errors don't strand a position.
+    last_exc = None
+    for attempt in (1, 2):
+        try:
+            return place_oca_exit(symbol, qty, new_stop, target_price, mode)
+        except Exception as exc:
+            last_exc = exc
+            logger.warning(
+                "replace_oca_exit: place attempt %d failed for %s: %s",
+                attempt, symbol, exc,
+            )
+            time.sleep(0.5)
+    # Both attempts failed — surface to caller so it can re-raise/alert. The
+    # caller's existing `except` block catches and fires the NAKED POSITION
+    # telegram alert.
+    raise last_exc
 
 
 def close_position(symbol: str, mode: str = "paper"):
