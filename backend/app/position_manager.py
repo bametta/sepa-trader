@@ -321,6 +321,20 @@ def run_monday_open(db: Session, mode: str | None = None):
         logger.info("Monday open [%s]: auto_execute off — skipping.", mode)
         return
 
+    # Holiday guard: Alpaca's clock is the source of truth for market hours.
+    # Catches Monday holidays (MLK, Memorial, Labor, Presidents Day, etc.) so
+    # we don't fire BUY orders into a closed market.
+    try:
+        if not alp.get_clock(mode).is_open:
+            logger.info("Monday open [%s]: market closed (holiday?) — skipping.", mode)
+            return
+    except Exception as exc:
+        logger.warning(
+            "Monday open [%s]: market-clock check failed (%s) — skipping to be safe.",
+            mode, exc,
+        )
+        return
+
     max_pos = _effective_max_positions(db, mode)
     mv_max  = int(get_setting(db, "mv_max_slots", "3") or "3")
     pb_max  = int(get_setting(db, "pb_max_slots", "2") or "2")

@@ -451,6 +451,37 @@ async def _dm_watchdog():
     now_et   = datetime.now(_ET)
     today    = now_et.strftime("%Y-%m-%d")
 
+    # Holiday + half-day guard. The DM rotation submits MOC orders, which
+    # Alpaca rejects after the per-day MOC cutoff (~10 min before the close).
+    # On a half-day the market closes at 13:00 ET, so this 15:30 ET fire is
+    # already past the cutoff and submitting would silently fail. Use
+    # Alpaca's clock as the source of truth — handles holidays, half-days,
+    # and DST in one shot.
+    try:
+        from . import alpaca_client as alp
+        clock = alp.get_clock("paper")
+        if not clock.is_open:
+            logger.info("DM watchdog: market closed (holiday?) — skipping.")
+            return
+        next_close = clock.next_close
+        if next_close is not None:
+            # next_close is a datetime; compute remaining minutes
+            try:
+                remaining_min = (next_close - datetime.now(next_close.tzinfo)).total_seconds() / 60
+            except Exception:
+                remaining_min = None
+            if remaining_min is not None and remaining_min < 20:
+                logger.info(
+                    "DM watchdog: only %.1f min until close (likely half-day) "
+                    "— past MOC cutoff, skipping.", remaining_min,
+                )
+                return
+    except Exception as exc:
+        logger.warning(
+            "DM watchdog: market-clock check failed (%s) — skipping to be safe.", exc,
+        )
+        return
+
     db = SessionLocal()
     try:
         from sqlalchemy import text as _text
