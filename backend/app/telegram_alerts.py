@@ -64,6 +64,22 @@ async def alert_trade(action: str, symbol: str, qty: float, price: float, trigge
     )
 
 
+def alert_system_error_sync(context: str, error: str | Exception, level: str = "URGENT") -> bool:
+    """Sync system-failure alert. Safe to call from any sync code path
+    (scheduler jobs, monitor loop, screener except blocks).
+
+    `context` is a short label like "Minervini screener" or "Monitor loop".
+    `error` may be a string or Exception; rendered with type prefix when Exception.
+    """
+    if isinstance(error, Exception):
+        body = f"{type(error).__name__}: {error}"
+    else:
+        body = str(error)
+    body = body[:600]
+    msg = f"*SYSTEM ERROR*\n\nContext: `{context}`\n\n```\n{body}\n```"
+    return send_sync(msg, level=level)
+
+
 async def alert_monitor_summary(portfolio: float, day_pnl: float, positions: int, mode: str, interval_minutes: int = 30):
     pnl_sign = "+" if day_pnl >= 0 else ""
     if interval_minutes < 60:

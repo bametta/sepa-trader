@@ -387,6 +387,14 @@ def _ensure_exit_orders(
                 )
             except Exception as exc:
                 logger.error("Exit guard: split OCO placement failed for %s: %s", sym, exc)
+                try:
+                    from . import telegram_alerts as tg
+                    tg.alert_system_error_sync(
+                        f"NAKED POSITION [{mode}] {sym} — split OCO placement failed",
+                        exc,
+                    )
+                except Exception:
+                    pass
         else:
             try:
                 alp.place_oca_exit(sym, qty, stop, target, mode)
@@ -396,6 +404,14 @@ def _ensure_exit_orders(
                 )
             except Exception as exc:
                 logger.error("Exit guard: failed to place OCO for %s: %s", sym, exc)
+                try:
+                    from . import telegram_alerts as tg
+                    tg.alert_system_error_sync(
+                        f"NAKED POSITION [{mode}] {sym} — OCO placement failed",
+                        exc,
+                    )
+                except Exception:
+                    pass
 
 
 # ── Tape context helper ───────────────────────────────────────────────────────
@@ -562,6 +578,11 @@ async def run_monitor(db: Session, user_id: int | None = None, mode: str | None 
 
             except Exception as exc:
                 logger.error("Stop management cycle failed: %s", exc)
+                try:
+                    from . import telegram_alerts as tg
+                    tg.alert_system_error_sync(f"Monitor stop-mgmt cycle [{mode}]", exc)
+                except Exception:
+                    pass
 
         # Step 3: Signal evaluation
         stage2_lost   = []
@@ -656,6 +677,12 @@ async def run_monitor(db: Session, user_id: int | None = None, mode: str | None 
         }
 
     except Exception as exc:
+        logger.exception("Monitor [%s] top-level failure", mode)
+        try:
+            from . import telegram_alerts as tg
+            tg.alert_system_error_sync(f"Monitor crashed [{mode}]", exc)
+        except Exception:
+            pass
         return {"status": "error", "error": str(exc)}
 
 

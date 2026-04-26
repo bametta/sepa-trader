@@ -132,6 +132,11 @@ async def _monday_open_job():
             run_monday_open(db, mode=mode)
         except Exception as exc:
             logger.error("Monday open [%s] failed: %s", mode, exc)
+            try:
+                from . import telegram_alerts as tg
+                tg.alert_system_error_sync(f"Monday open [{mode}]", exc)
+            except Exception:
+                pass
         finally:
             db.close()
 
@@ -214,6 +219,11 @@ async def _screener_watchdog():
             set_setting(db3, "screener_error",  str(exc)[:500])
         finally:
             db3.close()
+        try:
+            from . import telegram_alerts as tg
+            tg.alert_system_error_sync("Minervini screener (scheduled)", exc)
+        except Exception:
+            pass
     finally:
         db2.close()
 
@@ -288,6 +298,11 @@ async def _pb_screener_watchdog():
             set_setting(db3, "screener_error",  str(exc)[:500])
         finally:
             db3.close()
+        try:
+            from . import telegram_alerts as tg
+            tg.alert_system_error_sync("Pullback screener (scheduled)", exc)
+        except Exception:
+            pass
     finally:
         db2.close()
 
@@ -311,6 +326,11 @@ async def _run_screener_for_mode(uid: int, mode: str) -> int:
         return len(results)
     except Exception as exc:
         logger.error("Market-close screener [%s] failed: %s", mode, exc)
+        try:
+            from . import telegram_alerts as tg
+            tg.alert_system_error_sync(f"Market-close screener [{mode}]", exc)
+        except Exception:
+            pass
         return 0
     finally:
         db.close()
