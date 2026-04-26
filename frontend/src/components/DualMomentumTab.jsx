@@ -1,7 +1,7 @@
 /**
  * Dual Momentum (GEM) Strategy Tab — polished UI
  */
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import {
   fetchMarketEnvironment,
@@ -464,7 +464,11 @@ function StrategySettings({ config, onSave, saving, globalMode = 'paper', onCopy
   const [open, setOpen] = useState(false)
   const [form, setForm] = useState(null)
 
-  if (config && !form) {
+  // Re-hydrate form whenever the active mode or backing config changes,
+  // so editing in paper then switching to live shows the *live* values
+  // (and saving in live writes the live row, not stale paper values).
+  useEffect(() => {
+    if (!config) return
     setForm({
       is_active:              config.is_active                       || false,
       auto_execute:           config.auto_execute                    || false,
@@ -478,7 +482,7 @@ function StrategySettings({ config, onSave, saving, globalMode = 'paper', onCopy
       alpaca_live_key:        config.alpaca_live_key                 || '',
       alpaca_live_secret:     config.alpaca_live_secret              || '',
     })
-  }
+  }, [globalMode, config])
 
   const set = (k, v) => setForm(f => ({ ...f, [k]: v }))
   const handleSave = () => form && onSave({
