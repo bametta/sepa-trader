@@ -762,9 +762,39 @@ async def run_monitor(db: Session, user_id: int | None = None, mode: str | None 
 
             results.append({"sym": sym, "signal": signal})
 
+        # Daily-drawdown kill-switch — block all NEW entries (slot fill +
+        # watchlist) when day_pnl breaches the configured threshold. Existing
+        # exits/trailing stops still run; we only stop adding risk.
+        # Setting `daily_drawdown_halt_pct` (default 5.0); 0 disables the check.
+        entries_halted = False
+        try:
+            halt_pct = float(get_setting(db, "daily_drawdown_halt_pct", "5.0") or "0")
+        except (TypeError, ValueError):
+            halt_pct = 5.0
+        last_eq = float(getattr(acct, "last_equity", 0) or 0)
+        if halt_pct > 0 and last_eq > 0:
+            day_pnl_pct = day_pnl / last_eq * 100
+            if day_pnl_pct <= -halt_pct:
+                entries_halted = True
+                logger.warning(
+                    "DAILY DRAWDOWN HALT [%s]: day_pnl=%.2f%% breached -%.2f%% threshold — "
+                    "blocking new entries (exits still run).",
+                    mode, day_pnl_pct, halt_pct,
+                )
+                try:
+                    from . import telegram_alerts as tg
+                    tg.send_sync(
+                        f"*DAILY DRAWDOWN HALT* [{mode.upper()}]\n\n"
+                        f"Day P&L: `{day_pnl_pct:.2f}%` (threshold `-{halt_pct:.2f}%`)\n"
+                        f"New entries blocked for the rest of the session. Exits still run.",
+                        level="URGENT",
+                    )
+                except Exception:
+                    pass
+
         # Step 4: Weekly-plan slot fill — buys PENDING picks when capacity exists.
         # This is the primary entry mechanism (screener picks → weekly_plan → orders).
-        if auto_execute and market_open:
+        if auto_execute and market_open and not entries_halted:
             try:
                 from .position_manager import fill_open_slots
                 fill_open_slots(
@@ -783,7 +813,7 @@ async def run_monitor(db: Session, user_id: int | None = None, mode: str | None 
         watchlist    = _get_watchlist(db, user_id)
         max_pos      = _effective_max_positions(db, mode)
 
-        if auto_execute and market_open and len(positions) < max_pos:
+        if auto_execute and market_open and not entries_halted and len(positions) < max_pos:
             for sym in watchlist:
                 if sym in held_symbols:
                     continue

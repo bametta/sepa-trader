@@ -47,8 +47,12 @@ async def _run_monitor_for_mode(admin_uid: int | None, mode: str) -> None:
                 result.get("portfolio", 0),
                 len(result.get("results", [])),
             )
-        from .position_manager import check_post_close
+        from .position_manager import check_post_close, reconcile_db_vs_alpaca
         check_post_close(db, mode=mode)
+        try:
+            reconcile_db_vs_alpaca(db, mode=mode)
+        except Exception as exc:
+            logger.error("Watchdog [%s]: reconciliation failed — %s", mode, exc)
     except Exception as exc:
         logger.error("Watchdog [%s]: monitor failed — %s", mode, exc, exc_info=True)
     finally:

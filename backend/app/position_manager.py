@@ -1152,3 +1152,90 @@ def fill_open_slots(
 
         except Exception as exc:
             logger.error("fill_open_slots: buy failed for %s: %s", sym, exc)
+
+
+# ── DB ↔ Alpaca position reconciliation ──────────────────────────────────────
+
+_RECONCILE_LAST_ALERT: dict[str, float] = {}
+_RECONCILE_COOLDOWN_SEC = 3600  # don't re-alert the same drift more than 1×/hour
+
+
+def reconcile_db_vs_alpaca(db: Session, mode: str) -> dict:
+    """Compare live Alpaca positions against the DB's view of intended state.
+
+    Source of DB truth: BUY trade_log entries from the past 30 days that have
+    no later SELL entry for the same symbol+mode. This catches:
+      • symbol held in Alpaca but never logged (manual order, missed log)
+      • symbol logged as bought but missing in Alpaca (SELL leg lost, manual close)
+
+    Quantity drift is intentionally NOT alerted — _reconcile_partial_fills
+    handles that. We only flag set-membership mismatches.
+
+    Alerts via Telegram URGENT, deduped by (mode, drift-signature) for
+    `_RECONCILE_COOLDOWN_SEC` so a persistent drift doesn't spam the channel.
+    Returns a dict with `drift`, `missing_in_alpaca`, `unexpected_in_alpaca`.
+    """
+    import time
+    from . import telegram_alerts as tg
+
+    try:
+        alpaca_syms = {p.symbol for p in alp.get_positions(mode)}
+    except Exception as exc:
+        logger.error("reconcile_db_vs_alpaca [%s]: alpaca fetch failed: %s", mode, exc)
+        return {"drift": False, "error": str(exc)}
+
+    try:
+        rows = db.execute(
+            text("""
+                SELECT symbol
+                FROM trade_log t
+                WHERE mode = :mode
+                  AND action = 'BUY'
+                  AND created_at >= NOW() - INTERVAL '30 days'
+                  AND NOT EXISTS (
+                      SELECT 1 FROM trade_log s
+                      WHERE s.symbol = t.symbol
+                        AND s.mode   = t.mode
+                        AND s.action = 'SELL'
+                        AND s.created_at > t.created_at
+                  )
+            """),
+            {"mode": mode},
+        ).fetchall()
+        db_syms = {r[0] for r in rows}
+    except Exception as exc:
+        logger.error("reconcile_db_vs_alpaca [%s]: db fetch failed: %s", mode, exc)
+        return {"drift": False, "error": str(exc)}
+
+    missing_in_alpaca   = sorted(db_syms - alpaca_syms)   # DB thinks open, broker says no
+    unexpected_in_alpaca = sorted(alpaca_syms - db_syms)  # broker holds, DB has no record
+
+    if not missing_in_alpaca and not unexpected_in_alpaca:
+        return {"drift": False, "missing_in_alpaca": [], "unexpected_in_alpaca": []}
+
+    signature = f"{mode}|{','.join(missing_in_alpaca)}|{','.join(unexpected_in_alpaca)}"
+    now = time.time()
+    last = _RECONCILE_LAST_ALERT.get(signature, 0)
+    if now - last >= _RECONCILE_COOLDOWN_SEC:
+        _RECONCILE_LAST_ALERT[signature] = now
+        body_lines = [f"*POSITION DRIFT* [{mode.upper()}]", ""]
+        if missing_in_alpaca:
+            body_lines.append(f"DB-tracked but not in Alpaca: `{', '.join(missing_in_alpaca)}`")
+        if unexpected_in_alpaca:
+            body_lines.append(f"Alpaca holds but no DB record: `{', '.join(unexpected_in_alpaca)}`")
+        body_lines.append("")
+        body_lines.append("Investigate before next entry cycle.")
+        try:
+            tg.send_sync("\n".join(body_lines), level="URGENT")
+        except Exception:
+            pass
+
+    logger.warning(
+        "reconcile_db_vs_alpaca [%s]: drift detected — missing_in_alpaca=%s unexpected_in_alpaca=%s",
+        mode, missing_in_alpaca, unexpected_in_alpaca,
+    )
+    return {
+        "drift": True,
+        "missing_in_alpaca":   missing_in_alpaca,
+        "unexpected_in_alpaca": unexpected_in_alpaca,
+    }
