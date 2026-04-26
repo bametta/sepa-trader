@@ -2,19 +2,39 @@ import httpx
 from .config import settings
 
 
-async def send(message: str, level: str = "INFO") -> bool:
+def _build_request(message: str, level: str) -> tuple[str, dict] | None:
     if not settings.telegram_bot_token or not settings.telegram_chat_id:
-        return False
-
+        return None
     emoji = {"URGENT": "🚨", "OPPORTUNITY": "🟢", "INFO": "ℹ️"}.get(level, "📊")
     text  = f"{emoji} *SEPA Monitor*\n\n{message}"
+    url   = f"https://api.telegram.org/bot{settings.telegram_bot_token}/sendMessage"
+    data  = {"chat_id": settings.telegram_chat_id, "text": text, "parse_mode": "Markdown"}
+    return url, data
 
-    url  = f"https://api.telegram.org/bot{settings.telegram_bot_token}/sendMessage"
-    data = {"chat_id": settings.telegram_chat_id, "text": text, "parse_mode": "Markdown"}
 
+async def send(message: str, level: str = "INFO") -> bool:
+    req = _build_request(message, level)
+    if req is None:
+        return False
+    url, data = req
     try:
         async with httpx.AsyncClient(timeout=10) as client:
             r = await client.post(url, json=data)
+            return r.status_code == 200
+    except Exception:
+        return False
+
+
+def send_sync(message: str, level: str = "INFO") -> bool:
+    """Synchronous variant — safe to call from inside async functions where
+    asyncio.run() would deadlock against the running loop."""
+    req = _build_request(message, level)
+    if req is None:
+        return False
+    url, data = req
+    try:
+        with httpx.Client(timeout=10) as client:
+            r = client.post(url, json=data)
             return r.status_code == 200
     except Exception:
         return False

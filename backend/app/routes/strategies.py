@@ -503,60 +503,108 @@ def update_dm_config(
 
 # ── Execution helpers ─────────────────────────────────────────────────────────
 
+_DM_UNIVERSE = ("SPY", "EFA", "AGG", "BIL")
+
+
+def _moc_eligible_now() -> bool:
+    """True when current ET time is within Alpaca's MOC submission window
+    (weekday, 09:30 ≤ now < 15:50). Outside this window, MOC orders are rejected.
+    """
+    import pytz
+    from datetime import datetime, time
+    now_et = datetime.now(pytz.timezone("America/New_York"))
+    if now_et.weekday() > 4:
+        return False
+    return time(9, 30) <= now_et.time() < time(15, 50)
+
+
 def _execute_signal(db: Session, user_id: int, strategy_name: str,
                     symbol: str, mode: str):
     """
-    Close any existing strategy position and open the new one.
-    Uses full-account-value sizing (single-instrument rotation strategy).
+    Rotation execution for the Dual Momentum strategy.
+
+    Sizing uses *equity* (cash + position value) so the rotation is correctly
+    sized whether or not prior positions have settled. When fired during RTH
+    (≤ 15:50 ET) all sells AND the buy go in as Market-on-Close orders so they
+    fill simultaneously at the official close price — this eliminates the
+    overnight gap that an after-hours market order would create.
+
+    Safety: if any required sell order is rejected, the buy is skipped to
+    prevent ending up with both the old and new ETF held at once.
     """
     from alpaca.trading.requests import MarketOrderRequest
     from alpaca.trading.enums    import OrderSide, TimeInForce
+    from .. import telegram_alerts as tg
 
     is_admin = db.execute(
         text("SELECT role FROM users WHERE id = :id"), {"id": user_id}
     ).scalar() == "admin"
     client = _resolve_strategy_alpaca_client(db, user_id, strategy_name, mode, is_admin)
 
-    # Close all current positions in SPY/EFA/AGG/BIL that aren't the target
-    positions = client.get_all_positions()
-    for p in positions:
-        if p.symbol in ("SPY", "EFA", "AGG", "BIL") and p.symbol != symbol:
-            try:
-                client.close_position(p.symbol)
-                logger.info("execute_signal: closed %s [%s]", p.symbol, mode)
-            except Exception as exc:
-                logger.warning("execute_signal: could not close %s: %s", p.symbol, exc)
+    use_moc = _moc_eligible_now()
+    tif     = TimeInForce.CLS if use_moc else TimeInForce.DAY
+    tif_label = "MOC" if use_moc else "DAY"
 
-    # Check if already holding the target
-    already_holding = any(p.symbol == symbol for p in positions)
-    if already_holding:
-        logger.info("execute_signal: already holding %s — no action needed", symbol)
+    positions      = client.get_all_positions()
+    held_in_dm     = {p.symbol: float(p.qty) for p in positions if p.symbol in _DM_UNIVERSE}
+    already_held   = held_in_dm.get(symbol, 0.0)
+
+    # ── 1. Submit sell orders for every DM holding that isn't the target ──
+    sell_failures: list[str] = []
+    for sym, qty_held in held_in_dm.items():
+        if sym == symbol or qty_held <= 0:
+            continue
+        try:
+            req = MarketOrderRequest(
+                symbol=sym, qty=int(qty_held), side=OrderSide.SELL, time_in_force=tif,
+            )
+            client.submit_order(req)
+            logger.info("execute_signal: submitted SELL %d %s [%s/%s]", int(qty_held), sym, mode, tif_label)
+        except Exception as exc:
+            sell_failures.append(sym)
+            logger.error("execute_signal: SELL %s FAILED — %s", sym, exc)
+
+    # If any sell failed, abort the buy — better to do nothing than double up
+    if sell_failures:
+        msg = (f"DM rotation HALTED [{mode}] — sell orders failed for "
+               f"{', '.join(sell_failures)}. Target {symbol} NOT bought to avoid "
+               f"holding multiple ETFs. Manual intervention required.")
+        logger.error(msg)
+        try:
+            tg.send_sync(msg, level="URGENT")
+        except Exception:
+            pass
         return
 
-    # Size: use all available buying power (rotation strategy — 100% allocation)
-    account = client.get_account()
-    bp      = _sf(account.buying_power, 0.0)
-    # Get current price for the target via direct Yahoo Finance API
+    # ── 2. Size the buy from equity (the rotation total), not buying_power ──
+    account          = client.get_account()
+    equity           = _sf(account.equity, 0.0) or _sf(account.portfolio_value, 0.0)
+    cash             = _sf(account.cash, 0.0)
+    buying_power     = _sf(account.buying_power, 0.0)
+
     from ..strategies.yf_client import get_current_price
     price = get_current_price(symbol)
-    qty   = int(bp * 0.98 / price)  # 98% — leave a small buffer
-
     if price <= 0:
         raise HTTPException(502, f"Could not fetch current price for {symbol}")
-    if qty < 1:
-        logger.warning("execute_signal: insufficient buying power for %s (bp=$%.0f, price=$%.2f)",
-                       symbol, bp, price)
+
+    target_qty = int(equity * 0.98 / price)        # 98% to leave a small slippage buffer
+    buy_qty    = max(0, target_qty - int(already_held))
+
+    if buy_qty < 1:
+        logger.info(
+            "execute_signal: no buy needed for %s (target=%d already_held=%d equity=$%.0f)",
+            symbol, target_qty, int(already_held), equity,
+        )
         return
 
-    # Pre-trade AI gate — DM is a rotation strategy so stop/target are 0 (R:R not applicable).
-    # Gate still enforces: no API key → HOLD, buying-power check, tape context warnings.
+    # ── 3. Pre-trade AI gate (advisory, can block but never override GEM) ──
     try:
         from ..claude_analyst import pre_trade_analysis, log_pre_trade
         gate = pre_trade_analysis(
-            db=db, symbol=symbol, side="BUY", qty=qty,
+            db=db, symbol=symbol, side="BUY", qty=buy_qty,
             entry_price=price, stop_price=0.0, target_price=0.0,
-            trigger="DM_AUTO_EXECUTE", portfolio_value=_sf(account.portfolio_value, 0.0),
-            cash=_sf(account.cash, 0.0), buying_power=bp, mode=mode,
+            trigger="DM_AUTO_EXECUTE", portfolio_value=equity,
+            cash=cash, buying_power=buying_power, mode=mode,
             user_id=user_id,
         )
         log_pre_trade(db, symbol, "DM_AUTO_EXECUTE",
@@ -569,14 +617,31 @@ def _execute_signal(db: Session, user_id: int, strategy_name: str,
     except Exception as gate_exc:
         logger.error("DM pre-trade gate error — proceeding: %s", gate_exc)
 
-    req = MarketOrderRequest(
-        symbol=symbol,
-        qty=qty,
-        side=OrderSide.BUY,
-        time_in_force=TimeInForce.DAY,
-    )
-    client.submit_order(req)
-    logger.info("execute_signal: bought %d shares of %s [%s]", qty, symbol, mode)
+    # ── 4. Submit the buy ──
+    try:
+        req = MarketOrderRequest(
+            symbol=symbol, qty=buy_qty, side=OrderSide.BUY, time_in_force=tif,
+        )
+        client.submit_order(req)
+        logger.info(
+            "execute_signal: submitted BUY %d %s [%s/%s] (target=%d already=%d)",
+            buy_qty, symbol, mode, tif_label, target_qty, int(already_held),
+        )
+        if not use_moc:
+            logger.warning(
+                "DM executed OUTSIDE the MOC window — order will fill at next "
+                "open, exposing position to overnight gap risk."
+            )
+    except Exception as exc:
+        msg = (f"DM BUY FAILED [{mode}] for {symbol} qty={buy_qty}: {exc}\n"
+               f"Sell orders for {list(held_in_dm.keys())} already submitted — "
+               f"account may be in cash. Manual intervention required.")
+        logger.error(msg)
+        try:
+            tg.send_sync(msg, level="URGENT")
+        except Exception:
+            pass
+        raise
 
 
 def _execute_signal_bg(user_id: int, strategy_name: str, symbol: str, mode: str):

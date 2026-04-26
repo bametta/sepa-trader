@@ -626,11 +626,13 @@ def start_scheduler():
         replace_existing=True,
     )
 
-    # DM watchdog — fires daily at 4:30 PM ET on weekdays.
-    # Handles scheduled frequency (monthly/biweekly/weekly) + VIX/drawdown circuit breakers.
+    # DM watchdog — fires daily at 3:30 PM ET on weekdays.
+    # 3:30 PM ET gives ~20 min for AI analysis + execution before Alpaca's
+    # 3:50 PM ET MOC cutoff, so rotation orders fill at the official close
+    # instead of leaking into the next-day open with overnight gap risk.
     scheduler.add_job(
         _dm_watchdog,
-        CronTrigger(day_of_week="mon-fri", hour=16, minute=30, timezone="America/New_York"),
+        CronTrigger(day_of_week="mon-fri", hour=15, minute=30, timezone="America/New_York"),
         id="dm_watchdog",
         replace_existing=True,
     )
