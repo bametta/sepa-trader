@@ -576,14 +576,15 @@ def copy_dm_config(
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """Copy non-credential DM settings from one mode to the other.
-    Use after validating a config in paper to promote it to live.
-    Credentials are unaffected (already shared across mode rows)."""
+    """Copy DM strategy parameters (settings JSONB) from one mode to the other.
+    The is_active and auto_execute toggles are NEVER copied — those must be
+    enabled deliberately per mode to prevent accidentally arming live trading.
+    Credentials are unaffected (stored in separate paper/live columns)."""
     if src not in ("paper", "live") or dst not in ("paper", "live") or src == dst:
         raise HTTPException(400, "src and dst must be different and one of paper/live")
     uid = current_user["id"]
     src_row = db.execute(
-        text("SELECT is_active, auto_execute, settings FROM strategy_config "
+        text("SELECT settings FROM strategy_config "
              "WHERE user_id = :uid AND strategy_name = :name AND trading_mode = :mode"),
         {"uid": uid, "name": STRATEGY_DM, "mode": src},
     ).fetchone()
@@ -592,17 +593,13 @@ def copy_dm_config(
     db.execute(
         text("""
             INSERT INTO strategy_config (user_id, strategy_name, trading_mode, is_active, auto_execute, settings)
-            VALUES (:uid, :name, :mode, :is_active, :auto_execute, CAST(:settings AS jsonb))
+            VALUES (:uid, :name, :mode, FALSE, FALSE, CAST(:settings AS jsonb))
             ON CONFLICT (user_id, strategy_name, trading_mode) DO UPDATE
-              SET is_active    = EXCLUDED.is_active,
-                  auto_execute = EXCLUDED.auto_execute,
-                  settings     = EXCLUDED.settings
+              SET settings = EXCLUDED.settings
         """),
         {
             "uid": uid, "name": STRATEGY_DM, "mode": dst,
-            "is_active":    src_row[0],
-            "auto_execute": src_row[1],
-            "settings":     json.dumps(src_row[2]) if not isinstance(src_row[2], str) else src_row[2],
+            "settings": json.dumps(src_row[0]) if not isinstance(src_row[0], str) else src_row[0],
         },
     )
     db.commit()
