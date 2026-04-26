@@ -295,19 +295,38 @@ def run_rs_screener(
     logger.info("RS screener: excluded TV sectors: %s", excluded_tv)
 
     # ── Pass 2: Local scoring and filtering ───────────────────────────────────
+    # NOTE: Re-apply ALL hard filters locally — fetch_rs_universe (fast-path
+    # caller) deliberately omits price_max / stage2 / extension to share its
+    # universe with other screeners, so we cannot rely on the server-side
+    # filter list having enforced them.
     scored: list[dict] = []
     drop_counts = {"exchange": 0, "no_sector": 0, "excluded_sector": 0,
+                   "price_min": 0, "price_max": 0, "avg_vol": 0, "market_cap": 0,
                    "extension": 0, "stage2_emas": 0, "low_rs": 0}
 
     for sym, v in tv_data.items():
-        price  = v.get("close")                or 0.0
-        ema50  = v.get("EMA50")                or 0.0
-        ema200 = v.get("EMA200")               or 0.0
-        sector = (v.get("sector") or "").strip()
-        exch   = (v.get("exchange") or "").strip().upper()
+        price   = v.get("close")                  or 0.0
+        ema50   = v.get("EMA50")                  or 0.0
+        ema200  = v.get("EMA200")                 or 0.0
+        avg_vol = v.get("average_volume_30d_calc") or 0.0
+        mcap    = v.get("market_cap_basic")       or 0.0
+        sector  = (v.get("sector") or "").strip()
+        exch    = (v.get("exchange") or "").strip().upper()
 
         if allowed_exchanges and exch not in allowed_exchanges:
             drop_counts["exchange"] += 1
+            continue
+        if cfg["price_min"] > 0 and price < cfg["price_min"]:
+            drop_counts["price_min"] += 1
+            continue
+        if cfg["price_max"] > 0 and price > cfg["price_max"]:
+            drop_counts["price_max"] += 1
+            continue
+        if cfg["avg_vol_min"] > 0 and avg_vol < cfg["avg_vol_min"]:
+            drop_counts["avg_vol"] += 1
+            continue
+        if cfg["market_cap_min"] > 0 and mcap < cfg["market_cap_min"]:
+            drop_counts["market_cap"] += 1
             continue
         if excluded_tv:
             if not sector:

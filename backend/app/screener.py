@@ -116,7 +116,10 @@ def _fetch_market_universe(
             sector   = (row["d"][1] or "").strip()
         except (KeyError, IndexError, TypeError):
             continue
-        if excluded_sectors and sector in excluded_sectors:
+        # excluded_sectors is a set of LOWERCASE TV sector names (resolved via
+        # _rs_resolve). TV's `sector` column comes back capitalised, so we must
+        # lower-case it before the membership check or the filter silently fails.
+        if excluded_sectors and sector.lower() in excluded_sectors:
             skipped_sector += 1
             continue
         sym = full_sym.split(":")[-1]

@@ -107,10 +107,21 @@ _TV_HEADERS = {
 
 def get_pb_settings(db: Session, user_id: int) -> dict:
     """Load all pullback screener settings with defaults."""
+    from .rs_screener import _resolve_excluded as _rs_resolve
+
     def _s(key, default):
         return get_user_setting(db, key, str(default), user_id)
 
+    excluded_raw = [
+        s.strip()
+        for s in _s("pb_excluded_sectors", DEFAULT_EXCLUDED_SECTORS).split(",")
+        if s.strip()
+    ]
+
     return {
+        # Set of LOWERCASE TV sector names — used by _local_refinement for the
+        # actual exclusion check. Settings UI accepts either GICS or TV names.
+        "_resolved_excluded": _rs_resolve(excluded_raw),
         "price_min":           float(_s("pb_price_min",           10.0)),
         "price_max":           float(_s("pb_price_max",           200.0)),
         # EMA ladder — each step is independently togglable
@@ -146,12 +157,9 @@ def get_pb_settings(db: Session, user_id: int) -> dict:
             for e in _s("pb_exchanges", "NYSE,NASDAQ").split(",")
             if e.strip()
         ],
-        # Sector exclusion — per-strategy, comma-separated TV sector names.
-        "excluded_sectors": [
-            s.strip()
-            for s in _s("pb_excluded_sectors", DEFAULT_EXCLUDED_SECTORS).split(",")
-            if s.strip()
-        ],
+        # Raw user-entered exclusion list (kept for display / rationale).
+        # _resolved_excluded above is what _local_refinement actually checks.
+        "excluded_sectors": excluded_raw,
         # Minimum YoY revenue growth % (0 = disabled)
         "min_revenue_growth": float(_s("pb_min_revenue_growth", "0")),
     }
@@ -455,9 +463,14 @@ def _local_refinement(sym: str, v: dict, cfg: dict) -> dict | None:
     if w52_high and abs(pct_from_52wh) > cfg["52w_high_pct_max"]:
         return None
 
-    # Sector exclusion — block commodity/defensive/low-growth sectors
+    # Sector exclusion — block commodity/defensive/low-growth sectors.
+    # Settings can use either GICS names ("Energy", "Consumer Defensive") or
+    # TV names ("Energy Minerals", "Consumer Non-Durables"). _resolved_excluded
+    # (precomputed in cfg) is a set of lowercase TV sector names; the TV column
+    # is capitalised so we must lower-case before comparing.
     sector = (v.get("sector") or "").strip()
-    if cfg.get("excluded_sectors") and sector and sector in cfg["excluded_sectors"]:
+    excluded_tv = cfg.get("_resolved_excluded") or set()
+    if excluded_tv and sector and sector.lower() in excluded_tv:
         logger.debug("Pullback: %s skipped — excluded sector (%s)", sym, sector)
         return None
 
