@@ -515,6 +515,33 @@ def check_post_close(db: Session, mode: str | None = None):
         except Exception as exc:
             logger.error("[%s] failed to log SELL for closed %s: %s", mode, sym, exc)
 
+    # Same-day re-buy guard: stamp the weekly_plan row for every just-closed
+    # symbol as EXECUTED so the AI analysis (claude_analyst.analyze_picks_structured
+    # filters to status=PENDING) and any rescreen later today won't pick the
+    # same name back up. Scoped to the latest week_start in this mode so we
+    # don't mutate prior weeks' plans. Idempotent — already-EXECUTED rows are
+    # untouched. The 8-hour sold_recently cooldown in fill_open_slots remains
+    # as a second line of defence covering manual closes that don't match a
+    # plan row at all.
+    if closed:
+        try:
+            db.execute(
+                text("""
+                    UPDATE weekly_plan SET status = 'EXECUTED'
+                    WHERE week_start = (SELECT MAX(week_start) FROM weekly_plan WHERE mode = :mode)
+                      AND mode   = :mode
+                      AND symbol IN :syms
+                      AND status = 'PENDING'
+                """),
+                {"mode": mode, "syms": tuple(closed)},
+            )
+            db.commit()
+        except Exception as exc:
+            logger.warning(
+                "[%s] same-day re-buy guard: failed to mark closed plan rows EXECUTED: %s",
+                mode, exc,
+            )
+
     # Resolve AI API key: prefer user-setting 'ai_api_key', fall back to legacy 'claude_api_key'
     try:
         from sqlalchemy import text as _t

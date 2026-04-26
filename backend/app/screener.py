@@ -575,15 +575,20 @@ def _save_plan(db: Session, rows: list[dict], week_start: str, mode: str, user_i
         ).fetchall()
     }
 
-    # Also treat anything bought today (in trade_log) as executed
+    # Also treat anything bought OR sold today (in trade_log) as executed.
+    # SELL-today is included so a position that closed earlier today (e.g.
+    # bracket OCO) doesn't get re-emitted as a fresh PENDING pick when the
+    # screener runs again later in the same session — the same-day re-buy
+    # guard in position_manager.check_post_close already marks the plan row
+    # EXECUTED, but a mid-day rescreen would otherwise blow that away here.
     try:
-        bought_today = {r[0] for r in db.execute(
+        traded_today = {r[0] for r in db.execute(
             text("""SELECT DISTINCT symbol FROM trade_log
-                    WHERE action = 'BUY' AND mode = :mode
+                    WHERE action IN ('BUY', 'SELL') AND mode = :mode
                     AND created_at >= CURRENT_DATE"""),
             {"mode": mode},
         ).fetchall()}
-        already_executed |= bought_today
+        already_executed |= traded_today
     except Exception:
         pass
 
