@@ -830,14 +830,28 @@ async def run_monitor(db: Session, user_id: int | None = None, mode: str | None 
                         if not _gate(db, sym, qty, price, stop, target, "BREAKOUT", mode, user_id=user_id):
                             results.append({"sym": sym, "action": "BLOCKED_BY_AI"})
                             continue
+                        order_placed = False
                         try:
                             from .position_manager import _place_entry as _pm_place_entry
                             order_desc = _pm_place_entry(db, sym, qty, price, stop, target, "BREAKOUT", mode, "minervini", target2=target2)
+                            order_placed = True
                             logger.info("Watchlist buy %s qty=%.0f — %s [%s]", sym, qty, order_desc, mode)
                             _log_trade(db, sym, "BUY", qty, price, "BREAKOUT", mode)
                             new_breakouts.append(sym)
                             held_symbols.add(sym)
                         except Exception as e:
+                            if order_placed:
+                                logger.error(
+                                    "Watchlist buy %s [%s]: ORDER PLACED but trade_log failed: %s",
+                                    sym, mode, e,
+                                )
+                                try:
+                                    tg.alert_system_error_sync(
+                                        f"UNTRACKED POSITION [{mode}] {sym} qty={qty} — watchlist order placed, log failed",
+                                        e, level="URGENT",
+                                    )
+                                except Exception:
+                                    pass
                             results.append({"sym": sym, "action": "BUY_FAILED", "error": str(e)})
 
         if stage2_lost:

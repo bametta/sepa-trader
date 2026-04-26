@@ -345,7 +345,30 @@ def replace_split_oca_exits(
         if not cleared:
             logger.warning("replace_split_oca_exits: cancellation timeout for %s", symbol)
     place_oca_exit(symbol, qty1, new_stop, t1_price, mode)
-    place_oca_exit(symbol, qty2, new_stop, t2_price, mode)
+    try:
+        place_oca_exit(symbol, qty2, new_stop, t2_price, mode)
+    except Exception as exc:
+        # Second leg failed — qty2 is now naked (qty1 has its OCO, qty2 does not).
+        # Retry once before raising so a transient API blip doesn't leave the
+        # position partially unhedged.
+        logger.error("replace_split_oca_exits: second leg failed for %s: %s — retrying", symbol, exc)
+        time.sleep(0.5)
+        try:
+            place_oca_exit(symbol, qty2, new_stop, t2_price, mode)
+        except Exception as exc2:
+            logger.error(
+                "replace_split_oca_exits: second leg retry failed for %s: %s — qty2 NAKED",
+                symbol, exc2,
+            )
+            try:
+                from . import telegram_alerts as tg
+                tg.alert_system_error_sync(
+                    f"NAKED LEG [{mode}] {symbol} qty2={qty2} — split-OCO second leg failed twice",
+                    exc2, level="URGENT",
+                )
+            except Exception:
+                pass
+            raise
 
 
 def cancel_symbol_exit_orders(symbol: str, mode: str = "paper") -> list[str]:

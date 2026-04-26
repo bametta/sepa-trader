@@ -1110,8 +1110,10 @@ def fill_open_slots(
             logger.info("fill_open_slots: %s blocked by pre-trade gate.", sym)
             continue
 
+        order_placed = False
         try:
             order_desc = _place_entry(db, sym, qty, price, stop, target, f"FILL_{signal}", mode, stype, target2=target2)
+            order_placed = True
             logger.info(
                 "fill_open_slots [%s]: opened %s qty=%.0f signal=%s — %s",
                 mode, sym, qty, signal, order_desc,
@@ -1151,7 +1153,29 @@ def fill_open_slots(
                 break
 
         except Exception as exc:
-            logger.error("fill_open_slots: buy failed for %s: %s", sym, exc)
+            if order_placed:
+                # Alpaca holds a real position but the DB write failed —
+                # critical: it will be unmanaged (no weekly_plan row to drive
+                # exits/sizing). Reconciliation will catch it next cycle, but
+                # alert immediately so the operator can intervene.
+                logger.error(
+                    "fill_open_slots: ORDER PLACED but DB write failed for %s [%s]: %s",
+                    sym, mode, exc,
+                )
+                try:
+                    db.rollback()
+                except Exception:
+                    pass
+                try:
+                    from . import telegram_alerts as tg
+                    tg.alert_system_error_sync(
+                        f"UNTRACKED POSITION [{mode}] {sym} qty={qty} — order placed, DB log failed",
+                        exc, level="URGENT",
+                    )
+                except Exception:
+                    pass
+            else:
+                logger.error("fill_open_slots: buy failed for %s: %s", sym, exc)
 
 
 # ── DB ↔ Alpaca position reconciliation ──────────────────────────────────────
