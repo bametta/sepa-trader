@@ -61,7 +61,12 @@ _TV_HEADERS = {
 # Mapping from common GICS names (used in UI/settings) → TV sector names.
 # Allows users to type familiar names while still matching TV's responses.
 _GICS_TO_TV: dict[str, set[str]] = {
-    "energy":              {"energy minerals", "industrial services"},  # drillers/oilfield svcs
+    # NOTE: "industrial services" deliberately NOT included under "energy" —
+    # it would also strip legitimate industrial-services firms (consulting,
+    # staffing, etc.) when a user excludes Energy. Drillers/oilfield-services
+    # are caught separately via _DEFAULT_EXCLUDED_SECTORS so the default
+    # exclusion still works without GICS-mapping collateral damage.
+    "energy":              {"energy minerals"},
     "basic materials":     {"non-energy minerals", "process industries"},
     "consumer defensive":  {"consumer non-durables"},
     "consumer staples":    {"consumer non-durables"},
@@ -175,14 +180,14 @@ def _build_tv_filters(cfg: dict) -> list[dict]:
     return filters
 
 
-def fetch_rs_score_map(cfg: dict) -> dict[str, float]:
+def fetch_rs_universe(cfg: dict) -> tuple[dict[str, float], dict[str, dict]]:
+    """Single TradingView batch call. Returns (score_map, tv_data).
+
+    Cast wider than the RS screener's own strict filters (no percentile cutoff,
+    no extension guard, no stage2 EMA constraint) so Minervini and Pullback
+    picks can also be scored for global re-ranking AND so run_rs_screener can
+    skip its own TV fetch entirely by reusing tv_data.
     """
-    Single TradingView batch call. Returns {symbol: rs_score} for every stock
-    that passes basic quality filters. Cast wider than the RS screener's own
-    filters (no percentile cutoff, no extension guard) so all Minervini and
-    Pullback picks that qualify can be scored for global re-ranking.
-    """
-    # Use a looser filter so we catch Minervini/Pullback picks too
     broad_filters = [
         {"left": "close",                  "operation": "greater", "right": cfg["price_min"]},
         {"left": "average_volume_30d_calc", "operation": "greater", "right": cfg["avg_vol_min"]},
@@ -203,17 +208,24 @@ def fetch_rs_score_map(cfg: dict) -> dict[str, float]:
         )
         resp.raise_for_status()
     except Exception as exc:
-        logger.error("fetch_rs_score_map: TV call failed: %s", exc)
-        return {}
+        logger.error("fetch_rs_universe: TV call failed: %s", exc)
+        return {}, {}
 
     score_map: dict[str, float] = {}
+    tv_data:   dict[str, dict]  = {}
     for row in resp.json().get("data", []):
-        sym   = row["s"].split(":")[-1]
-        v     = dict(zip(_RS_COLS, row["d"]))
-        score = _rs_score(v)
-        score_map[sym] = score
+        sym = row["s"].split(":")[-1]
+        v   = dict(zip(_RS_COLS, row["d"]))
+        score_map[sym] = _rs_score(v)
+        tv_data[sym]   = v
 
-    logger.info("fetch_rs_score_map: scored %d symbols.", len(score_map))
+    logger.info("fetch_rs_universe: scored %d symbols.", len(score_map))
+    return score_map, tv_data
+
+
+# Backwards-compatible thin wrapper — drop the tv_data half of the tuple.
+def fetch_rs_score_map(cfg: dict) -> dict[str, float]:
+    score_map, _ = fetch_rs_universe(cfg)
     return score_map
 
 
@@ -223,15 +235,16 @@ def run_rs_screener(
     user_id: int = None,
     account_value: float = None,
     score_map: dict[str, float] | None = None,
+    tv_data:   dict[str, dict]  | None = None,
 ) -> list[dict]:
     """
     Scan the US market for top RS momentum stocks.
     Returns a list of weekly_plan-compatible row dicts (not saved — caller handles).
     Each row has screener_type='rs_momentum'.
 
-    If score_map is supplied (pre-fetched by the caller), the TV batch call is
-    skipped — avoids a redundant network round-trip when run_both_screeners
-    has already fetched scores for global re-ranking.
+    Caller fast-path: if both score_map and tv_data are supplied (e.g. from
+    fetch_rs_universe), the TV batch call is skipped entirely. Stage 2 and
+    extension guards are applied locally on the broad universe.
     """
     if mode is None:
         mode = get_user_setting(db, "trading_mode", "paper", user_id)
@@ -241,10 +254,10 @@ def run_rs_screener(
     stop_pct = float(get_user_setting(db, "stop_loss_pct",   "8.0",  user_id) or "8.0")
     max_ppct = float(get_user_setting(db, "max_position_pct", "20.0", user_id) or "20.0")
 
-    # ── Pass 1: fetch RS scores (reuse caller's map if available) ─────────────
-    if score_map is None:
+    # ── Pass 1: fetch tv_data if caller didn't supply it ─────────────────────
+    if tv_data is None:
         logger.info(
-            "RS screener: fetching scores from TradingView (stage2=%s, min_pct=%.0f)…",
+            "RS screener: fetching TV universe (stage2=%s, min_pct=%.0f)…",
             cfg["require_stage2"], cfg["min_percentile"],
         )
         try:
@@ -269,28 +282,10 @@ def run_rs_screener(
         logger.info("RS screener: TV returned %d pre-filtered candidates.", len(raw_rows))
         tv_data = {row["s"].split(":")[-1]: dict(zip(_RS_COLS, row["d"])) for row in raw_rows}
     else:
-        # score_map was pre-fetched — reconstruct tv_data from a fresh targeted call
-        # using the RS-specific (stricter) filters so extension/stage2 guards apply
-        logger.info("RS screener: using pre-fetched score_map (%d symbols).", len(score_map))
-        try:
-            resp = httpx.post(
-                SCAN_URL,
-                json={
-                    "filter":  _build_tv_filters(cfg),
-                    "columns": _RS_COLS,
-                    "range":   [0, 400],
-                    "sort":    {"sortBy": "market_cap_basic", "sortOrder": "desc"},
-                    "markets": ["america"],
-                },
-                timeout=30,
-                headers=_TV_HEADERS,
-            )
-            resp.raise_for_status()
-            raw_rows = resp.json().get("data", [])
-            tv_data  = {row["s"].split(":")[-1]: dict(zip(_RS_COLS, row["d"])) for row in raw_rows}
-        except Exception as exc:
-            logger.error("RS screener: TV call for pick data failed: %s", exc)
-            return []
+        logger.info(
+            "RS screener: reusing pre-fetched tv_data (%d symbols) — skipping second TV call.",
+            len(tv_data),
+        )
 
     # Resolve GICS names (from settings UI) → TV sector names; also accepts TV names directly
     excluded_tv = _resolve_excluded(cfg["excluded_sectors"])
@@ -300,36 +295,50 @@ def run_rs_screener(
 
     # ── Pass 2: Local scoring and filtering ───────────────────────────────────
     scored: list[dict] = []
+    drop_counts = {"exchange": 0, "no_sector": 0, "excluded_sector": 0,
+                   "extension": 0, "stage2_emas": 0, "low_rs": 0}
 
     for sym, v in tv_data.items():
         price  = v.get("close")                or 0.0
         ema50  = v.get("EMA50")                or 0.0
+        ema200 = v.get("EMA200")               or 0.0
         sector = (v.get("sector") or "").strip()
         exch   = (v.get("exchange") or "").strip().upper()
 
         if allowed_exchanges and exch not in allowed_exchanges:
+            drop_counts["exchange"] += 1
             continue
         if excluded_tv:
             if not sector:
-                logger.warning("RS screener: %s has no sector from TV — skipping.", sym)
+                drop_counts["no_sector"] += 1
                 continue
             if sector.lower() in excluded_tv:
+                drop_counts["excluded_sector"] += 1
                 continue
-        if cfg["require_stage2"] and ema50 > 0:
+        # Stage 2 must be enforced locally now that the broad fetcher skips
+        # the EMA50>EMA200 / close>EMA50 server-side filters.
+        if cfg["require_stage2"]:
+            if ema50 <= 0 or ema200 <= 0 or ema50 <= ema200 or price <= ema50:
+                drop_counts["stage2_emas"] += 1
+                continue
             if (price - ema50) / ema50 * 100 > cfg["max_extension"]:
+                drop_counts["extension"] += 1
                 continue
 
-        logger.debug("RS screener: %s sector='%s' exch=%s kept.", sym, sector, exch)
         rs = (score_map.get(sym) if score_map else None)
         if rs is None:
             rs = _rs_score(v)
         if rs <= -50:
+            drop_counts["low_rs"] += 1
             continue
 
         scored.append({"symbol": sym, "rs_score": rs, "price": price, "tv": v})
 
     if not scored:
-        logger.info("RS screener: no candidates after local filtering.")
+        logger.warning(
+            "RS screener: 0 candidates from %d symbols. Drops: %s",
+            len(tv_data), drop_counts,
+        )
         return []
 
     scored.sort(key=lambda x: x["rs_score"], reverse=True)

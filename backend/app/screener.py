@@ -464,7 +464,7 @@ def run_both_screeners(
     RS screener can be disabled via the rs_screener_enabled setting.
     """
     from .pullback_screener import run_pullback_screener
-    from .rs_screener import run_rs_screener, fetch_rs_score_map, get_rs_settings
+    from .rs_screener import run_rs_screener, fetch_rs_universe, get_rs_settings
 
     def _phase(msg):
         logger.info("Screener phase: %s", msg)
@@ -504,20 +504,22 @@ def run_both_screeners(
 
     rs_enabled = _gus2(db, "rs_screener_enabled", "true", user_id).lower() == "true"
     score_map: dict[str, float] = {}
+    rs_tv_data: dict[str, dict] = {}
     rs_rows: list[dict] = []
     if rs_enabled:
-        _phase(f"Pullback done — {len(pb_rows)} candidates. Fetching global RS scores…")
+        _phase(f"Pullback done — {len(pb_rows)} candidates. Fetching global RS universe…")
         try:
-            rs_cfg   = get_rs_settings(db, user_id)
-            score_map = fetch_rs_score_map(rs_cfg)
+            rs_cfg                  = get_rs_settings(db, user_id)
+            score_map, rs_tv_data   = fetch_rs_universe(rs_cfg)
         except Exception as exc:
-            logger.error("RS score fetch failed (non-fatal): %s", exc)
+            logger.error("RS universe fetch failed (non-fatal): %s", exc)
 
-        _phase(f"RS scores fetched ({len(score_map)} symbols). Running RS Momentum screener…")
+        _phase(f"RS universe fetched ({len(score_map)} symbols). Running RS Momentum screener…")
         try:
             rs_rows = run_rs_screener(
                 db, mode=mode, user_id=user_id, account_value=av,
                 score_map=score_map or None,
+                tv_data=rs_tv_data or None,
             )
         except Exception as exc:
             logger.error("RS screener failed (non-fatal): %s", exc)
