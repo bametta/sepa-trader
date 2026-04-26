@@ -364,22 +364,23 @@ Use PROCEED when all rules pass."""
         return _parse_pre_trade_response(text.strip())
 
     except Exception as exc:
-        # Transient API error — warn but allow trade to continue so a
-        # temporary outage doesn't freeze all automated trading.
-        logger.error("pre_trade_analysis failed for %s: %s", symbol, exc)
+        # Transient API error — block the trade. Real money is at stake;
+        # an unvetted entry during an AI outage is worse than a missed entry.
+        logger.error("pre_trade_analysis failed for %s: %s — BLOCKING", symbol, exc)
         return {
-            "proceed":  True,
-            "verdict":  "WARN",
-            "reason":   f"AI analysis error — proceeding with caution: {str(exc)[:80]}",
-            "warnings": [f"Pre-trade AI error (trade allowed): {str(exc)[:80]}"],
+            "proceed":  False,
+            "verdict":  "ABORT",
+            "reason":   f"AI analysis error — trade blocked: {str(exc)[:80]}",
+            "warnings": [f"Pre-trade AI error (trade blocked): {str(exc)[:80]}"],
             "analysis": "",
         }
 
 
 def _parse_pre_trade_response(text: str) -> dict:
-    verdict  = "PROCEED"
-    reason   = ""
+    verdict  = "ABORT"  # fail-closed: malformed/missing VERDICT blocks the trade
+    reason   = "VERDICT line missing or unparseable — defaulting to ABORT"
     warnings = []
+    found_verdict = False
 
     for line in text.splitlines():
         line = line.strip()
@@ -387,12 +388,16 @@ def _parse_pre_trade_response(text: str) -> dict:
             v = line.split(":", 1)[1].strip().upper()
             if v in ("PROCEED", "WARN", "ABORT"):
                 verdict = v
+                found_verdict = True
         elif line.startswith("REASON:"):
             reason = line.split(":", 1)[1].strip()
         elif line.startswith("WARNINGS:"):
             w = line.split(":", 1)[1].strip()
             if w.lower() != "none":
                 warnings = [x.strip() for x in w.split(",") if x.strip()]
+
+    if not found_verdict:
+        warnings.append("AI response missing VERDICT line — defaulted to ABORT")
 
     return {
         "proceed":  verdict in ("PROCEED", "WARN"),

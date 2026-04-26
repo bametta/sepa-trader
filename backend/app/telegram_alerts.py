@@ -1,9 +1,21 @@
+import logging
 import httpx
 from .config import settings
 
+logger = logging.getLogger(__name__)
+
+_warned_unconfigured = False
+
 
 def _build_request(message: str, level: str) -> tuple[str, dict] | None:
+    global _warned_unconfigured
     if not settings.telegram_bot_token or not settings.telegram_chat_id:
+        if not _warned_unconfigured:
+            logger.warning(
+                "Telegram alerts disabled: bot token or chat_id not configured. "
+                "Operator will not receive URGENT/OPPORTUNITY notifications."
+            )
+            _warned_unconfigured = True
         return None
     emoji = {"URGENT": "🚨", "OPPORTUNITY": "🟢", "INFO": "ℹ️"}.get(level, "📊")
     text  = f"{emoji} *SEPA Monitor*\n\n{message}"
@@ -20,8 +32,12 @@ async def send(message: str, level: str = "INFO") -> bool:
     try:
         async with httpx.AsyncClient(timeout=10) as client:
             r = await client.post(url, json=data)
-            return r.status_code == 200
-    except Exception:
+            if r.status_code != 200:
+                logger.error("Telegram send failed [%s]: HTTP %s — %s", level, r.status_code, r.text[:200])
+                return False
+            return True
+    except Exception as exc:
+        logger.error("Telegram send exception [%s]: %s", level, exc)
         return False
 
 
@@ -35,8 +51,12 @@ def send_sync(message: str, level: str = "INFO") -> bool:
     try:
         with httpx.Client(timeout=10) as client:
             r = client.post(url, json=data)
-            return r.status_code == 200
-    except Exception:
+            if r.status_code != 200:
+                logger.error("Telegram send_sync failed [%s]: HTTP %s — %s", level, r.status_code, r.text[:200])
+                return False
+            return True
+    except Exception as exc:
+        logger.error("Telegram send_sync exception [%s]: %s", level, exc)
         return False
 
 

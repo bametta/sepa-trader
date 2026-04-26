@@ -515,7 +515,7 @@ def _gate(
     mode: str,
     user_id: int = None,
 ) -> bool:
-    """Pre-trade AI gate. Returns True if order should proceed. Fails open."""
+    """Pre-trade AI gate. Returns True if order should proceed. Fails closed."""
     try:
         from .claude_analyst import pre_trade_analysis, log_pre_trade, get_stored_weekly_plan_analysis
         stored       = get_stored_weekly_plan_analysis(db, symbol, mode)
@@ -549,8 +549,13 @@ def _gate(
         return True
 
     except Exception as exc:
-        logger.error("Pre-trade gate error for %s: %s — proceeding.", symbol, exc)
-        return True
+        logger.error("Pre-trade gate error for %s: %s — BLOCKING (fail-closed).", symbol, exc)
+        try:
+            from . import telegram_alerts as tg
+            tg.alert_system_error_sync(f"Pre-trade gate {symbol} [{mode}]", exc, level="URGENT")
+        except Exception:
+            pass
+        return False
 
 
 # ── Partial-fill reconciliation ───────────────────────────────────────────────
