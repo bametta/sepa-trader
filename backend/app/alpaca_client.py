@@ -157,6 +157,10 @@ def place_bracket_buy(
     Stop and target legs: GTC — remain active until one fills or position is closed.
     Use this for NEW entries only. For existing positions use place_oca_exit().
     """
+    if qty <= 0 or stop_price <= 0 or target_price <= 0:
+        raise ValueError(f"place_bracket_buy {symbol}: invalid qty/stop/target ({qty}/{stop_price}/{target_price})")
+    if target_price <= stop_price:
+        raise ValueError(f"place_bracket_buy {symbol}: target ${target_price:.2f} must exceed stop ${stop_price:.2f}")
     req = MarketOrderRequest(
         symbol=symbol,
         qty=round(qty, 0),
@@ -184,6 +188,15 @@ def place_limit_bracket_buy(
     If not filled by end of day, Alpaca cancels automatically.
     Use for pullback-to-MA entries where price is already near the target level.
     """
+    if qty <= 0 or entry_price <= 0 or stop_price <= 0 or target_price <= 0:
+        raise ValueError(
+            f"place_limit_bracket_buy {symbol}: invalid qty/entry/stop/target "
+            f"({qty}/{entry_price}/{stop_price}/{target_price})"
+        )
+    if stop_price >= entry_price:
+        raise ValueError(f"place_limit_bracket_buy {symbol}: stop ${stop_price:.2f} must be below entry ${entry_price:.2f}")
+    if target_price <= entry_price:
+        raise ValueError(f"place_limit_bracket_buy {symbol}: target ${target_price:.2f} must exceed entry ${entry_price:.2f}")
     limit_price = round(entry_price * (1 + slippage_pct / 100), 2)
     req = LimitOrderRequest(
         symbol=symbol,
@@ -267,6 +280,10 @@ def place_split_bracket_buy(
     Both stop legs are identical so trailing stop logic treats them uniformly.
     Raises ValueError if qty < 2 (can't split into two 1-share lots).
     """
+    if stop_price <= 0 or t1_price <= 0 or t2_price <= 0:
+        raise ValueError(f"place_split_bracket_buy {symbol}: invalid stop/t1/t2 ({stop_price}/{t1_price}/{t2_price})")
+    if t1_price <= stop_price or t2_price <= stop_price:
+        raise ValueError(f"place_split_bracket_buy {symbol}: targets must exceed stop ${stop_price:.2f}")
     qty_int = int(round(qty))
     qty1    = qty_int // 2
     qty2    = qty_int - qty1
@@ -302,6 +319,15 @@ def place_split_limit_bracket_buy(
     Place two DAY limit bracket orders for a split-lot T1/T2 exit strategy.
     Raises ValueError if qty < 2.
     """
+    if entry_price <= 0 or stop_price <= 0 or t1_price <= 0 or t2_price <= 0:
+        raise ValueError(
+            f"place_split_limit_bracket_buy {symbol}: invalid entry/stop/t1/t2 "
+            f"({entry_price}/{stop_price}/{t1_price}/{t2_price})"
+        )
+    if stop_price >= entry_price:
+        raise ValueError(f"place_split_limit_bracket_buy {symbol}: stop ${stop_price:.2f} must be below entry ${entry_price:.2f}")
+    if t1_price <= entry_price or t2_price <= entry_price:
+        raise ValueError(f"place_split_limit_bracket_buy {symbol}: targets must exceed entry ${entry_price:.2f}")
     qty_int     = int(round(qty))
     qty1        = qty_int // 2
     qty2        = qty_int - qty1

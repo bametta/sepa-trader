@@ -999,6 +999,15 @@ def fill_open_slots(
         logger.debug("fill_open_slots [%s]: all strategy slots full — skipping.", mode)
         return
 
+    # Account snapshot for settlement-aware sizing inside the loop. Fetching
+    # once and re-using is fine — the loop completes in seconds and Alpaca's
+    # settled-cash field doesn't change mid-cycle absent fills.
+    try:
+        acct = alp.get_account(mode)
+    except Exception as exc:
+        logger.error("fill_open_slots [%s]: get_account failed: %s — aborting.", mode, exc)
+        return
+
     held_tuple = tuple(held_symbols) if held_symbols else ("__none__",)
 
     rows = db.execute(
