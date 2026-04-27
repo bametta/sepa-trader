@@ -1273,11 +1273,43 @@ def _log_alpaca_side_sell(db: Session, sym: str, mode: str) -> bool:
         {"s": sym, "m": mode},
     ).scalar()
 
-    fills = alp.find_recent_fills(mode, sym, "SELL", days=45)
+    fills = alp.find_recent_fills(mode, sym, "SELL", days=90)
     if not fills:
+        # No SELL order exists — most often this means the position was
+        # closed by a corporate action (merger, spinoff, delisting) rather
+        # than a trade. Fall back to /account/activities and synthesize a
+        # SELL row so reconciliation drift clears.
+        activities = alp.find_position_close_activity(mode, sym, days=90)
+        if activities:
+            inserted = 0
+            for act in activities:
+                ts = act.get("timestamp")
+                qty = act.get("qty") or 0
+                price = act.get("price") or 0
+                act_type = act.get("activity_type") or "CORP_ACTION"
+                if qty <= 0:
+                    continue
+                db.execute(
+                    text("""
+                        INSERT INTO trade_log (symbol, action, qty, price, trigger, mode, created_at)
+                        VALUES (:s, 'SELL', :q, :p, :t, :m, COALESCE(NULLIF(:ts,'')::timestamptz, NOW()))
+                    """),
+                    {"s": sym, "q": qty, "p": price,
+                     "t": f"CORPORATE_ACTION:{act_type}", "m": mode, "ts": ts or ""},
+                )
+                inserted += 1
+                logger.info(
+                    "[%s] reconstructed SELL via corporate action: %s qty=%s @ %s "
+                    "(type=%s, %s)", mode, sym, qty, price, act_type,
+                    act.get("description", ""),
+                )
+            if inserted:
+                db.commit()
+                return True
         logger.warning(
-            "[%s] %s closed on Alpaca but no recent filled SELL orders found — "
-            "cannot reconstruct trade_log SELL entries", mode, sym,
+            "[%s] %s closed on Alpaca but no recent SELL fills or corporate "
+            "actions found in last 90 days — cannot reconstruct trade_log",
+            mode, sym,
         )
         return False
 

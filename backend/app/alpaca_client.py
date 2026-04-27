@@ -165,6 +165,53 @@ def find_recent_fills(mode: str, symbol: str, side: str, days: int = 30) -> list
     return fills
 
 
+def find_position_close_activity(mode: str, symbol: str, days: int = 90) -> list:
+    """Query /account/activities for non-trade dispositions of `symbol` —
+    mergers (MA), spinoffs (SC), non-regulatory corporate actions (NRC,
+    e.g. delisting, ticker change), and cash-in-lieu (CIL).
+
+    Used as a fallback when a position is closed on Alpaca but no SELL order
+    exists. Returns list of dicts with at least {qty, price, timestamp,
+    activity_type} so trade_log can record what happened to the shares.
+    """
+    from datetime import datetime, timedelta, timezone
+    after = (datetime.now(timezone.utc) - timedelta(days=days)).date().isoformat()
+    activity_types = "MA,SC,NRC,CIL,ACATC,ACATS"
+    try:
+        raw = get_client(mode).get(
+            "/account/activities",
+            data={"activity_types": activity_types, "after": after},
+        )
+    except Exception as exc:
+        logger.warning("find_position_close_activity[%s] %s: %s", mode, symbol, exc)
+        return []
+
+    out: list = []
+    for a in (raw or []):
+        if not isinstance(a, dict):
+            continue
+        if (a.get("symbol") or "").upper() != symbol.upper():
+            continue
+        try:
+            qty = abs(float(a.get("qty") or 0))
+        except (TypeError, ValueError):
+            qty = 0.0
+        try:
+            price = float(a.get("per_share_amount") or a.get("price") or 0)
+        except (TypeError, ValueError):
+            price = 0.0
+        if qty <= 0:
+            continue
+        out.append({
+            "qty":           qty,
+            "price":         price,
+            "timestamp":     a.get("date") or a.get("transaction_time"),
+            "activity_type": a.get("activity_type") or "CORP_ACTION",
+            "description":   a.get("description") or "",
+        })
+    return out
+
+
 def get_clock(mode: str = "paper"):
     return get_client(mode).get_clock()
 
