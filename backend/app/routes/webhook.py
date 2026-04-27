@@ -62,6 +62,20 @@ async def tradingview(alert: TVAlert, db: Session = Depends(get_db)):
             if len(positions) < max_pos:
                 stop, target = _get_weekly_plan_exits(db, symbol, mode)
                 qty = _size_position(portfolio, alert.price, risk_pct, stop_pct, stop_price=stop)
+
+                # Apply min_cash_pct buffer (mirrors fill_open_slots) so a TV
+                # breakout cannot push cash below the configured floor.
+                try:
+                    from ..position_manager import _settled_funds_available
+                    min_cash_pct = float(get_setting(db, "min_cash_pct", "10.0") or "10.0")
+                    avail        = _settled_funds_available(acct, portfolio, min_cash_pct, 0.0)
+                    if avail > 0 and alert.price > 0:
+                        qty = min(qty, int(avail / alert.price))
+                    else:
+                        qty = 0
+                except Exception:
+                    pass
+
                 if qty >= 1:
                     if not _gate(db, symbol, qty, alert.price, stop, target, "TV_BREAKOUT", mode):
                         action_taken = "BLOCKED_BY_AI"

@@ -82,6 +82,51 @@ def _get_weekly_plan_exits(db: Session, symbol: str, mode: str) -> tuple[float, 
     return float(row[0] or 0), float(row[1] or 0)
 
 
+def _compute_fresh_exits(db: Session, symbol: str, current_price: float) -> tuple[float, float, str]:
+    """Pure compute: derive (stop, target, basis) from current price + EMAs.
+    No DB persistence. Used for slot-fill re-evaluation where we want fresh
+    levels but write through the existing weekly_plan row.
+    Returns (0, 0, "") on failure.
+    """
+    try:
+        from .tv_analyzer import analyze as _analyze
+        tech = _analyze(symbol, db=db) or {}
+    except Exception as exc:
+        logger.warning("_compute_fresh_exits: analyze(%s) failed: %s", symbol, exc)
+        tech = {}
+
+    px_now = float(tech.get("price") or current_price or 0)
+    if px_now <= 0:
+        return 0.0, 0.0, ""
+
+    ema20 = float(tech.get("ema20") or 0)
+    ema50 = float(tech.get("ema50") or 0)
+    try:
+        stop_pct = float(get_setting(db, "stop_loss_pct", "8.0") or "8.0")
+        rr       = float(get_setting(db, "default_rr", "2.5") or "2.5")
+    except (TypeError, ValueError):
+        stop_pct, rr = 8.0, 2.5
+
+    stop_floor, stop_ceiling = round(px_now * 0.85, 2), round(px_now * 0.96, 2)
+    fallback = round(px_now * (1 - stop_pct / 100), 2)
+
+    chosen, basis = 0.0, "fallback"
+    if ema20 > 0:
+        gap = (px_now - ema20) / px_now * 100
+        if 1.0 <= gap <= 6.0:
+            chosen, basis = round(ema20 * 0.99, 2), "EMA20"
+    if chosen <= 0 and ema50 > 0:
+        gap = (px_now - ema50) / px_now * 100
+        if 2.0 <= gap <= 12.0:
+            chosen, basis = round(ema50 * 0.99, 2), "EMA50"
+    if chosen <= 0:
+        chosen = fallback
+
+    chosen = max(stop_floor, min(chosen, stop_ceiling))
+    target = round(px_now + (px_now - chosen) * rr, 2)
+    return chosen, target, basis
+
+
 def _derive_fresh_plan(
     db: Session, symbol: str, mode: str, entry_price: float, current_price: float,
     user_id: int | None = None,
@@ -601,6 +646,20 @@ def _gate(
         if not result["proceed"]:
             logger.warning("Pre-trade gate BLOCKED %s [%s]: %s", symbol, trigger, result["reason"])
             return False
+
+        # Treat WARN as a block by default. WARN means borderline R:R, sizing
+        # near limits, weekly-plan WAIT carryover, or cash-at-floor — exactly
+        # the cases where slippage or repricing pushes the trade out of spec.
+        # Override with setting `block_on_warn=false` if a more permissive
+        # posture is wanted.
+        block_on_warn = (get_setting(db, "block_on_warn", "true") or "true").lower() == "true"
+        if block_on_warn and result["verdict"] == "WARN":
+            logger.warning(
+                "Pre-trade gate BLOCKED %s [%s] on WARN: %s",
+                symbol, trigger, result["reason"],
+            )
+            return False
+
         if result["warnings"]:
             logger.warning("Pre-trade gate WARNED %s [%s]: %s", symbol, trigger, ", ".join(result["warnings"]))
         logger.info("Pre-trade gate PASSED %s [%s]: %s", symbol, trigger, result["reason"])
@@ -898,6 +957,20 @@ async def run_monitor(db: Session, user_id: int | None = None, mode: str | None 
                     price               = result["price"]
                     stop, target = _get_weekly_plan_exits(db, sym, mode)
                     qty                 = _size_position(portfolio, price, risk_pct, stop_pct, stop_price=stop)
+
+                    # Apply min_cash_pct buffer — risk-based sizing alone doesn't
+                    # respect the cash floor, so a watchlist breakout could push
+                    # cash below the configured minimum (mirrors fill_open_slots).
+                    try:
+                        from .position_manager import _settled_funds_available
+                        min_cash_pct = float(get_setting(db, "min_cash_pct", "10.0") or "10.0")
+                        avail        = _settled_funds_available(acct, portfolio, min_cash_pct, 0.0)
+                        if avail > 0 and price > 0:
+                            qty = min(qty, int(avail / price))
+                        else:
+                            qty = 0
+                    except Exception as _exc:
+                        logger.warning("Watchlist cash-buffer check failed for %s: %s", sym, _exc)
 
                     if qty >= 1:
                         if not _gate(db, sym, qty, price, stop, target, "BREAKOUT", mode, user_id=user_id):

@@ -34,23 +34,21 @@ def _is_economic(db: Session, qty: float, price: float) -> bool:
 def _settled_funds_available(acct, portfolio: float, min_cash_pct: float, committed: float = 0.0) -> float:
     """Funds genuinely available to deploy on a new buy.
 
-    Alpaca's `buying_power` includes unsettled proceeds from same-day sales,
-    which can phantom-double the available cash on rebalance days
-    (T+1 settlement, finalized 2024). Prefer settled `cash`, fall back to
-    non-marginable buying power, last resort `buying_power`.
+    Use ONLY settled `cash`. Alpaca's `buying_power` includes margin (2x on
+    margin accounts) and unsettled proceeds, which can phantom-double the
+    available cash and silently fund entries that breach the cash floor.
+    If `cash` is missing/zero, return 0 — that's a fail-closed signal to
+    skip the entry rather than fall through to leveraged buying power.
 
     `committed` is dollars already earmarked by earlier buys in the same
     multi-symbol loop, so we don't repeatedly hand out the same cash.
     """
-    settled = 0.0
-    for attr in ("cash", "non_marginable_buying_power", "buying_power"):
-        try:
-            v = float(getattr(acct, attr) or 0)
-        except (TypeError, ValueError):
-            v = 0.0
-        if v > 0:
-            settled = v
-            break
+    try:
+        settled = float(getattr(acct, "cash", 0) or 0)
+    except (TypeError, ValueError):
+        settled = 0.0
+    if settled <= 0:
+        return 0.0
     buffer  = portfolio * (min_cash_pct / 100)
     return max(0.0, settled - buffer - committed)
 
@@ -1163,6 +1161,37 @@ def fill_open_slots(
 
         if price <= 0:
             continue
+
+        # Re-evaluate exits at fill time. Screener-time stop/target can be
+        # days/weeks stale by the time a slot opens; price has likely moved
+        # and structural support (EMA20/50) has shifted. Recomputing from
+        # current technicals keeps R:R and risk sizing honest, and ensures
+        # the pre-trade gate sees current numbers — not what the screener
+        # froze on Monday.
+        try:
+            from .trader import _compute_fresh_exits
+            fresh_stop, fresh_target, basis = _compute_fresh_exits(db, sym, price)
+            if fresh_stop > 0 and fresh_target > 0:
+                logger.info(
+                    "fill_open_slots: re-evaluated %s — basis=%s px=$%.2f stop=$%.2f→$%.2f target=$%.2f→$%.2f",
+                    sym, basis, price, stop, fresh_stop, target, fresh_target,
+                )
+                stop, target = fresh_stop, fresh_target
+                # Persist the refreshed plan so monitor/UI read consistent values.
+                try:
+                    db.execute(
+                        text("""
+                            UPDATE weekly_plan SET stop_price = :s, target1 = :t, entry_price = :e
+                            WHERE symbol = :sym AND mode = :mode
+                              AND week_start = (SELECT MAX(week_start) FROM weekly_plan WHERE mode = :mode)
+                        """),
+                        {"s": stop, "t": target, "e": price, "sym": sym, "mode": mode},
+                    )
+                    db.commit()
+                except Exception as _exc:
+                    logger.warning("fill_open_slots: persist refreshed plan failed for %s: %s", sym, _exc)
+        except Exception as _exc:
+            logger.warning("fill_open_slots: re-evaluation failed for %s — using stored exits: %s", sym, _exc)
 
         qty = _size_qty(portfolio, price, stop, risk_pct, stop_pct)
         # Cap at max_position_pct of portfolio
