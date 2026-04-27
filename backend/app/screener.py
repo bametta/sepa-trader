@@ -486,6 +486,7 @@ def run_screener(db: Session, mode: str = None, user_id: int = None, account_val
             "status":        "PENDING",
             "mode":          mode,
             "screener_type": "minervini",
+            "sector":        (c.get("sector") or "").strip(),
         })
 
     # Always save (even empty) so last-run info is queryable
@@ -738,12 +739,66 @@ def run_both_screeners(
         if r["symbol"] not in seen:
             seen[r["symbol"]] = r
 
+    # ── R:R floor ────────────────────────────────────────────────────────────
+    # Drop picks whose plan-level R:R falls below `screener_min_rr`. The
+    # AI gate already WARN-blocks at fill time, but every borderline pick
+    # in the weekly_plan wastes a slot until the gate rejects it. Filtering
+    # at screener time keeps the plan lean.
+    try:
+        min_rr = float(_gus2(db, "screener_min_rr", "1.5", user_id) or "1.5")
+    except (TypeError, ValueError):
+        min_rr = 1.5
+    if min_rr > 0:
+        before_rr = len(seen)
+        kept: dict[str, dict] = {}
+        for sym, r in seen.items():
+            entry = float(r.get("entry_price") or 0)
+            stop  = float(r.get("stop_price")  or 0)
+            t1    = float(r.get("target1")    or 0)
+            if entry <= stop or t1 <= entry:
+                continue  # malformed exits — drop
+            rr = (t1 - entry) / (entry - stop)
+            if rr >= min_rr:
+                kept[sym] = r
+        dropped = before_rr - len(kept)
+        if dropped:
+            logger.info("Plan merge: %d picks dropped below R:R %.2fx", dropped, min_rr)
+        seen = kept
+
     # Re-rank all picks globally by RS score so highest-momentum stocks buy first
-    merged = sorted(
+    sorted_picks = sorted(
         seen.values(),
         key=lambda r: score_map.get(r["symbol"], -999.0),
         reverse=True,
     )
+
+    # ── Per-sector cap ───────────────────────────────────────────────────────
+    # Walk picks in score order and skip any whose sector is already at the
+    # cap. Forces diversity in tape regimes where one sector (Technology in
+    # the current AI cycle) dominates absolute scoring.
+    try:
+        max_per_sector = int(_gus2(db, "max_picks_per_sector", "2", user_id) or "2")
+    except (TypeError, ValueError):
+        max_per_sector = 2
+    if max_per_sector > 0:
+        sector_counts: dict[str, int] = {}
+        merged: list[dict] = []
+        capped_out: list[str] = []
+        for r in sorted_picks:
+            sec = (r.get("sector") or "").strip().lower()
+            if sec and sector_counts.get(sec, 0) >= max_per_sector:
+                capped_out.append(f"{r['symbol']}({sec})")
+                continue
+            merged.append(r)
+            if sec:
+                sector_counts[sec] = sector_counts.get(sec, 0) + 1
+        if capped_out:
+            logger.info(
+                "Plan merge: %d picks dropped by sector cap (%d/sector): %s",
+                len(capped_out), max_per_sector, ", ".join(capped_out[:10]),
+            )
+    else:
+        merged = sorted_picks
 
     total_picks = len(merged)
     for i, row in enumerate(merged, 1):

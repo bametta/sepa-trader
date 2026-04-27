@@ -319,6 +319,7 @@ def run_pullback_screener(
             "mode":          mode,
             "screener_type": "pullback",
             "tv_chart_url": f"https://www.tradingview.com/chart/?symbol={c['symbol']}",
+            "sector":        (c.get("sector") or "").strip(),
         })
 
     logger.info(

@@ -173,7 +173,7 @@ def get_rs_settings(db: Session, user_id: int) -> dict:
         "price_max":       float(_s("rs_price_max",       0.0)),    # 0 = no ceiling
         "avg_vol_min":     float(_s("rs_avg_vol_min",     500_000)),
         "market_cap_min":  float(_s("rs_market_cap_min",  500_000_000)),
-        "min_percentile":  float(_s("rs_min_percentile",  70.0)),   # top 30%
+        "min_percentile":  float(_s("rs_min_percentile",  75.0)),   # top 25%
         "require_stage2":  _s("rs_require_stage2", "true") == "true",
         "max_extension":   float(_s("rs_max_extension",   15.0)),   # % above EMA50
         "top_n":           int(  _s("rs_top_n",           5)),
@@ -478,6 +478,7 @@ def run_rs_screener(
             "status":        "PENDING",
             "mode":          mode,
             "screener_type": "rs_momentum",
+            "sector":        (v.get("sector") or "").strip(),
         })
 
     logger.info(
