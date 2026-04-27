@@ -112,6 +112,20 @@ async def _start_one(mode: str) -> None:
     BACKOFF_MAX = 120.0
     handler = _make_handler(mode)
 
+    # Startup grace: a previous container's WebSocket holds Alpaca's
+    # single-slot-per-account for ~60–90s after process exit. Connecting
+    # immediately on a fresh deploy guarantees an HTTP 429. Wait it out
+    # before the first attempt so logs stay clean across deploys.
+    STARTUP_DELAY_SEC = 75
+    logger.info(
+        "trade_stream[%s]: waiting %ds for any prior WS slot to expire…",
+        mode, STARTUP_DELAY_SEC,
+    )
+    try:
+        await asyncio.sleep(STARTUP_DELAY_SEC)
+    except asyncio.CancelledError:
+        return
+
     while True:
         stream = TradingStream(api_key=key, secret_key=sec, paper=(mode == "paper"))
         stream.subscribe_trade_updates(handler)
