@@ -167,16 +167,20 @@ def find_recent_fills(mode: str, symbol: str, side: str, days: int = 30) -> list
 
 def find_position_close_activity(mode: str, symbol: str, days: int = 90) -> list:
     """Query /account/activities for non-trade dispositions of `symbol` —
-    mergers (MA), spinoffs (SC), non-regulatory corporate actions (NRC,
-    e.g. delisting, ticker change), and cash-in-lieu (CIL).
+    mergers (MA), symbol/name changes (SC, NC), reorgs (REORG), cash-in-lieu
+    (CIL), ACATS transfers, and stock splits (SPLIT).
 
     Used as a fallback when a position is closed on Alpaca but no SELL order
     exists. Returns list of dicts with at least {qty, price, timestamp,
     activity_type} so trade_log can record what happened to the shares.
+
+    NOTE: Alpaca rejects the entire request with `invalid activity type` if
+    ANY listed type is unrecognized — only include types from Alpaca's
+    documented enum. `NRC` was previously listed and broke this whole call.
     """
     from datetime import datetime, timedelta, timezone
     after = (datetime.now(timezone.utc) - timedelta(days=days)).date().isoformat()
-    activity_types = "MA,SC,NRC,CIL,ACATC,ACATS"
+    activity_types = "MA,SC,NC,REORG,CIL,ACATC,ACATS,SPLIT"
     try:
         raw = get_client(mode).get(
             "/account/activities",
