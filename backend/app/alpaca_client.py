@@ -354,31 +354,21 @@ def place_oca_exit(
     Place a single OCO (One-Cancels-Other) sell order for an existing position.
     When one leg fills, Alpaca automatically cancels the other.
 
-    Parent = STOP_LIMIT (the stop side). Target sibling is passed via the
-    take_profit kwarg.
-
-    Why the stop is the parent and not the take-profit: Alpaca paper has been
-    observed to silently drop the OCO sibling specified via the kwarg, while
-    the parent leg always lands. By making the stop the parent we guarantee
-    the position is never left without a stop — the worst-case failure mode
-    is losing the take-profit, which is far less dangerous than losing the
-    stop and running unbounded downside.
-
-    The stop's limit_price is set 1% below the stop trigger so the stop
-    converts to a marketable limit on activation.
+    Alpaca's API rejects OCO unless BOTH `stop_loss.stop_price` and
+    `take_profit.limit_price` are provided (error 40010001), so both kwargs
+    are required regardless of parent type. The parent is a LimitOrderRequest
+    where the parent's limit_price doubles as the take-profit working price —
+    the take_profit kwarg is the API-mandated sibling spec.
     """
-    rounded_stop   = round(stop_price, 2)
-    rounded_target = round(target_price, 2)
-    stop_limit_px  = round(stop_price * 0.99, 2)
-    req = StopLimitOrderRequest(
+    req = LimitOrderRequest(
         symbol=symbol,
         qty=round(qty, 0),
         side=OrderSide.SELL,
         time_in_force=TimeInForce.GTC,
-        stop_price=rounded_stop,
-        limit_price=stop_limit_px,
+        limit_price=round(target_price, 2),
         order_class=OrderClass.OCO,
-        take_profit=TakeProfitRequest(limit_price=rounded_target),
+        stop_loss=StopLossRequest(stop_price=round(stop_price, 2)),
+        take_profit=TakeProfitRequest(limit_price=round(target_price, 2)),
     )
     return get_client(mode).submit_order(req)
 
