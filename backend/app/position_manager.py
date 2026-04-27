@@ -1369,13 +1369,16 @@ def _log_alpaca_side_sell(db: Session, sym: str, mode: str) -> bool:
             return True
         # Fall through if nothing deleted — shouldn't happen but be safe.
 
-    fills = alp.find_recent_fills(mode, sym, "SELL", days=90)
+    fills = alp.find_recent_fills(mode, sym, "SELL", days=365)
     if not fills:
         # No SELL order exists — most often this means the position was
         # closed by a corporate action (merger, spinoff, delisting) rather
         # than a trade. Fall back to /account/activities and synthesize a
         # SELL row so reconciliation drift clears.
-        activities = alp.find_position_close_activity(mode, sym, days=90)
+        # 365d window: paper positions can sit closed-but-unreconciled for
+        # months between sessions; 90d was too short and surfaced as
+        # persistent POSITION DRIFT alerts that no fix could clear.
+        activities = alp.find_position_close_activity(mode, sym, days=365)
         if activities:
             inserted = 0
             for act in activities:
@@ -1403,8 +1406,9 @@ def _log_alpaca_side_sell(db: Session, sym: str, mode: str) -> bool:
                 db.commit()
                 return True
         logger.warning(
-            "[%s] %s closed on Alpaca but no recent SELL fills or corporate "
-            "actions found in last 90 days — cannot reconstruct trade_log",
+            "[%s] %s closed on Alpaca but no SELL fills or corporate "
+            "actions found in last 365 days — cannot reconstruct trade_log "
+            "(manually delete the stale BUY row from trade_log to silence drift)",
             mode, sym,
         )
         return False
