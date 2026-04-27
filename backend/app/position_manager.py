@@ -1307,8 +1307,26 @@ def _log_alpaca_side_sell(db: Session, sym: str, mode: str) -> bool:
     # Phantom-BUY guard: if the DB has a BUY row but Alpaca has NO filled BUY
     # order for this symbol, the original entry order expired/cancelled
     # without filling. Delete the phantom row(s) — there's nothing to "sell".
+    #
+    # CRITICAL: also check for OPEN buy orders. An order placed but not yet
+    # filled (status=new/accepted/partially_filled) has no closed-history
+    # entry yet, so find_recent_fills returns empty. Deleting the DB row
+    # in that window orphans the trade_log when the order finally fills.
     buy_fills = alp.find_recent_fills(mode, sym, "BUY", days=90)
-    if not buy_fills:
+    open_buys: list = []
+    try:
+        for o in alp.get_open_orders(mode):
+            if (getattr(o, "symbol", "") or "").upper() != sym.upper():
+                continue
+            side = str(getattr(o, "side", "") or "").lower()
+            if "buy" in side:
+                open_buys.append(o)
+    except Exception as exc:
+        logger.warning("phantom-guard: open-order check failed for %s: %s", sym, exc)
+        # Fail safe: if we can't verify, do NOT delete.
+        open_buys = [object()]  # truthy sentinel
+
+    if not buy_fills and not open_buys:
         deleted = db.execute(
             text("""
                 DELETE FROM trade_log
@@ -1534,6 +1552,66 @@ def reconcile_db_vs_alpaca(db: Session, mode: str) -> dict:
 
     missing_in_alpaca   = sorted(db_syms - alpaca_syms)   # DB thinks open, broker says no
     unexpected_in_alpaca = sorted(alpaca_syms - db_syms)  # broker holds, DB has no record
+
+    # Self-heal unexpected_in_alpaca: positions Alpaca shows that have no DB
+    # BUY row. Reconstruct the BUY from the actual filled-order history (or
+    # current position state as fallback) so trade_log reflects truth.
+    if unexpected_in_alpaca:
+        try:
+            alpaca_pos_by_sym = {p.symbol: p for p in alp.get_positions(mode)}
+        except Exception as exc:
+            logger.warning("reconcile: position fetch for backfill failed: %s", exc)
+            alpaca_pos_by_sym = {}
+        recovered: list = []
+        for sym in unexpected_in_alpaca:
+            buy_fills = []
+            try:
+                buy_fills = alp.find_recent_fills(mode, sym, "BUY", days=90)
+            except Exception:
+                pass
+            pos = alpaca_pos_by_sym.get(sym)
+            if buy_fills:
+                # Use the most recent BUY fill — captures actual entry price/qty.
+                latest = buy_fills[-1]
+                try:
+                    qty = float(getattr(latest, "filled_qty", 0) or 0)
+                    px  = float(getattr(latest, "filled_avg_price", 0) or 0)
+                    ts  = getattr(latest, "filled_at", None)
+                except (TypeError, ValueError):
+                    qty, px, ts = 0.0, 0.0, None
+            elif pos is not None:
+                # Fallback: use current Alpaca position avg entry / qty.
+                try:
+                    qty = float(getattr(pos, "qty", 0) or 0)
+                    px  = float(getattr(pos, "avg_entry_price", 0) or 0)
+                    ts  = None
+                except (TypeError, ValueError):
+                    qty, px, ts = 0.0, 0.0, None
+            else:
+                continue
+            if qty <= 0 or px <= 0:
+                continue
+            try:
+                db.execute(
+                    text("""
+                        INSERT INTO trade_log
+                            (symbol, action, qty, price, trigger, mode, created_at)
+                        VALUES
+                            (:s, 'BUY', :q, :p, 'RECONCILE_BACKFILL', :m,
+                             COALESCE(:ts, NOW()))
+                    """),
+                    {"s": sym, "q": qty, "p": px, "m": mode, "ts": ts},
+                )
+                recovered.append(sym)
+            except Exception as exc:
+                logger.error("reconcile: backfill BUY failed for %s: %s", sym, exc)
+        if recovered:
+            db.commit()
+            logger.warning(
+                "reconcile [%s]: backfilled BUY rows for %s — drift cleared.",
+                mode, recovered,
+            )
+            unexpected_in_alpaca = sorted(set(unexpected_in_alpaca) - set(recovered))
 
     if not missing_in_alpaca and not unexpected_in_alpaca:
         return {"drift": False, "missing_in_alpaca": [], "unexpected_in_alpaca": []}
