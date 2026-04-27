@@ -388,21 +388,29 @@ def _ensure_exit_orders(
             )
 
             # Verify the parent order's legs directly — Alpaca's OCO holds
-            # one sibling, so re-querying status=open can hide the held leg
-            # and produce false-positive "missing stop" alerts.
+            # one sibling, so re-querying status=open can hide the held leg.
             has_l, has_s = alp.verify_oca_parent(parent)
-            if not (has_l and has_s):
+            if not has_s:
+                # Stop is the parent — should never be missing. If it is,
+                # the position is genuinely naked.
                 logger.error(
-                    "Exit guard: %s OCO parent missing leg (limit=%s stop=%s) [%s]",
-                    sym, has_l, has_s, mode,
+                    "Exit guard: %s OCO parent has NO stop leg (limit=%s) [%s]",
+                    sym, has_l, mode,
                 )
                 try:
                     tg.alert_system_error_sync(
-                        f"NAKED POSITION [{mode}] {sym} — OCO parent missing stop leg",
+                        f"NAKED POSITION [{mode}] {sym} — OCO submitted without stop",
                         RuntimeError(f"limit={has_l} stop={has_s}"),
                     )
                 except Exception:
                     pass
+            elif not has_l:
+                # Stop landed but Alpaca dropped the take-profit sibling.
+                # Position is protected on the downside; just warn.
+                logger.warning(
+                    "Exit guard: %s OCO has stop but no take-profit leg [%s]",
+                    sym, mode,
+                )
         except Exception as exc:
             logger.error("Exit guard: OCO placement failed for %s: %s", sym, exc)
             try:

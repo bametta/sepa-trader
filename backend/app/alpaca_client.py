@@ -354,38 +354,48 @@ def place_oca_exit(
     Place a single OCO (One-Cancels-Other) sell order for an existing position.
     When one leg fills, Alpaca automatically cancels the other.
 
-    Both stop_loss and take_profit must be passed explicitly as request objects —
-    Alpaca raises code 40010001 if take_profit.limit_price is missing even when
-    limit_price is set on the parent LimitOrderRequest.
+    Parent = STOP_LIMIT (the stop side). Target sibling is passed via the
+    take_profit kwarg.
+
+    Why the stop is the parent and not the take-profit: Alpaca paper has been
+    observed to silently drop the OCO sibling specified via the kwarg, while
+    the parent leg always lands. By making the stop the parent we guarantee
+    the position is never left without a stop — the worst-case failure mode
+    is losing the take-profit, which is far less dangerous than losing the
+    stop and running unbounded downside.
+
+    The stop's limit_price is set 1% below the stop trigger so the stop
+    converts to a marketable limit on activation.
     """
-    req = LimitOrderRequest(
+    rounded_stop   = round(stop_price, 2)
+    rounded_target = round(target_price, 2)
+    stop_limit_px  = round(stop_price * 0.99, 2)
+    req = StopLimitOrderRequest(
         symbol=symbol,
         qty=round(qty, 0),
         side=OrderSide.SELL,
         time_in_force=TimeInForce.GTC,
-        limit_price=round(target_price, 2),
+        stop_price=rounded_stop,
+        limit_price=stop_limit_px,
         order_class=OrderClass.OCO,
-        stop_loss=StopLossRequest(stop_price=round(stop_price, 2)),
-        take_profit=TakeProfitRequest(limit_price=round(target_price, 2)),  # ← required by Alpaca
+        take_profit=TakeProfitRequest(limit_price=rounded_target),
     )
     return get_client(mode).submit_order(req)
 
 
 def verify_oca_parent(parent) -> tuple[bool, bool]:
     """Verify that an OCO parent Order returned from submit_order has both
-    a stop and a limit child. Returns (has_limit, has_stop).
+    a stop and a limit (take-profit) child. Returns (has_limit, has_stop).
 
-    Alpaca's OCO model: one child is `new` (working), the other is `held` —
-    held legs don't appear in `status=open` queries on every UI/account, so
-    we inspect the parent's `.legs` directly instead of re-querying.
-
-    The parent itself acts as the take-profit limit (its order_type is
-    `limit`), and its sibling stop_limit child appears in `.legs`."""
+    Parent layout (see place_oca_exit): parent itself is the stop_limit, and
+    the target lives in `.legs` as the take_profit sibling. We inspect .legs
+    directly because Alpaca's "held" sibling status doesn't reliably appear
+    in status=open queries."""
     if parent is None:
         return False, False
     parent_type = str(getattr(parent, "order_type", "") or getattr(parent, "type", "") or "").lower()
-    has_limit = "limit" in parent_type and "stop" not in parent_type
-    has_stop  = False
+    has_stop  = "stop" in parent_type
+    has_limit = "limit" in parent_type and "stop" not in parent_type  # parent is stop_limit, not pure limit
     for leg in (getattr(parent, "legs", None) or []):
         leg_type = str(getattr(leg, "order_type", "") or getattr(leg, "type", "") or "").lower()
         if "stop" in leg_type:
