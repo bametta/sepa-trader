@@ -381,21 +381,24 @@ def _ensure_exit_orders(
             continue
 
         try:
-            alp.place_oca_exit(sym, qty, stop, target, mode)
+            parent = alp.place_oca_exit(sym, qty, stop, target, mode)
             logger.info(
                 "Exit guard: placed OCO for %s qty=%d stop=$%.2f target=$%.2f [%s]",
                 sym, qty, stop, target, mode,
             )
 
-            has_l, has_s = alp.verify_oca_legs(sym, mode, timeout=8.0)
+            # Verify the parent order's legs directly — Alpaca's OCO holds
+            # one sibling, so re-querying status=open can hide the held leg
+            # and produce false-positive "missing stop" alerts.
+            has_l, has_s = alp.verify_oca_parent(parent)
             if not (has_l and has_s):
                 logger.error(
-                    "Exit guard: %s OCO submitted but legs incomplete (limit=%s stop=%s) [%s]",
+                    "Exit guard: %s OCO parent missing leg (limit=%s stop=%s) [%s]",
                     sym, has_l, has_s, mode,
                 )
                 try:
                     tg.alert_system_error_sync(
-                        f"NAKED POSITION [{mode}] {sym} — OCO submitted but stop leg missing",
+                        f"NAKED POSITION [{mode}] {sym} — OCO parent missing stop leg",
                         RuntimeError(f"limit={has_l} stop={has_s}"),
                     )
                 except Exception:

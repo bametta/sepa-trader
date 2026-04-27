@@ -371,34 +371,27 @@ def place_oca_exit(
     return get_client(mode).submit_order(req)
 
 
-def verify_oca_legs(symbol: str, mode: str = "paper", timeout: float = 8.0) -> tuple[bool, bool]:
-    """After an OCO submit, poll the open-orders book until BOTH a sell limit
-    and a sell stop_limit child are visible for `symbol`. Returns (has_limit,
-    has_stop). Caller decides what to do on missing-leg.
+def verify_oca_parent(parent) -> tuple[bool, bool]:
+    """Verify that an OCO parent Order returned from submit_order has both
+    a stop and a limit child. Returns (has_limit, has_stop).
 
-    Alpaca paper occasionally accepts the parent limit but drops the stop
-    sibling. This helper lets the caller detect that and recover."""
-    client = get_client(mode)
-    sym_upper = symbol.upper()
-    elapsed = 0.0
-    has_limit = has_stop = False
-    while elapsed < timeout:
-        orders = client.get_orders(GetOrdersRequest(status=QueryOrderStatus.OPEN))
-        has_limit = has_stop = False
-        for o in orders:
-            if (getattr(o, "symbol", "") or "").upper() != sym_upper:
-                continue
-            if "sell" not in str(getattr(o, "side", "") or "").lower():
-                continue
-            otype = str(getattr(o, "order_type", "") or getattr(o, "type", "") or "").lower()
-            if "stop" in otype:
-                has_stop = True
-            elif "limit" in otype:
-                has_limit = True
-        if has_limit and has_stop:
-            return True, True
-        time.sleep(0.5)
-        elapsed += 0.5
+    Alpaca's OCO model: one child is `new` (working), the other is `held` —
+    held legs don't appear in `status=open` queries on every UI/account, so
+    we inspect the parent's `.legs` directly instead of re-querying.
+
+    The parent itself acts as the take-profit limit (its order_type is
+    `limit`), and its sibling stop_limit child appears in `.legs`."""
+    if parent is None:
+        return False, False
+    parent_type = str(getattr(parent, "order_type", "") or getattr(parent, "type", "") or "").lower()
+    has_limit = "limit" in parent_type and "stop" not in parent_type
+    has_stop  = False
+    for leg in (getattr(parent, "legs", None) or []):
+        leg_type = str(getattr(leg, "order_type", "") or getattr(leg, "type", "") or "").lower()
+        if "stop" in leg_type:
+            has_stop = True
+        elif "limit" in leg_type:
+            has_limit = True
     return has_limit, has_stop
 
 
