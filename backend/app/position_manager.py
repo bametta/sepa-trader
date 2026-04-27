@@ -208,6 +208,32 @@ def _place_entry(
         order_type   = get_setting(db, "mv_entry_order_type",   "stop_limit")
         slippage_pct = float(get_setting(db, "mv_entry_slippage_pct", "1.0"))
 
+    # Hard pre-submit cash guard. Sizing already enforces min_cash_pct on a
+    # snapshot, but slippage and racing fills (other entries within the same
+    # cycle) can push the actual debit above settled cash and quietly draw
+    # margin. Refetch cash now and abort if worst-case cost exceeds it.
+    # Limit/stop-limit: worst case is the limit cap. Market: assume +1% slip.
+    try:
+        slip = max(slippage_pct, 1.0) if order_type == "market" else slippage_pct
+        worst_px   = entry * (1 + slip / 100)
+        worst_cost = qty * worst_px
+        live_acct  = alp.get_account(mode)
+        live_cash  = float(getattr(live_acct, "cash", 0) or 0)
+        if worst_cost > live_cash:
+            msg = (
+                f"pre-submit cash guard: worst-case ${worst_cost:.2f} "
+                f"> settled cash ${live_cash:.2f} — refusing to submit "
+                f"(would draw margin)"
+            )
+            logger.warning("_place_entry %s [%s]: %s", sym, mode, msg)
+            raise RuntimeError(msg)
+    except RuntimeError:
+        raise
+    except Exception as exc:
+        # Failure to fetch cash is itself a fail-closed signal.
+        logger.error("_place_entry %s: cash guard refetch failed: %s — refusing", sym, exc)
+        raise RuntimeError(f"cash guard refetch failed: {exc}")
+
     has_exits = stop > 0 and target > 0
 
     if order_type == "limit":

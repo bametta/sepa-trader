@@ -80,18 +80,31 @@ async def tradingview(alert: TVAlert, db: Session = Depends(get_db)):
                     if not _gate(db, symbol, qty, alert.price, stop, target, "TV_BREAKOUT", mode):
                         action_taken = "BLOCKED_BY_AI"
                     else:
+                        # Hard pre-submit cash guard (TV market buy goes direct
+                        # to place_market_buy, bypassing _place_entry's check).
                         try:
-                            alp.place_market_buy(symbol, qty, mode)
-                            _log_trade(db, symbol, "BUY", qty, alert.price, "TV_BREAKOUT", mode)
-                            action_taken = f"BUY {qty} shares"
-                            from ..claude_analyst import get_latest_pre_trade
-                            v, r = get_latest_pre_trade(db, symbol, mode)
-                            asyncio.create_task(tg.alert_trade(
-                                "BUY", symbol, qty, alert.price, "TV_BREAKOUT", mode,
-                                ai_verdict=v, ai_reason=r,
-                            ))
-                        except Exception as e:
-                            action_taken = f"BUY_FAILED: {e}"
+                            live_cash  = float(getattr(alp.get_account(mode), "cash", 0) or 0)
+                            worst_cost = qty * alert.price * 1.01
+                        except Exception:
+                            live_cash, worst_cost = 0.0, float("inf")
+                        if worst_cost > live_cash:
+                            action_taken = (
+                                f"BLOCKED_CASH_GUARD: worst-case ${worst_cost:.2f} "
+                                f"> settled cash ${live_cash:.2f}"
+                            )
+                        else:
+                            try:
+                                alp.place_market_buy(symbol, qty, mode)
+                                _log_trade(db, symbol, "BUY", qty, alert.price, "TV_BREAKOUT", mode)
+                                action_taken = f"BUY {qty} shares"
+                                from ..claude_analyst import get_latest_pre_trade
+                                v, r = get_latest_pre_trade(db, symbol, mode)
+                                asyncio.create_task(tg.alert_trade(
+                                    "BUY", symbol, qty, alert.price, "TV_BREAKOUT", mode,
+                                    ai_verdict=v, ai_reason=r,
+                                ))
+                            except Exception as e:
+                                action_taken = f"BUY_FAILED: {e}"
 
         elif signal == "NO_SETUP" and symbol in positions:
             try:
