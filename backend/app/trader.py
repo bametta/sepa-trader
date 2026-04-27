@@ -84,6 +84,7 @@ def _get_weekly_plan_exits(db: Session, symbol: str, mode: str) -> tuple[float, 
 
 def _derive_fresh_plan(
     db: Session, symbol: str, mode: str, entry_price: float, current_price: float,
+    user_id: int | None = None,
 ) -> tuple[float, float]:
     """For an open position with no weekly_plan row, derive a fresh stop/target
     from CURRENT price action — not from the original entry — and persist it
@@ -153,17 +154,19 @@ def _derive_fresh_plan(
             text("""
                 INSERT INTO weekly_plan
                     (week_start, symbol, rank, score, entry_price, stop_price,
-                     target1, status, mode)
+                     target1, status, mode, user_id)
                 VALUES (
                     COALESCE(
-                        (SELECT MAX(week_start) FROM weekly_plan WHERE mode = :mode),
+                        (SELECT MAX(week_start) FROM weekly_plan
+                         WHERE mode = :mode
+                           AND (:uid IS NULL OR user_id = :uid)),
                         CURRENT_DATE
                     ),
-                    :sym, 99, 0, :entry, :stop, :target, 'EXECUTED', :mode
+                    :sym, 99, 0, :entry, :stop, :target, 'EXECUTED', :mode, :uid
                 )
             """),
             {"sym": symbol, "entry": entry_price or px_now,
-             "stop": chosen_stop, "target": target, "mode": mode},
+             "stop": chosen_stop, "target": target, "mode": mode, "uid": user_id},
         )
         db.commit()
     except Exception as exc:
@@ -352,6 +355,7 @@ def _ensure_exit_orders(
     positions: list,
     open_orders_by_symbol: dict,
     mode: str,
+    user_id: int | None = None,
 ):
     """
     For every live position:
@@ -422,7 +426,7 @@ def _ensure_exit_orders(
             if entry_price <= 0 and current_price <= 0:
                 logger.warning("Exit guard: %s no anchor price — cannot derive plan [%s]", sym, mode)
                 continue
-            stop, target = _derive_fresh_plan(db, sym, mode, entry_price, current_price)
+            stop, target = _derive_fresh_plan(db, sym, mode, entry_price, current_price, user_id=user_id)
             if stop <= 0 or target <= 0:
                 logger.warning(
                     "Exit guard: %s plan derivation returned invalid prices "
@@ -778,7 +782,7 @@ async def run_monitor(db: Session, user_id: int | None = None, mode: str | None 
                 # Step 2: Exit guard
                 # Ensures every position has an active OCO.
                 # Replaces existing OCOs when plan stop/target has changed.
-                _ensure_exit_orders(db, positions, open_orders_by_symbol, mode)
+                _ensure_exit_orders(db, positions, open_orders_by_symbol, mode, user_id=user_id)
 
             except Exception as exc:
                 logger.error("Stop management cycle failed: %s", exc)
