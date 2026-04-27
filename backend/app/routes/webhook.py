@@ -18,6 +18,11 @@ class TVAlert(BaseModel):
     volume: float = 0
     score: int = 0
     secret: str = ""
+    # TradingView's native sector/industry labels. Send via Pine alert template
+    # using `{{syminfo.sector}}` and `{{syminfo.industry}}`. Used for sector
+    # exclusion before any sizing/AI/order work runs.
+    sector: str = ""
+    industry: str = ""
 
 
 @router.post("/tradingview")
@@ -57,6 +62,29 @@ async def tradingview(alert: TVAlert, db: Session = Depends(get_db)):
         acct        = alp.get_account(mode)
         portfolio   = float(acct.portfolio_value)
         max_pos     = int(get_setting(db, "max_positions", "10"))
+
+        if signal == "BREAKOUT" and symbol not in positions:
+            # Sector exclusion — uses the TV-native sector label sent by the
+            # alert. Resolves the configured exclusion list (which may use
+            # GICS-style names) into TV sector names via _resolve_excluded.
+            # Falls back to the RS strategy's default exclusion list when
+            # no `tv_excluded_sectors` setting is present, so existing
+            # operators get sane defaults without configuring anything.
+            tv_sector = (alert.sector or "").strip().lower()
+            if tv_sector:
+                try:
+                    from ..rs_screener import _resolve_excluded, _DEFAULT_EXCLUDED_SECTORS
+                    raw = get_setting(
+                        db, "tv_excluded_sectors",
+                        get_setting(db, "rs_excluded_sectors", ",".join(_DEFAULT_EXCLUDED_SECTORS)),
+                    )
+                    excluded = _resolve_excluded([s for s in (raw or "").split(",") if s.strip()])
+                    if tv_sector in excluded:
+                        action_taken = f"BLOCKED_SECTOR: {alert.sector}"
+                        # Skip the rest of the BREAKOUT branch entirely.
+                        signal = "_SECTOR_BLOCKED"
+                except Exception:
+                    pass
 
         if signal == "BREAKOUT" and symbol not in positions:
             if len(positions) < max_pos:
