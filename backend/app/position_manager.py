@@ -1405,11 +1405,52 @@ def _log_alpaca_side_sell(db: Session, sym: str, mode: str) -> bool:
             if inserted:
                 db.commit()
                 return True
+        # Last resort: nothing to reconstruct from. Before deleting, RE-VERIFY
+        # the symbol genuinely isn't in Alpaca — guards against transient API
+        # outages where get_positions returned a partial list earlier in the
+        # reconcile cycle. If still absent, delete the unmatched BUY row(s)
+        # so drift clears permanently.
+        try:
+            current_syms = {p.symbol.upper() for p in alp.get_positions(mode)}
+        except Exception as exc:
+            logger.warning(
+                "[%s] %s: cannot re-verify Alpaca positions (%s) — leaving "
+                "orphaned BUY in DB; will retry next cycle.", mode, sym, exc,
+            )
+            return False
+        if sym.upper() in current_syms:
+            logger.info(
+                "[%s] %s: re-check shows position IS in Alpaca after all — "
+                "skipping cleanup, drift will resolve next cycle.", mode, sym,
+            )
+            return False
+
+        deleted = db.execute(
+            text("""
+                DELETE FROM trade_log
+                WHERE symbol = :s AND mode = :m AND action = 'BUY'
+                  AND NOT EXISTS (
+                      SELECT 1 FROM trade_log s
+                      WHERE s.symbol = :s AND s.mode = :m
+                        AND s.action = 'SELL'
+                        AND s.created_at > trade_log.created_at
+                  )
+            """),
+            {"s": sym, "m": mode},
+        ).rowcount
+        if deleted:
+            db.commit()
+            logger.warning(
+                "[%s] %s: orphaned BUY row(s) deleted (%d) — Alpaca shows no "
+                "position and no SELL fills/corp actions in last 365d. "
+                "trade_log now matches broker state.",
+                mode, sym, deleted,
+            )
+            return True
+
         logger.warning(
-            "[%s] %s closed on Alpaca but no SELL fills or corporate "
-            "actions found in last 365 days — cannot reconstruct trade_log "
-            "(manually delete the stale BUY row from trade_log to silence drift)",
-            mode, sym,
+            "[%s] %s: no Alpaca history found and no BUY row to delete — "
+            "drift state inconsistent. Investigate manually.", mode, sym,
         )
         return False
 
