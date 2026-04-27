@@ -47,6 +47,7 @@ def _fetch_market_universe(
     excluded_sectors: set[str],
     exchanges: list[str] | None = None,
     max_results: int = 300,
+    excluded_industries: set[str] | None = None,
 ) -> list[str]:
     """Server-side TradingView scan for SEPA Stage-2 candidates.
 
@@ -81,7 +82,7 @@ def _fetch_market_universe(
     if price_max and price_max > 0:
         filters.append({"left": "close", "operation": "eless", "right": price_max})
 
-    columns = ["close", "sector", "average_volume_30d_calc", "market_cap_basic"]
+    columns = ["close", "sector", "average_volume_30d_calc", "market_cap_basic", "industry"]
 
     try:
         resp = httpx.post(
@@ -107,19 +108,23 @@ def _fetch_market_universe(
         logger.warning("Market-wide TV scan returned 0 rows — check filter set or TV availability")
         return []
 
-    # Local sector exclusion. `sector` column is at index 1.
+    # Local sector / industry exclusion. Columns: 0=close, 1=sector,
+    # 2=avg_vol, 3=market_cap, 4=industry.
     out: list[str] = []
     skipped_sector = 0
     for row in rows:
         try:
             full_sym = row["s"]                  # e.g. "NASDAQ:AAPL"
             sector   = (row["d"][1] or "").strip()
+            industry = (row["d"][4] or "").strip() if len(row["d"]) > 4 else ""
         except (KeyError, IndexError, TypeError):
             continue
-        # excluded_sectors is a set of LOWERCASE TV sector names (resolved via
-        # _rs_resolve). TV's `sector` column comes back capitalised, so we must
-        # lower-case it before the membership check or the filter silently fails.
+        # excluded_sectors / excluded_industries are sets of LOWERCASE TV
+        # names. TV returns capitalised values so lowercase before checking.
         if excluded_sectors and sector.lower() in excluded_sectors:
+            skipped_sector += 1
+            continue
+        if excluded_industries and industry.lower() in excluded_industries:
             skipped_sector += 1
             continue
         sym = full_sym.split(":")[-1]
@@ -235,10 +240,14 @@ def run_screener(db: Session, mode: str = None, user_id: int = None, account_val
 
     # Sector exclusion — Minervini-specific. Falls back to the legacy
     # `screener_excluded_sectors` key so existing settings keep working.
-    from .rs_screener import _resolve_excluded as _rs_resolve
+    from .rs_screener import (
+        _resolve_excluded as _rs_resolve,
+        _resolve_excluded_industries as _rs_resolve_industries,
+    )
     _excluded_csv = _s("mv_excluded_sectors", "") or _s("screener_excluded_sectors", "")
     _excluded_raw = [s.strip() for s in _excluded_csv.split(",") if s.strip()]
-    excluded_sectors = _rs_resolve(_excluded_raw) if _excluded_raw else set()
+    excluded_sectors    = _rs_resolve(_excluded_raw) if _excluded_raw else set()
+    excluded_industries = _rs_resolve_industries(_excluded_raw) if _excluded_raw else set()
 
     if account_value is None:
         try:
@@ -309,6 +318,7 @@ def run_screener(db: Session, mode: str = None, user_id: int = None, account_val
             price_min=price_min,
             price_max=price_max,
             excluded_sectors=excluded_sectors,
+            excluded_industries=excluded_industries,
         )
         if scanned:
             universe = scanned
@@ -351,6 +361,11 @@ def run_screener(db: Session, mode: str = None, user_id: int = None, account_val
                 continue
             if sector in excluded_sectors:
                 logger.debug("Minervini screener: %s excluded (sector=%s).", sym, sector)
+                continue
+        if excluded_industries:
+            industry = (result.get("industry") or "").strip().lower()
+            if industry and industry in excluded_industries:
+                logger.debug("Minervini screener: %s excluded (industry=%s).", sym, industry)
                 continue
         all_scored.append({"symbol": sym, **result})
 

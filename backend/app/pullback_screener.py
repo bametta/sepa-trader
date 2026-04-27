@@ -80,6 +80,7 @@ _PB_COLS = [
     "Perf.1M",
     "Perf.3M",
     "sector",                       # Used for sector exclusion filter
+    "industry",                     # Used for industry-level exclusion (e.g. oilfield services under Industrial Services)
 ]
 
 # Sectors excluded by default — commodity/defensive/low-growth sectors that
@@ -107,7 +108,10 @@ _TV_HEADERS = {
 
 def get_pb_settings(db: Session, user_id: int) -> dict:
     """Load all pullback screener settings with defaults."""
-    from .rs_screener import _resolve_excluded as _rs_resolve
+    from .rs_screener import (
+        _resolve_excluded as _rs_resolve,
+        _resolve_excluded_industries as _rs_resolve_industries,
+    )
 
     def _s(key, default):
         return get_user_setting(db, key, str(default), user_id)
@@ -121,7 +125,8 @@ def get_pb_settings(db: Session, user_id: int) -> dict:
     return {
         # Set of LOWERCASE TV sector names — used by _local_refinement for the
         # actual exclusion check. Settings UI accepts either GICS or TV names.
-        "_resolved_excluded": _rs_resolve(excluded_raw),
+        "_resolved_excluded":            _rs_resolve(excluded_raw),
+        "_resolved_excluded_industries": _rs_resolve_industries(excluded_raw),
         "price_min":           float(_s("pb_price_min",           10.0)),
         "price_max":           float(_s("pb_price_max",           200.0)),
         # EMA ladder — each step is independently togglable
@@ -468,10 +473,15 @@ def _local_refinement(sym: str, v: dict, cfg: dict) -> dict | None:
     # TV names ("Energy Minerals", "Consumer Non-Durables"). _resolved_excluded
     # (precomputed in cfg) is a set of lowercase TV sector names; the TV column
     # is capitalised so we must lower-case before comparing.
-    sector = (v.get("sector") or "").strip()
-    excluded_tv = cfg.get("_resolved_excluded") or set()
+    sector   = (v.get("sector") or "").strip()
+    industry = (v.get("industry") or "").strip()
+    excluded_tv         = cfg.get("_resolved_excluded") or set()
+    excluded_industries = cfg.get("_resolved_excluded_industries") or set()
     if excluded_tv and sector and sector.lower() in excluded_tv:
         logger.debug("Pullback: %s skipped — excluded sector (%s)", sym, sector)
+        return None
+    if excluded_industries and industry and industry.lower() in excluded_industries:
+        logger.debug("Pullback: %s skipped — excluded industry (%s)", sym, industry)
         return None
 
     # Earnings date from TV (Unix timestamp → date, or None if unavailable)
