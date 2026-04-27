@@ -463,6 +463,16 @@ def run_monday_open(db: Session, mode: str | None = None):
             db.commit()
             held.add(sym)
             committed += qty * entry
+            try:
+                from . import telegram_alerts as tg
+                from .claude_analyst import get_latest_pre_trade
+                v, r = get_latest_pre_trade(db, sym, mode)
+                tg.alert_trade_sync(
+                    "BUY", sym, qty, entry, "MONDAY_OPEN", mode,
+                    ai_verdict=v, ai_reason=r,
+                )
+            except Exception:
+                pass
 
         except Exception as exc:
             logger.error("Monday open: buy failed for %s: %s", sym, exc)
@@ -827,6 +837,16 @@ def _execute_specific_pick(db: Session, mode: str, symbol: str, pending_picks: l
         )
         db.commit()
         logger.info("Slot refill complete: opened %s [%s]", symbol, mode)
+        try:
+            from . import telegram_alerts as tg
+            from .claude_analyst import get_latest_pre_trade
+            v, r = get_latest_pre_trade(db, symbol, mode)
+            tg.alert_trade_sync(
+                "BUY", symbol, qty, entry, "SLOT_REFILL", mode,
+                ai_verdict=v, ai_reason=r,
+            )
+        except Exception:
+            pass
 
     except Exception as exc:
         logger.error("Slot refill buy failed for %s: %s", symbol, exc)
@@ -915,6 +935,16 @@ def _execute_next_pick(db: Session, mode: str, held: set):
         )
         db.commit()
         logger.info("Post-close fallback: opened %s [%s]", sym, mode)
+        try:
+            from . import telegram_alerts as tg
+            from .claude_analyst import get_latest_pre_trade
+            v, r = get_latest_pre_trade(db, sym, mode)
+            tg.alert_trade_sync(
+                "BUY", sym, qty, entry, "POST_CLOSE", mode,
+                ai_verdict=v, ai_reason=r,
+            )
+        except Exception:
+            pass
 
     except Exception as exc:
         logger.error("Post-close fallback buy failed for %s: %s", sym, exc)
@@ -1189,6 +1219,16 @@ def fill_open_slots(
                 {"s": sym, "q": qty, "p": price, "t": f"FILL_{signal}", "m": mode},
             )
             db.commit()
+            try:
+                from . import telegram_alerts as tg
+                from .claude_analyst import get_latest_pre_trade
+                v, r = get_latest_pre_trade(db, sym, mode, user_id=user_id)
+                tg.alert_trade_sync(
+                    "BUY", sym, qty, price, f"FILL_{signal}", mode,
+                    ai_verdict=v, ai_reason=r,
+                )
+            except Exception:
+                pass
 
             committed += qty * price
             held_symbols.add(sym)

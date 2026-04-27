@@ -422,7 +422,7 @@ app.add_middleware(
     allow_headers=["Content-Type", "Authorization", "X-Requested-With"],
 )
 
-from .routes import auth as auth_route, admin as admin_route, strategies as strategies_route
+from .routes import auth as auth_route, admin as admin_route, strategies as strategies_route, ai_log as ai_log_route
 
 app.include_router(auth_route.router)
 app.include_router(admin_route.router)
@@ -435,6 +435,7 @@ app.include_router(webhook.router)
 app.include_router(screener.router)
 app.include_router(strategies_route.router)
 app.include_router(market_route.router)
+app.include_router(ai_log_route.router)
 
 
 @app.get("/health")

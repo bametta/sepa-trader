@@ -501,6 +501,39 @@ def log_pre_trade(
     db.commit()
 
 
+def get_latest_pre_trade(
+    db: Session, symbol: str, mode: str, user_id: int | None = None,
+) -> tuple[str, str]:
+    """Return (verdict, reason) of the most recent pre_trade_* row for this
+    symbol/mode/user. Empty strings if no row found. Used to enrich the
+    Telegram fill alert with the gate's decision rationale."""
+    try:
+        row = db.execute(
+            text("""
+                SELECT analysis FROM ai_analysis_log
+                WHERE symbol = :sym AND mode = :mode
+                  AND trigger LIKE 'pre_trade_%'
+                  AND (:uid IS NULL OR user_id = :uid)
+                ORDER BY created_at DESC LIMIT 1
+            """),
+            {"sym": symbol, "mode": mode, "uid": user_id},
+        ).fetchone()
+    except Exception as exc:
+        logger.debug("get_latest_pre_trade failed (non-fatal): %s", exc)
+        return "", ""
+    if not row or not row[0]:
+        return "", ""
+    verdict, reason = "", ""
+    for line in str(row[0]).splitlines():
+        if line.startswith("VERDICT:") and not verdict:
+            verdict = line.split(":", 1)[1].strip()
+        elif line.startswith("REASON:") and not reason:
+            reason = line.split(":", 1)[1].strip()
+        if verdict and reason:
+            break
+    return verdict, reason
+
+
 # ── Slot-refill analysis ──────────────────────────────────────────────────────
 
 def analyze_slot_refill(

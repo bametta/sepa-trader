@@ -813,6 +813,15 @@ async def run_monitor(db: Session, user_id: int | None = None, mode: str | None 
                             _log_trade(db, sym, "BUY", qty, price, "BREAKOUT", mode)
                             new_breakouts.append(sym)
                             held_symbols.add(sym)
+                            try:
+                                from .claude_analyst import get_latest_pre_trade
+                                v, r = get_latest_pre_trade(db, sym, mode, user_id=user_id)
+                                tg.alert_trade_sync(
+                                    "BUY", sym, qty, price, "BREAKOUT", mode,
+                                    ai_verdict=v, ai_reason=r,
+                                )
+                            except Exception:
+                                pass
                         except Exception as e:
                             if order_placed:
                                 logger.error(

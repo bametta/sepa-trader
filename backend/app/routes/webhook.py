@@ -70,7 +70,12 @@ async def tradingview(alert: TVAlert, db: Session = Depends(get_db)):
                             alp.place_market_buy(symbol, qty, mode)
                             _log_trade(db, symbol, "BUY", qty, alert.price, "TV_BREAKOUT", mode)
                             action_taken = f"BUY {qty} shares"
-                            asyncio.create_task(tg.alert_trade("BUY", symbol, qty, alert.price, "TV_BREAKOUT", mode))
+                            from ..claude_analyst import get_latest_pre_trade
+                            v, r = get_latest_pre_trade(db, symbol, mode)
+                            asyncio.create_task(tg.alert_trade(
+                                "BUY", symbol, qty, alert.price, "TV_BREAKOUT", mode,
+                                ai_verdict=v, ai_reason=r,
+                            ))
                         except Exception as e:
                             action_taken = f"BUY_FAILED: {e}"
 
