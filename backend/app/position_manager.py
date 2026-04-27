@@ -1273,6 +1273,36 @@ def _log_alpaca_side_sell(db: Session, sym: str, mode: str) -> bool:
         {"s": sym, "m": mode},
     ).scalar()
 
+    # Phantom-BUY guard: if the DB has a BUY row but Alpaca has NO filled BUY
+    # order for this symbol, the original entry order expired/cancelled
+    # without filling. Delete the phantom row(s) — there's nothing to "sell".
+    buy_fills = alp.find_recent_fills(mode, sym, "BUY", days=90)
+    if not buy_fills:
+        deleted = db.execute(
+            text("""
+                DELETE FROM trade_log
+                WHERE id IN (
+                    SELECT t.id FROM trade_log t
+                    WHERE t.symbol = :s AND t.mode = :m AND t.action = 'BUY'
+                      AND NOT EXISTS (
+                          SELECT 1 FROM trade_log s
+                          WHERE s.symbol = t.symbol AND s.mode = t.mode
+                            AND s.action = 'SELL' AND s.created_at > t.created_at
+                      )
+                )
+            """),
+            {"s": sym, "m": mode},
+        ).rowcount
+        if deleted:
+            db.commit()
+            logger.warning(
+                "[%s] %s: phantom BUY row(s) deleted (%d) — original entry "
+                "order never filled (likely an expired stop-limit).",
+                mode, sym, deleted,
+            )
+            return True
+        # Fall through if nothing deleted — shouldn't happen but be safe.
+
     fills = alp.find_recent_fills(mode, sym, "SELL", days=90)
     if not fills:
         # No SELL order exists — most often this means the position was
