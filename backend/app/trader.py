@@ -350,6 +350,60 @@ def _ensure_exit_orders(
                     for kw in ('oco', 'bracket', 'oto'))
         )
 
+        # ── In-flight BUY guard ──────────────────────────────────────────
+        # If an entry order is still partially filling, the position qty
+        # we see now may grow further. Skip OCO placement so we don't lock
+        # in stale qty (e.g. 4 shares of an eventual 31). Existing OCOs
+        # are still adjusted for stop/target drift — only NEW placement
+        # waits. The naked-cover step below will catch the residual on a
+        # later tick once the BUY completes.
+        buy_in_flight = any(
+            'buy' in str(getattr(o, 'side', '') or '').lower()
+            and str(getattr(o, 'status', '') or '').lower() in (
+                'new', 'accepted', 'pending_new', 'partially_filled', 'held'
+            )
+            for o in sym_orders
+        )
+
+        # ── Naked-share coverage ─────────────────────────────────────────
+        # Sum sell-side qty across all open OCO/stop/limit exit orders for
+        # this symbol. If pos.qty exceeds covered qty, an earlier OCO was
+        # placed against a partial-fill (e.g. 8 of 31 covered, 23 naked)
+        # and the rest of the position has no stop. Add a single OCO for
+        # the uncovered slice so the next tick's drift-replace logic can
+        # rationalize it.
+        covered_sell_qty = 0.0
+        for o in sym_orders:
+            if 'sell' not in str(getattr(o, 'side', '') or '').lower():
+                continue
+            try:
+                covered_sell_qty += float(getattr(o, 'qty', 0) or 0)
+            except (TypeError, ValueError):
+                pass
+        naked_qty = max(0, int(qty) - int(covered_sell_qty))
+        if naked_qty > 0 and not buy_in_flight and stop > 0 and target > 0:
+            try:
+                alp.place_oca_exit(sym, naked_qty, stop, target, mode)
+                logger.warning(
+                    "Exit guard: covered %d naked share(s) of %s "
+                    "(pos=%d, prior OCO=%d) [%s]",
+                    naked_qty, sym, int(qty), int(covered_sell_qty), mode,
+                )
+            except Exception as exc:
+                logger.error(
+                    "Exit guard: naked-cover OCO failed for %s qty=%d: %s",
+                    sym, naked_qty, exc,
+                )
+                try:
+                    tg.alert_system_error_sync(
+                        f"NAKED POSITION [{mode}] {sym} — {naked_qty} share(s) uncovered, "
+                        f"OCO placement failed",
+                        exc,
+                    )
+                except Exception:
+                    pass
+            continue  # next monitor tick will rebalance OCO/target sides
+
         if sym in oco_covered:
             # At least one OCO exists
             if stop <= 0 or target <= 0:
@@ -457,7 +511,16 @@ def _ensure_exit_orders(
                     logger.debug("Exit guard: %s OCO in place and matches plan — no action.", sym)
             continue
 
-        # No OCO at all — cancel any orphaned standalone sells, then place fresh exit(s)
+        # No OCO at all — wait for any in-flight BUY to settle first so we
+        # don't place exits against a partial-fill qty.
+        if buy_in_flight:
+            logger.info(
+                "Exit guard: %s has in-flight BUY — deferring OCO placement until next tick [%s]",
+                sym, mode,
+            )
+            continue
+
+        # cancel any orphaned standalone sells, then place fresh exit(s)
         for oid in orphan_order_ids.get(sym, []):
             try:
                 client.cancel_order_by_id(oid)
@@ -466,11 +529,33 @@ def _ensure_exit_orders(
                 logger.warning("Exit guard: could not cancel %s for %s: %s", oid, sym, exc)
 
         if stop <= 0 or target <= 0:
+            # No plan row exists (manual entry, expired weekly_plan window,
+            # or pre-existing position). Derive default exits from settings
+            # so the position isn't left naked. User can override anytime
+            # via 'Set Stop / Target'; the next monitor tick will pick up
+            # the new plan values and replace the OCO.
+            try:
+                stop_pct   = float(get_setting(db, "stop_loss_pct", "8.0") or "8.0")
+                target_pct = float(get_setting(db, "default_target_pct", "20.0") or "20.0")
+            except (TypeError, ValueError):
+                stop_pct, target_pct = 8.0, 20.0
+            entry_price = float(getattr(pos, "avg_entry_price", 0) or 0)
+            current_price = float(getattr(pos, "current_price", 0) or entry_price)
+            anchor = entry_price if entry_price > 0 else current_price
+            if anchor <= 0:
+                logger.warning(
+                    "Exit guard: %s has no OCO and no entry price — cannot derive defaults [%s]",
+                    sym, mode,
+                )
+                continue
+            stop   = round(anchor * (1 - stop_pct / 100), 2)
+            target = round(anchor * (1 + target_pct / 100), 2)
+            target2 = 0  # single-lot OCO for derived defaults
             logger.warning(
-                "Exit guard: %s has no OCO but no stop/target in plan [%s] "
-                "— use 'Set Stop / Target' on the position card.", sym, mode,
+                "Exit guard: %s has no plan exits — using defaults stop=$%.2f target=$%.2f "
+                "(stop_pct=%.1f%%, target_pct=%.1f%%) [%s]",
+                sym, stop, target, stop_pct, target_pct, mode,
             )
-            continue
 
         if target2 > 0 and int(qty) >= 2:
             # Split-lot: place two OCOs (T1 for half, T2 for the other half)

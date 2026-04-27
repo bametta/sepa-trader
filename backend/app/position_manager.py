@@ -18,6 +18,19 @@ def _size_qty(portfolio: float, entry: float, stop: float, risk_pct: float, stop
     return (portfolio * risk_pct / 100) / stop_dollar
 
 
+def _is_economic(db: Session, qty: float, price: float) -> bool:
+    """Reject sub-economic orders (e.g. 1 share of a $40 stock when cash
+    starvation collapses sizing). Commissions, slippage, and partial-fill
+    bracket churn make these orders net-negative even on a winning thesis.
+    Floor is configurable via `min_position_dollars` setting; default $500.
+    """
+    try:
+        floor = float(get_setting(db, "min_position_dollars", "500") or "500")
+    except (TypeError, ValueError):
+        floor = 500.0
+    return (qty * price) >= floor
+
+
 def _settled_funds_available(acct, portfolio: float, min_cash_pct: float, committed: float = 0.0) -> float:
     """Funds genuinely available to deploy on a new buy.
 
@@ -434,6 +447,12 @@ def run_monday_open(db: Session, mode: str | None = None):
             qty = 0
         if qty < 1:
             logger.info("Monday open: skipping %s — position size < 1 share (avail=$%.2f).", sym, avail)
+            continue
+        if not _is_economic(db, qty, entry):
+            logger.info(
+                "Monday open: skipping %s — sub-economic order (qty=%d × $%.2f < min).",
+                sym, int(qty), entry,
+            )
             continue
 
         if not _gate(db, sym, qty, entry, stop, target, "MONDAY_OPEN", mode):
@@ -886,6 +905,12 @@ def _execute_next_pick(db: Session, mode: str, held: set):
         qty = 0
     if qty < 1:
         return
+    if not _is_economic(db, qty, entry):
+        logger.info(
+            "Post-close fallback: %s sub-economic (qty=%d × $%.2f < min) — skipping.",
+            sym, int(qty), entry,
+        )
+        return
 
     if not _gate(db, sym, qty, entry, stop, target, "POST_CLOSE", mode):
         return
@@ -1150,6 +1175,12 @@ def fill_open_slots(
                 qty = 0
         if qty < 1:
             logger.info("fill_open_slots: %s qty<1 (price=$%.2f stop=$%.2f) — skipping.", sym, price, stop)
+            continue
+        if not _is_economic(db, qty, price):
+            logger.info(
+                "fill_open_slots: %s sub-economic (qty=%d × $%.2f < min) — skipping.",
+                sym, int(qty), price,
+            )
             continue
 
         if not _gate(db, sym, qty, price, stop, target, f"FILL_{signal}", mode, user_id=user_id):
