@@ -30,11 +30,14 @@ def pre_trade_log(
         where_extra = " AND symbol = :sym"
         params["sym"] = symbol.upper()
 
+    # Show rows scoped to this user OR with user_id=NULL (legacy/unscoped
+    # writes from internal callers — Monday open, slot refill, post-close).
+    # The mode filter still prevents cross-mode bleed.
     rows = db.execute(
         text(f"""
             SELECT id, trigger, symbol, analysis, mode, created_at
             FROM ai_analysis_log
-            WHERE user_id = :uid
+            WHERE (user_id = :uid OR user_id IS NULL)
               AND mode = :mode
               AND trigger LIKE 'pre_trade_%'
               {where_extra}
