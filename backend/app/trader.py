@@ -621,6 +621,16 @@ def _gate(
     """Pre-trade AI gate. Returns True if order should proceed. Fails closed."""
     try:
         from .claude_analyst import pre_trade_analysis, log_pre_trade, get_stored_weekly_plan_analysis
+        # Internal callers (Monday open, slot refill, post-close, TV) don't
+        # carry a user context. Fall back to the admin uid so the gate log
+        # row is scoped correctly and the AI Gate tab can display it.
+        if user_id is None:
+            try:
+                row = db.execute(text("SELECT id FROM users WHERE role='admin' ORDER BY id LIMIT 1")).fetchone()
+                if row:
+                    user_id = row[0]
+            except Exception:
+                pass
         stored       = get_stored_weekly_plan_analysis(db, symbol, mode)
         acct         = alp.get_account(mode)
         portfolio    = float(acct.portfolio_value)
@@ -641,6 +651,7 @@ def _gate(
         log_pre_trade(
             db, symbol, trigger,
             result["verdict"], result["reason"], result["analysis"], mode,
+            user_id=user_id,
         )
 
         if not result["proceed"]:
