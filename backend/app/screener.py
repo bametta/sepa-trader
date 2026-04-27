@@ -781,11 +781,15 @@ def run_both_screeners(
     except (TypeError, ValueError):
         max_per_sector = 2
     if max_per_sector > 0:
+        from .rs_screener import gics_label as _gics_label
         sector_counts: dict[str, int] = {}
         merged: list[dict] = []
         capped_out: list[str] = []
         for r in sorted_picks:
-            sec = (r.get("sector") or "").strip().lower()
+            tv_sec = (r.get("sector") or "").strip().lower()
+            # Map to GICS umbrella so "Electronic Technology" + "Technology
+            # Services" both count toward the same "technology" cap bucket.
+            sec = _gics_label(tv_sec) if tv_sec else ""
             if sec and sector_counts.get(sec, 0) >= max_per_sector:
                 capped_out.append(f"{r['symbol']}({sec})")
                 continue

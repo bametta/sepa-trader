@@ -135,6 +135,24 @@ _GICS_TO_TV_INDUSTRIES: dict[str, set[str]] = {
 }
 
 
+# Reverse map: TV-native sector → GICS umbrella label.
+# Built from _GICS_TO_TV so it's always consistent with the forward map.
+# Used by the per-sector cap so "Electronic Technology" + "Technology Services"
+# both count toward the same "technology" bucket instead of being treated as
+# two independent sectors.
+_TV_TO_GICS: dict[str, str] = {}
+for _gics, _tv_set in _GICS_TO_TV.items():
+    for _tv in _tv_set:
+        _TV_TO_GICS[_tv] = _gics
+# Sectors that have no GICS mapping keep their TV name as the cap bucket.
+
+
+def gics_label(tv_sector: str) -> str:
+    """Return the GICS umbrella label for a TV-native sector name, or the
+    lowercased TV name itself if no mapping exists."""
+    return _TV_TO_GICS.get(tv_sector.strip().lower(), tv_sector.strip().lower())
+
+
 def _resolve_excluded_industries(cfg_sectors: list[str]) -> set[str]:
     """For each user-listed sector, return the set of TV industries that
     should also be blocked. Catches symbols that TV places under a different
