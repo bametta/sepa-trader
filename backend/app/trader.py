@@ -62,11 +62,12 @@ def _effective_max_positions(db: Session, mode: str) -> int:
     return configured
 
 
-def _get_weekly_plan_exits(db: Session, symbol: str, mode: str) -> tuple[float, float, float]:
-    """Return (stop_price, target1, target2) — most recent plan row for this symbol+mode."""
+def _get_weekly_plan_exits(db: Session, symbol: str, mode: str) -> tuple[float, float]:
+    """Return (stop_price, target) — most recent plan row for this symbol+mode.
+    Single-OCO model: target2 column still exists in DB but is no longer read."""
     row = db.execute(
         text("""
-            SELECT stop_price, target1, target2
+            SELECT stop_price, target1
             FROM weekly_plan
             WHERE symbol = :sym
               AND mode = :mode
@@ -76,8 +77,8 @@ def _get_weekly_plan_exits(db: Session, symbol: str, mode: str) -> tuple[float, 
         {"sym": symbol, "mode": mode},
     ).fetchone()
     if not row:
-        return 0.0, 0.0, 0.0
-    return float(row[0] or 0), float(row[1] or 0), float(row[2] or 0)
+        return 0.0, 0.0
+    return float(row[0] or 0), float(row[1] or 0)
 
 
 def _get_current_stop_price(orders: list) -> float | None:
@@ -172,7 +173,7 @@ def _adjust_trailing_stops(
         if current_price <= entry:
             continue  # red or flat — never touch
 
-        stop_orig, target, target2 = _get_weekly_plan_exits(db, sym, mode)
+        stop_orig, target = _get_weekly_plan_exits(db, sym, mode)
         if stop_orig <= 0 or target <= 0:
             logger.debug("Trailing stop: %s has no plan exits — skipping.", sym)
             continue
@@ -181,14 +182,10 @@ def _adjust_trailing_stops(
         if new_stop is None:
             continue  # gain < 1R
 
-        # Cap the new stop just below the nearest open take-profit so Alpaca
-        # never rejects an OCO whose stop sits above its limit. With a split
-        # bracket the relevant target depends on whether T1 has already filled
-        # — that's checked via oco_count below; here we use the tighter of the
-        # two if both are still in play.
-        active_targets = [t for t in (target, target2) if t and t > 0]
-        if active_targets:
-            target_cap = round(min(active_targets) * 0.999, 2)
+        # Cap the new stop just below the take-profit so Alpaca never rejects
+        # an OCO whose stop sits above its limit.
+        if target > 0:
+            target_cap = round(target * 0.999, 2)
             if new_stop >= target_cap:
                 logger.debug(
                     "Trailing stop: %s new=$%.2f would breach target cap $%.2f — clamping.",
@@ -209,34 +206,14 @@ def _adjust_trailing_stops(
         R      = entry - stop_orig
         gain_r = (current_price - entry) / R
 
-        # Count open OCO/bracket sell orders to detect split-lot state
-        sym_orders = open_orders_by_symbol.get(sym, [])
-        oco_count  = sum(
-            1 for o in sym_orders
-            if 'sell' in str(getattr(o, 'side', '') or '').lower()
-            and any(kw in str(getattr(o, 'order_class', '') or '').lower()
-                    for kw in ('oco', 'bracket', 'oto'))
-        )
-
         logger.info(
             "Trailing stop: %s  gain=%.1fR  price=$%.2f  old=$%.2f → new=$%.2f  "
-            "target1=$%.2f target2=$%.2f oco_count=%d [%s]",
-            sym, gain_r, current_price, effective_current, new_stop,
-            target, target2, oco_count, mode,
+            "target=$%.2f [%s]",
+            sym, gain_r, current_price, effective_current, new_stop, target, mode,
         )
 
         try:
-            if target2 > 0 and oco_count >= 2:
-                # Both T1 and T2 lots still open — update stop on both
-                qty1 = int(qty) // 2
-                qty2 = int(qty) - qty1
-                alp.replace_split_oca_exits(sym, qty1, qty2, new_stop, target, target2, mode)
-            elif target2 > 0 and oco_count == 1:
-                # T1 was already hit — only T2 lot remains; pos.qty is the current qty
-                alp.replace_oca_exit(sym, qty, new_stop, target2, mode)
-            else:
-                # Single-lot position
-                alp.replace_oca_exit(sym, qty, new_stop, target, mode)
+            alp.replace_oca_exit(sym, qty, new_stop, target, mode)
 
             db.execute(
                 text("""
@@ -270,26 +247,6 @@ def _adjust_trailing_stops(
 
 # ── Exit guard ────────────────────────────────────────────────────────────────
 
-def _classify_exit_orders(open_orders_by_symbol: dict) -> tuple[set[str], dict]:
-    oco_covered      = set()
-    orphan_order_ids = {}
-
-    for sym, orders in open_orders_by_symbol.items():
-        for o in orders:
-            order_class = str(getattr(o, 'order_class', '') or '').lower()
-            side        = str(getattr(o, 'side',        '') or '').lower()
-            is_sell     = 'sell' in side
-            is_oco      = any(kw in order_class for kw in ('oco', 'bracket', 'oto'))
-
-            if is_sell and is_oco:
-                oco_covered.add(sym)
-                break
-            if is_sell and not is_oco:
-                orphan_order_ids.setdefault(sym, []).append(str(o.id))
-
-    return oco_covered, orphan_order_ids
-
-
 # Tolerance for considering stop/target "changed" — avoids churn on tiny rounding diffs
 _PRICE_CHANGE_THRESHOLD = 0.02   # $0.02
 
@@ -309,7 +266,6 @@ def _ensure_exit_orders(
     This ensures that edits made via 'Set Stop / Target' (Auto mode) take
     effect on the next monitor cycle without requiring manual intervention.
     """
-    oco_covered, orphan_order_ids = _classify_exit_orders(open_orders_by_symbol)
     client = alp.get_client(mode)
 
     # Cancel exit orders for symbols that have no live position (e.g., user
@@ -337,26 +293,16 @@ def _ensure_exit_orders(
                 )
 
     for pos in positions:
-        sym   = pos.symbol
-        qty   = float(pos.qty)
-        stop, target, target2 = _get_weekly_plan_exits(db, sym, mode)
-
-        # Count open OCO/bracket sell orders — needed to distinguish split-lot state
+        sym = pos.symbol
+        qty = int(float(pos.qty))
+        if qty <= 0:
+            continue
+        stop, target = _get_weekly_plan_exits(db, sym, mode)
         sym_orders = open_orders_by_symbol.get(sym, [])
-        oco_count  = sum(
-            1 for o in sym_orders
-            if 'sell' in str(getattr(o, 'side', '') or '').lower()
-            and any(kw in str(getattr(o, 'order_class', '') or '').lower()
-                    for kw in ('oco', 'bracket', 'oto'))
-        )
 
         # ── In-flight BUY guard ──────────────────────────────────────────
-        # If an entry order is still partially filling, the position qty
-        # we see now may grow further. Skip OCO placement so we don't lock
-        # in stale qty (e.g. 4 shares of an eventual 31). Existing OCOs
-        # are still adjusted for stop/target drift — only NEW placement
-        # waits. The naked-cover step below will catch the residual on a
-        # later tick once the BUY completes.
+        # If an entry order is still partially filling, pos.qty may grow.
+        # Defer all exit work; next tick reconciles once the BUY settles.
         buy_in_flight = any(
             'buy' in str(getattr(o, 'side', '') or '').lower()
             and str(getattr(o, 'status', '') or '').lower() in (
@@ -364,235 +310,106 @@ def _ensure_exit_orders(
             )
             for o in sym_orders
         )
-
-        # ── Naked-share coverage ─────────────────────────────────────────
-        # Sum sell-side qty across all open OCO/stop/limit exit orders for
-        # this symbol. If pos.qty exceeds covered qty, an earlier OCO was
-        # placed against a partial-fill (e.g. 8 of 31 covered, 23 naked)
-        # and the rest of the position has no stop. Add a single OCO for
-        # the uncovered slice so the next tick's drift-replace logic can
-        # rationalize it.
-        covered_sell_qty = 0.0
-        for o in sym_orders:
-            if 'sell' not in str(getattr(o, 'side', '') or '').lower():
-                continue
-            try:
-                covered_sell_qty += float(getattr(o, 'qty', 0) or 0)
-            except (TypeError, ValueError):
-                pass
-        naked_qty = max(0, int(qty) - int(covered_sell_qty))
-        if naked_qty > 0 and not buy_in_flight and stop > 0 and target > 0:
-            try:
-                alp.place_oca_exit(sym, naked_qty, stop, target, mode)
-                logger.warning(
-                    "Exit guard: covered %d naked share(s) of %s "
-                    "(pos=%d, prior OCO=%d) [%s]",
-                    naked_qty, sym, int(qty), int(covered_sell_qty), mode,
-                )
-            except Exception as exc:
-                logger.error(
-                    "Exit guard: naked-cover OCO failed for %s qty=%d: %s",
-                    sym, naked_qty, exc,
-                )
-                try:
-                    tg.alert_system_error_sync(
-                        f"NAKED POSITION [{mode}] {sym} — {naked_qty} share(s) uncovered, "
-                        f"OCO placement failed",
-                        exc,
-                    )
-                except Exception:
-                    pass
-            continue  # next monitor tick will rebalance OCO/target sides
-
-        if sym in oco_covered:
-            # At least one OCO exists
-            if stop <= 0 or target <= 0:
-                continue
-
-            current_stop   = _get_current_stop_price(sym_orders)
-            current_target = _get_current_target_price(sym_orders)
-            stop_changed   = current_stop is not None and abs(current_stop - stop) > _PRICE_CHANGE_THRESHOLD
-
-            if target2 > 0:
-                if oco_count >= 2:
-                    # Both lots open — only validate the stop (each lot has a different target)
-                    if stop_changed:
-                        qty1 = int(qty) // 2
-                        qty2 = int(qty) - qty1
-                        try:
-                            alp.replace_split_oca_exits(sym, qty1, qty2, stop, target, target2, mode)
-                            logger.info(
-                                "Exit guard: replaced split OCOs for %s stop=$%.2f T1=$%.2f T2=$%.2f [%s]",
-                                sym, stop, target, target2, mode,
-                            )
-                        except Exception as exc:
-                            logger.error("Exit guard: split OCO replacement failed for %s: %s", sym, exc)
-                    else:
-                        logger.debug("Exit guard: %s split OCOs in place — no action.", sym)
-                else:
-                    # T1 was hit — only T2 lot remains. Auto-raise stop to
-                    # at least breakeven (entry price): the first lot already
-                    # locked in profit, so the worst-case on the remaining
-                    # shares should be a scratch trade. Trailing stops can
-                    # still ratchet higher; this only sets the floor.
-                    entry_price = float(getattr(pos, "avg_entry_price", 0) or 0)
-                    be_stop     = max(stop, entry_price) if entry_price > 0 else stop
-                    if be_stop > stop and entry_price > 0:
-                        logger.info(
-                            "Exit guard: T1 filled for %s — raising stop to BE $%.2f (was $%.2f) [%s]",
-                            sym, be_stop, stop, mode,
-                        )
-                        try:
-                            db.execute(
-                                text("""
-                                    UPDATE weekly_plan SET stop_price = :s
-                                    WHERE symbol = :sym AND mode = :mode
-                                      AND week_start = (
-                                          SELECT MAX(week_start) FROM weekly_plan WHERE mode = :mode
-                                      )
-                                """),
-                                {"s": be_stop, "sym": sym, "mode": mode},
-                            )
-                            db.commit()
-                        except Exception as exc:
-                            logger.warning("BE update for %s failed: %s", sym, exc)
-                        stop = be_stop
-                        stop_changed = (
-                            current_stop is not None
-                            and abs(current_stop - stop) > _PRICE_CHANGE_THRESHOLD
-                        )
-
-                    target_changed = (
-                        current_target is not None
-                        and abs(current_target - target2) > _PRICE_CHANGE_THRESHOLD
-                    )
-                    if stop_changed or target_changed:
-                        try:
-                            alp.replace_oca_exit(sym, qty, stop, target2, mode)
-                            logger.info(
-                                "Exit guard: replaced T2 OCO for %s stop=$%.2f T2=$%.2f [%s]",
-                                sym, stop, target2, mode,
-                            )
-                        except Exception as exc:
-                            logger.error("Exit guard: T2 OCO replacement failed for %s: %s", sym, exc)
-                            try:
-                                tg.alert_system_error_sync(
-                                    f"NAKED POSITION [{mode}] {sym} — T2 OCO replace failed",
-                                    exc,
-                                )
-                            except Exception:
-                                pass
-                    else:
-                        logger.debug("Exit guard: %s T2 OCO in place — no action.", sym)
-            else:
-                # Single-lot — original logic
-                target_changed = (
-                    current_target is not None
-                    and abs(current_target - target) > _PRICE_CHANGE_THRESHOLD
-                )
-                if stop_changed or target_changed:
-                    logger.info(
-                        "Exit guard: %s plan changed (stop $%.2f→$%.2f, target $%.2f→$%.2f) — replacing OCO [%s]",
-                        sym, current_stop or 0, stop, current_target or 0, target, mode,
-                    )
-                    try:
-                        alp.replace_oca_exit(sym, qty, stop, target, mode)
-                        logger.info("Exit guard: replaced OCO for %s stop=$%.2f target=$%.2f [%s]", sym, stop, target, mode)
-                    except Exception as exc:
-                        logger.error("Exit guard: OCO replacement failed for %s: %s", sym, exc)
-                        try:
-                            tg.alert_system_error_sync(
-                                f"NAKED POSITION [{mode}] {sym} — OCO replace failed",
-                                exc,
-                            )
-                        except Exception:
-                            pass
-                else:
-                    logger.debug("Exit guard: %s OCO in place and matches plan — no action.", sym)
-            continue
-
-        # No OCO at all — wait for any in-flight BUY to settle first so we
-        # don't place exits against a partial-fill qty.
         if buy_in_flight:
-            logger.info(
-                "Exit guard: %s has in-flight BUY — deferring OCO placement until next tick [%s]",
-                sym, mode,
-            )
+            logger.info("Exit guard: %s has in-flight BUY — deferring [%s]", sym, mode)
             continue
 
-        # cancel any orphaned standalone sells, then place fresh exit(s)
-        for oid in orphan_order_ids.get(sym, []):
-            try:
-                client.cancel_order_by_id(oid)
-                logger.info("Exit guard: cancelled orphaned sell %s for %s [%s]", oid, sym, mode)
-            except Exception as exc:
-                logger.warning("Exit guard: could not cancel %s for %s: %s", oid, sym, exc)
-
+        # ── Derive defaults if no plan exits ─────────────────────────────
         if stop <= 0 or target <= 0:
-            # No plan row exists (manual entry, expired weekly_plan window,
-            # or pre-existing position). Derive default exits from settings
-            # so the position isn't left naked. User can override anytime
-            # via 'Set Stop / Target'; the next monitor tick will pick up
-            # the new plan values and replace the OCO.
             try:
                 stop_pct   = float(get_setting(db, "stop_loss_pct", "8.0") or "8.0")
                 target_pct = float(get_setting(db, "default_target_pct", "20.0") or "20.0")
             except (TypeError, ValueError):
                 stop_pct, target_pct = 8.0, 20.0
-            entry_price = float(getattr(pos, "avg_entry_price", 0) or 0)
+            entry_price   = float(getattr(pos, "avg_entry_price", 0) or 0)
             current_price = float(getattr(pos, "current_price", 0) or entry_price)
-            anchor = entry_price if entry_price > 0 else current_price
+            anchor        = entry_price if entry_price > 0 else current_price
             if anchor <= 0:
-                logger.warning(
-                    "Exit guard: %s has no OCO and no entry price — cannot derive defaults [%s]",
-                    sym, mode,
-                )
+                logger.warning("Exit guard: %s no anchor price — cannot derive defaults [%s]", sym, mode)
                 continue
-            stop   = round(anchor * (1 - stop_pct / 100), 2)
-            target = round(anchor * (1 + target_pct / 100), 2)
-            target2 = 0  # single-lot OCO for derived defaults
+            stop    = round(anchor * (1 - stop_pct / 100), 2)
+            target  = round(anchor * (1 + target_pct / 100), 2)
             logger.warning(
-                "Exit guard: %s has no plan exits — using defaults stop=$%.2f target=$%.2f "
-                "(stop_pct=%.1f%%, target_pct=%.1f%%) [%s]",
-                sym, stop, target, stop_pct, target_pct, mode,
+                "Exit guard: %s no plan exits — using defaults stop=$%.2f target=$%.2f [%s]",
+                sym, stop, target, mode,
             )
 
-        if target2 > 0 and int(qty) >= 2:
-            # Split-lot: place two OCOs (T1 for half, T2 for the other half)
-            qty1 = int(qty) // 2
-            qty2 = int(qty) - qty1
+        # ── Inspect current coverage ─────────────────────────────────────
+        # A position is "properly covered" only if total sell qty == pos qty
+        # AND a stop_limit child AND a limit child both exist AND prices
+        # match the plan (within threshold).
+        sell_legs = [o for o in sym_orders if 'sell' in str(getattr(o, 'side', '') or '').lower()]
+        covered_qty = 0
+        has_stop_leg = has_limit_leg = False
+        for o in sell_legs:
             try:
-                alp.place_oca_exit(sym, qty1, stop, target,  mode)
-                alp.place_oca_exit(sym, qty2, stop, target2, mode)
-                logger.info(
-                    "Exit guard: placed split OCOs for %s qty=%d+%d stop=$%.2f T1=$%.2f T2=$%.2f [%s]",
-                    sym, qty1, qty2, stop, target, target2, mode,
+                covered_qty += int(float(getattr(o, 'qty', 0) or 0))
+            except (TypeError, ValueError):
+                pass
+            otype = str(getattr(o, 'order_type', '') or getattr(o, 'type', '') or '').lower()
+            if 'stop' in otype:
+                has_stop_leg = True
+            elif 'limit' in otype:
+                has_limit_leg = True
+
+        current_stop   = _get_current_stop_price(sym_orders)
+        current_target = _get_current_target_price(sym_orders)
+        prices_match = (
+            current_stop is not None
+            and current_target is not None
+            and abs(current_stop - stop) <= _PRICE_CHANGE_THRESHOLD
+            and abs(current_target - target) <= _PRICE_CHANGE_THRESHOLD
+        )
+        # Single-OCO model: properly covered means total sell qty == pos qty
+        # AND exactly one stop leg + one limit leg exist AND prices match.
+        if (covered_qty == qty and has_stop_leg and has_limit_leg
+                and len(sell_legs) == 2 and prices_match):
+            logger.debug("Exit guard: %s coverage already correct — no action.", sym)
+            continue
+
+        # ── Serialized replace: cancel all sells, wait, place fresh ──────
+        # Never stack a new OCO on top of existing sells. Alpaca paper can
+        # silently drop the stop sibling if reservable qty is already
+        # pledged by a prior order — leaving the position with a target
+        # leg and no stop. Cancelling first eliminates the race.
+        cancelled = alp.cancel_symbol_exit_orders(sym, mode)
+        if cancelled and not alp.wait_for_orders_cancelled(sym, mode, timeout=10.0, poll_interval=0.4):
+            logger.error(
+                "Exit guard: timed out cancelling %s sells — skipping placement [%s]",
+                sym, mode,
+            )
+            continue
+
+        try:
+            alp.place_oca_exit(sym, qty, stop, target, mode)
+            logger.info(
+                "Exit guard: placed OCO for %s qty=%d stop=$%.2f target=$%.2f [%s]",
+                sym, qty, stop, target, mode,
+            )
+
+            has_l, has_s = alp.verify_oca_legs(sym, mode, timeout=8.0)
+            if not (has_l and has_s):
+                logger.error(
+                    "Exit guard: %s OCO submitted but legs incomplete (limit=%s stop=%s) [%s]",
+                    sym, has_l, has_s, mode,
                 )
-            except Exception as exc:
-                logger.error("Exit guard: split OCO placement failed for %s: %s", sym, exc)
                 try:
                     tg.alert_system_error_sync(
-                        f"NAKED POSITION [{mode}] {sym} — split OCO placement failed",
-                        exc,
+                        f"NAKED POSITION [{mode}] {sym} — OCO submitted but stop leg missing",
+                        RuntimeError(f"limit={has_l} stop={has_s}"),
                     )
                 except Exception:
                     pass
-        else:
+        except Exception as exc:
+            logger.error("Exit guard: OCO placement failed for %s: %s", sym, exc)
             try:
-                alp.place_oca_exit(sym, qty, stop, target, mode)
-                logger.info(
-                    "Exit guard: placed OCO for %s qty=%.0f stop=$%.2f target=$%.2f [%s]",
-                    sym, qty, stop, target, mode,
+                tg.alert_system_error_sync(
+                    f"NAKED POSITION [{mode}] {sym} — OCO placement failed",
+                    exc,
                 )
-            except Exception as exc:
-                logger.error("Exit guard: failed to place OCO for %s: %s", sym, exc)
-                try:
-                    tg.alert_system_error_sync(
-                        f"NAKED POSITION [{mode}] {sym} — OCO placement failed",
-                        exc,
-                    )
-                except Exception:
-                    pass
+            except Exception:
+                pass
+        continue
 
 
 # ── Tape context helper ───────────────────────────────────────────────────────
@@ -968,7 +785,7 @@ async def run_monitor(db: Session, user_id: int | None = None, mode: str | None 
 
                 if signal == "BREAKOUT" and result.get("price"):
                     price               = result["price"]
-                    stop, target, target2 = _get_weekly_plan_exits(db, sym, mode)
+                    stop, target = _get_weekly_plan_exits(db, sym, mode)
                     qty                 = _size_position(portfolio, price, risk_pct, stop_pct, stop_price=stop)
 
                     if qty >= 1:
@@ -978,7 +795,7 @@ async def run_monitor(db: Session, user_id: int | None = None, mode: str | None 
                         order_placed = False
                         try:
                             from .position_manager import _place_entry as _pm_place_entry
-                            order_desc = _pm_place_entry(db, sym, qty, price, stop, target, "BREAKOUT", mode, "minervini", target2=target2)
+                            order_desc = _pm_place_entry(db, sym, qty, price, stop, target, "BREAKOUT", mode, "minervini")
                             order_placed = True
                             logger.info("Watchlist buy %s qty=%.0f — %s [%s]", sym, qty, order_desc, mode)
                             _log_trade(db, sym, "BUY", qty, price, "BREAKOUT", mode)

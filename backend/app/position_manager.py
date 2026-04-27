@@ -188,17 +188,16 @@ def _place_entry(
     trigger: str,
     mode: str,
     screener_type: str = "minervini",
-    target2: float = 0.0,
+    target2: float = 0.0,  # kept for caller compat — ignored (single-OCO model)
 ) -> str:
     """
     Submit the entry buy using the user-configured order type.
     Returns a short description string for logging.
 
-    When target2 > 0 and qty >= 2, places two bracket orders (split-lot):
-      Lot 1: qty//2 shares with take-profit at target (T1)
-      Lot 2: remaining shares with take-profit at target2 (T2)
-    stop_limit entries cannot carry brackets — split-lot falls back to T1-only
-    for stop_limit order type.
+    Single-OCO model: one stop and one target per position. The split T1/T2
+    logic was removed because Alpaca paper silently dropped sibling stop legs
+    when stacking multiple OCOs on the same symbol. `target2` is accepted for
+    caller compatibility but no longer used.
 
     Settings are split by screener source:
       mv_entry_order_type / mv_entry_slippage_pct  — Minervini/breakout picks
@@ -211,21 +210,10 @@ def _place_entry(
         order_type   = get_setting(db, "mv_entry_order_type",   "stop_limit")
         slippage_pct = float(get_setting(db, "mv_entry_slippage_pct", "1.0"))
 
-    has_exits   = stop > 0 and target > 0
-    use_split   = target2 > 0 and int(qty) >= 2 and order_type != "stop_limit"
+    has_exits = stop > 0 and target > 0
 
     if order_type == "limit":
         limit_px = round(entry * (1 + slippage_pct / 100), 2)
-        if has_exits and use_split:
-            try:
-                alp.place_split_limit_bracket_buy(sym, qty, entry, stop, target, target2, slippage_pct, mode)
-                qty1 = int(qty) // 2
-                return (f"split limit bracket (lim=${limit_px} stop=${stop:.2f} "
-                        f"T1=${target:.2f}×{qty1}sh T2=${target2:.2f}×{int(qty)-qty1}sh)")
-            except ValueError:
-                pass  # qty too small — fall through to single bracket
-            except Exception as exc:
-                logger.error("_place_entry: split limit bracket FAILED for %s: %s — single bracket fallback", sym, exc)
         if has_exits:
             try:
                 alp.place_limit_bracket_buy(sym, qty, entry, stop, target, slippage_pct, mode)
@@ -241,20 +229,9 @@ def _place_entry(
     elif order_type == "stop_limit":
         limit_px = round(entry * (1 + slippage_pct / 100), 2)
         alp.place_stop_limit_buy(sym, qty, entry, slippage_pct, mode)
-        note = " [T2 exits added post-fill by monitor]" if target2 > 0 else " — exits pending fill"
-        return f"stop-limit (stop=${entry:.2f} lim=${limit_px}){note}"
+        return f"stop-limit (stop=${entry:.2f} lim=${limit_px}) — exits pending fill"
 
     else:  # "market" or unrecognised
-        if has_exits and use_split:
-            try:
-                alp.place_split_bracket_buy(sym, qty, stop, target, target2, mode)
-                qty1 = int(qty) // 2
-                return (f"split market bracket (stop=${stop:.2f} "
-                        f"T1=${target:.2f}×{qty1}sh T2=${target2:.2f}×{int(qty)-qty1}sh)")
-            except ValueError:
-                pass  # qty too small — fall through to single bracket
-            except Exception as exc:
-                logger.error("_place_entry: split market bracket FAILED for %s: %s — single bracket fallback", sym, exc)
         if has_exits:
             try:
                 alp.place_bracket_buy(sym, qty, stop, target, mode)
