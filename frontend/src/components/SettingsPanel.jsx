@@ -81,6 +81,13 @@ const SECTIONS = [
         ],
       },
       {
+        title: 'Plan Diversity',
+        fields: [
+          { key: 'screener_min_rr',      label: 'Min R:R to include in plan (default 1.5 — drops borderline setups before the AI gate sees them)', type: 'number' },
+          { key: 'max_picks_per_sector', label: 'Max picks per sector (default 2 — caps concentration in any single sector)', type: 'number' },
+        ],
+      },
+      {
         title: 'Sectors',
         fields: [
           { key: 'mv_excluded_sectors', label: 'Excluded sectors', type: 'sector_picker', span: true, defaultValue: '' },
@@ -220,7 +227,7 @@ const SECTIONS = [
           { key: 'rs_price_max',         label: 'Max price $ (0 = no ceiling)',                            type: 'number' },
           { key: 'rs_avg_vol_min',       label: 'Min avg daily volume (default 500000)',                   type: 'number' },
           { key: 'rs_market_cap_min',    label: 'Min market cap $ (default 500000000)',                    type: 'number' },
-          { key: 'rs_min_percentile',    label: 'Min RS percentile to qualify (default 70 = top 30%)',     type: 'number' },
+          { key: 'rs_min_percentile',    label: 'Min RS percentile to qualify (default 75 = top 25%)',     type: 'number' },
           { key: 'rs_max_extension',     label: 'Max % above EMA50 — rejects over-extended stocks (default 15)', type: 'number' },
           { key: 'rs_top_n',             label: 'Top N picks (default 5)',                                 type: 'number' },
           { key: 'rs_require_stage2',    label: 'Require Stage 2 uptrend (price > EMA50 > EMA200)',        type: 'toggle', defaultValue: 'true' },
