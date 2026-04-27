@@ -158,6 +158,17 @@ async def _start_one(mode: str) -> None:
                     "Sleeping %.0fs before retry.",
                     mode, backoff,
                 )
+            elif "close frame" in msg.lower() or "1006" in msg or "1011" in msg:
+                # Ungraceful WS drop (network blip, edge timeout, peer reset).
+                # Alpaca's server-side slot takes ~60-90s to release after an
+                # ungraceful disconnect, so retrying in 5s guarantees a 429.
+                # Jump straight to 60s to give the slot time to expire.
+                backoff = max(backoff, 60.0)
+                logger.warning(
+                    "trade_stream[%s]: WS dropped ungracefully (%s). "
+                    "Sleeping %.0fs to let Alpaca release the slot.",
+                    mode, msg[:80], backoff,
+                )
             else:
                 logger.warning(
                     "trade_stream[%s]: connection error — %s. Retrying in %.0fs.",
