@@ -82,6 +82,101 @@ def _get_weekly_plan_exits(db: Session, symbol: str, mode: str) -> tuple[float, 
     return float(row[0] or 0), float(row[1] or 0)
 
 
+def _derive_fresh_plan(
+    db: Session, symbol: str, mode: str, entry_price: float, current_price: float,
+) -> tuple[float, float]:
+    """For an open position with no weekly_plan row, derive a fresh stop/target
+    from CURRENT price action — not from the original entry — and persist it
+    so subsequent cycles read the same plan.
+
+    Why current-price-anchored: a stale "default" of entry × (1−stop_pct) is
+    obsolete the moment the stock has moved meaningfully off the entry. If the
+    position is up 30%, we should ratchet the stop to lock in some gain
+    (structural EMA20/EMA50 below current), not anchor to the original entry.
+
+    Stop selection (in priority order):
+      1. EMA20 if it's 1–6% below current → tightest structural support
+      2. EMA50 if it's 2–12% below current → wider structural support
+      3. current × (1 − stop_pct%) fallback (hard floor)
+    Stop is clamped to [current × 0.85, current × 0.96] to prevent both
+    catastrophic-wide and whipsaw-tight stops.
+
+    Target = current + (current − stop) × default_rr (default 2.5R).
+    Persists as a weekly_plan row with rank=99, status='EXECUTED' so it
+    coexists with screener-driven plans.
+    """
+    try:
+        from .tv_analyzer import analyze as _analyze
+        tech = _analyze(symbol, db=db) or {}
+    except Exception as exc:
+        logger.warning("_derive_fresh_plan: analyze(%s) failed: %s", symbol, exc)
+        tech = {}
+
+    px_now = float(tech.get("price") or current_price or entry_price or 0)
+    if px_now <= 0:
+        return 0.0, 0.0
+
+    ema20 = float(tech.get("ema20") or 0)
+    ema50 = float(tech.get("ema50") or 0)
+
+    try:
+        stop_pct = float(get_setting(db, "stop_loss_pct", "8.0") or "8.0")
+        rr       = float(get_setting(db, "default_rr", "2.5") or "2.5")
+    except (TypeError, ValueError):
+        stop_pct, rr = 8.0, 2.5
+
+    stop_floor   = round(px_now * 0.85, 2)
+    stop_ceiling = round(px_now * 0.96, 2)
+    fallback     = round(px_now * (1 - stop_pct / 100), 2)
+
+    chosen_stop = 0.0
+    basis = "fallback"
+    if ema20 > 0:
+        gap_pct = (px_now - ema20) / px_now * 100
+        if 1.0 <= gap_pct <= 6.0:
+            chosen_stop = round(ema20 * 0.99, 2)
+            basis = "EMA20"
+    if chosen_stop <= 0 and ema50 > 0:
+        gap_pct = (px_now - ema50) / px_now * 100
+        if 2.0 <= gap_pct <= 12.0:
+            chosen_stop = round(ema50 * 0.99, 2)
+            basis = "EMA50"
+    if chosen_stop <= 0:
+        chosen_stop = fallback
+
+    chosen_stop = max(stop_floor, min(chosen_stop, stop_ceiling))
+    target = round(px_now + (px_now - chosen_stop) * rr, 2)
+
+    # Persist so we don't re-derive every monitor cycle
+    try:
+        db.execute(
+            text("""
+                INSERT INTO weekly_plan
+                    (week_start, symbol, rank, score, entry_price, stop_price,
+                     target1, status, mode)
+                VALUES (
+                    COALESCE(
+                        (SELECT MAX(week_start) FROM weekly_plan WHERE mode = :mode),
+                        CURRENT_DATE
+                    ),
+                    :sym, 99, 0, :entry, :stop, :target, 'EXECUTED', :mode
+                )
+            """),
+            {"sym": symbol, "entry": entry_price or px_now,
+             "stop": chosen_stop, "target": target, "mode": mode},
+        )
+        db.commit()
+    except Exception as exc:
+        logger.warning("_derive_fresh_plan: persist(%s) failed: %s", symbol, exc)
+
+    logger.warning(
+        "Exit guard: %s reanalyzed (no plan) — basis=%s px=$%.2f stop=$%.2f "
+        "target=$%.2f (R:R=%.1f) [%s]",
+        symbol, basis, px_now, chosen_stop, target, rr, mode,
+    )
+    return chosen_stop, target
+
+
 def _get_current_stop_price(orders: list) -> float | None:
     """Extract the active stop price from an open OCO/bracket order's stop leg."""
     for o in orders:
@@ -315,25 +410,25 @@ def _ensure_exit_orders(
             logger.info("Exit guard: %s has in-flight BUY — deferring [%s]", sym, mode)
             continue
 
-        # ── Derive defaults if no plan exits ─────────────────────────────
+        # ── Re-analyze and synthesize a fresh plan if none exists ────────
+        # An entry-anchored "default" goes stale the moment the stock moves
+        # off the original entry. _derive_fresh_plan re-reads CURRENT price
+        # action, picks a structural stop (EMA20/EMA50/fallback) anchored to
+        # the current price, and persists the plan so trailing-stop logic and
+        # subsequent cycles all see the same exits.
         if stop <= 0 or target <= 0:
-            try:
-                stop_pct   = float(get_setting(db, "stop_loss_pct", "8.0") or "8.0")
-                target_pct = float(get_setting(db, "default_target_pct", "20.0") or "20.0")
-            except (TypeError, ValueError):
-                stop_pct, target_pct = 8.0, 20.0
             entry_price   = float(getattr(pos, "avg_entry_price", 0) or 0)
             current_price = float(getattr(pos, "current_price", 0) or entry_price)
-            anchor        = entry_price if entry_price > 0 else current_price
-            if anchor <= 0:
-                logger.warning("Exit guard: %s no anchor price — cannot derive defaults [%s]", sym, mode)
+            if entry_price <= 0 and current_price <= 0:
+                logger.warning("Exit guard: %s no anchor price — cannot derive plan [%s]", sym, mode)
                 continue
-            stop    = round(anchor * (1 - stop_pct / 100), 2)
-            target  = round(anchor * (1 + target_pct / 100), 2)
-            logger.warning(
-                "Exit guard: %s no plan exits — using defaults stop=$%.2f target=$%.2f [%s]",
-                sym, stop, target, mode,
-            )
+            stop, target = _derive_fresh_plan(db, sym, mode, entry_price, current_price)
+            if stop <= 0 or target <= 0:
+                logger.warning(
+                    "Exit guard: %s plan derivation returned invalid prices "
+                    "(stop=%.2f target=%.2f) — skipping [%s]", sym, stop, target, mode,
+                )
+                continue
 
         # ── Inspect current coverage ─────────────────────────────────────
         # A position is "properly covered" only if total sell qty == pos qty
