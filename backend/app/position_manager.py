@@ -573,12 +573,14 @@ def check_post_close(db: Session, mode: str | None = None):
             )
 
     # Resolve AI API key: prefer user-setting 'ai_api_key', fall back to legacy 'claude_api_key'
+    admin_uid = None
     try:
         from sqlalchemy import text as _t
         admin_row = db.execute(_t("SELECT id FROM users WHERE role='admin' ORDER BY id LIMIT 1")).fetchone()
         if admin_row:
+            admin_uid = admin_row[0]
             from .database import get_all_user_settings as _gaus
-            _s = _gaus(db, admin_row[0])
+            _s = _gaus(db, admin_uid)
             api_key = _s.get("ai_api_key", "") or _s.get("claude_api_key", "") or get_setting(db, "claude_api_key", "")
         else:
             api_key = get_setting(db, "claude_api_key", "")
@@ -602,7 +604,7 @@ def check_post_close(db: Session, mode: str | None = None):
         )
 
         if api_key:
-            _run_claude_analysis(db, sym, mode)
+            _run_claude_analysis(db, sym, mode, user_id=admin_uid)
 
         if auto_exec and len(current) < max_pos:
             _refill_slot(
@@ -974,7 +976,7 @@ def _execute_next_pick(db: Session, mode: str, held: set):
         logger.error("Post-close fallback buy failed for %s: %s", sym, exc)
 
 
-def _run_claude_analysis(db: Session, closed_sym: str, mode: str):
+def _run_claude_analysis(db: Session, closed_sym: str, mode: str, user_id: int | None = None):
     try:
         from .claude_analyst import analyze_picks, log_analysis
 
@@ -1008,7 +1010,7 @@ def _run_claude_analysis(db: Session, closed_sym: str, mode: str):
             "reason":      "position closed (stop hit or target reached)",
         }
 
-        analysis = analyze_picks(db, picks, closed_position=closed_ctx)
+        analysis = analyze_picks(db, picks, closed_position=closed_ctx, user_id=user_id, mode=mode)
         log_analysis(db, "post_close", closed_sym, analysis, mode)
         logger.info("Post-close analysis saved for %s [%s].", closed_sym, mode)
 
