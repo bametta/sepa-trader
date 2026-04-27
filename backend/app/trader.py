@@ -1,6 +1,7 @@
 """
 Auto-execution engine: fires trades based on SEPA signals.
-- Every 30-minute cycle: trailing stop adjustment + signal evaluation
+- Every monitor cycle (interval = monitor_interval_minutes, default 30):
+  trailing stop adjustment + signal evaluation
 - Pre-trade AI gate runs before every buy order
 - Exit guard ensures every position has an OCO at all times,
   and replaces existing OCOs when the plan's stop/target has changed
