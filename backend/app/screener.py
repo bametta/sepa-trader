@@ -782,6 +782,14 @@ def run_both_screeners(
         max_per_sector = 2
     if max_per_sector > 0:
         from .rs_screener import gics_label as _gics_label
+        # Diagnostic: log sector field for every pick so we can verify TV values
+        for _r in sorted_picks:
+            logger.info(
+                "Sector cap input: %s tv_sector=%r → gics=%r (screener=%s)",
+                _r.get("symbol"), _r.get("sector", ""),
+                _gics_label((_r.get("sector") or "").strip().lower()) if (_r.get("sector") or "").strip() else "",
+                _r.get("screener_type"),
+            )
         sector_counts: dict[str, int] = {}
         merged: list[dict] = []
         capped_out: list[str] = []
