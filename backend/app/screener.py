@@ -612,9 +612,21 @@ def _save_plan(db: Session, rows: list[dict], week_start: str, mode: str, user_i
     # screener never re-queues a name we already hold (e.g. position opened
     # last week, plan rebuilt today). Best-effort — if Alpaca is unreachable
     # we still save the plan; fill_open_slots will reconcile on next monitor.
+    #
+    # Use a user-scoped client (DB credentials) rather than the global env
+    # client — keys are stored in user_settings, not .env, so the global
+    # client returns 401 unauthorized.
     try:
         from . import alpaca_client as alp
-        held = {p.symbol for p in alp.get_positions(mode)}
+        held_positions = None
+        if user_id:
+            try:
+                held_positions = list(alp.get_positions_for_user(db, user_id, mode))
+            except AttributeError:
+                pass  # function not yet defined — fall through to global client
+        if held_positions is None:
+            held_positions = list(alp.get_positions(mode))
+        held = {p.symbol for p in held_positions}
         already_executed |= held
     except Exception as exc:
         logger.warning("_save_plan: could not fetch Alpaca positions for held-guard: %s", exc)
