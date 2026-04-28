@@ -556,16 +556,8 @@ def _ensure_exit_orders(
             stop_ok   = abs(current_stop - stop) <= _PRICE_CHANGE_THRESHOLD
             qty_ok    = (oco_qty == qty)
 
-            logger.info(
-                "Exit guard OCO %s: qty_ok=%s stop_ok=%s target_ok=%s "
-                "oco_qty=%s pos_qty=%s cur_stop=%.2f plan_stop=%.2f "
-                "cur_target=%s plan_target=%.2f",
-                sym, qty_ok, stop_ok, target_ok,
-                oco_qty, qty, current_stop, stop,
-                current_target, target,
-            )
             if qty_ok and stop_ok and target_ok:
-                logger.info("Exit guard: %s OCO coverage correct — no action.", sym)
+                logger.debug("Exit guard: %s OCO coverage correct — no action.", sym)
                 continue
 
         else:
@@ -593,15 +585,10 @@ def _ensure_exit_orders(
                 and abs(current_stop - stop) <= _PRICE_CHANGE_THRESHOLD
                 and abs(current_target - target) <= _PRICE_CHANGE_THRESHOLD
             )
-            logger.info(
-                "Exit guard two-order %s: has_stop=%s has_limit=%s "
-                "stop_qty=%s limit_qty=%s pos_qty=%s prices_match=%s",
-                sym, has_stop_leg, has_limit_leg, stop_qty, limit_qty, qty, prices_match,
-            )
             if (has_stop_leg and has_limit_leg
                     and stop_qty == qty and limit_qty == qty
                     and len(sell_legs) == 2 and prices_match):
-                logger.info("Exit guard: %s two-order coverage correct — no action.", sym)
+                logger.debug("Exit guard: %s two-order coverage correct — no action.", sym)
                 continue
 
         # ── Serialized replace: cancel all sells, wait, place fresh ──────
