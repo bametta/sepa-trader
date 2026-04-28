@@ -470,7 +470,7 @@ def run_monday_open(db: Session, mode: str | None = None):
             )
             continue
 
-        if not _gate(db, sym, qty, entry, stop, target, "MONDAY_OPEN", mode):
+        if not _gate(db, sym, qty, entry, stop, target, "MONDAY_OPEN", mode, user_id=admin_uid):
             continue
 
         try:
@@ -855,7 +855,7 @@ def _execute_specific_pick(db: Session, mode: str, symbol: str, pending_picks: l
         logger.info("Slot refill: %s position size < 1 share (avail=$%.2f) — skipping.", symbol, avail)
         return
 
-    if not _gate(db, symbol, qty, entry, stop, target, "SLOT_REFILL", mode):
+    if not _gate(db, symbol, qty, entry, stop, target, "SLOT_REFILL", mode, user_id=user_id):
         return
 
     try:
@@ -953,7 +953,7 @@ def _execute_next_pick(db: Session, mode: str, held: set, user_id: int | None = 
         )
         return
 
-    if not _gate(db, sym, qty, entry, stop, target, "POST_CLOSE", mode):
+    if not _gate(db, sym, qty, entry, stop, target, "POST_CLOSE", mode, user_id=admin_uid):
         return
 
     try:
