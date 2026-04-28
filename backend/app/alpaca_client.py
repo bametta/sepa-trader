@@ -87,6 +87,63 @@ def get_positions(mode: str = "paper"):
     return get_client(mode).get_all_positions()
 
 
+def _get_user_client(db, user_id: int | None, mode: str) -> TradingClient | None:
+    """Resolve a TradingClient from DB-stored credentials for a specific user.
+    Returns None if user_id is None or no credentials are found (caller falls
+    back to the global env-based client).
+    """
+    if not user_id:
+        return None
+    from .database import get_user_setting as _gus
+    is_admin = db.execute(
+        __import__("sqlalchemy").text("SELECT role FROM users WHERE id = :id"),
+        {"id": user_id},
+    ).scalar() == "admin"
+    if mode == "paper":
+        key    = (_gus(db, "alpaca_paper_key",    "", user_id) or "").strip()
+        secret = (_gus(db, "alpaca_paper_secret", "", user_id) or "").strip()
+        if is_admin:
+            key    = key    or (settings.alpaca_paper_key    or "").strip()
+            secret = secret or (settings.alpaca_paper_secret or "").strip()
+        paper = True
+    else:
+        key    = (_gus(db, "alpaca_live_key",    "", user_id) or "").strip()
+        secret = (_gus(db, "alpaca_live_secret", "", user_id) or "").strip()
+        if is_admin:
+            key    = key    or (settings.alpaca_live_key    or "").strip()
+            secret = secret or (settings.alpaca_live_secret or "").strip()
+        paper = False
+    if not key or not secret:
+        return None
+    return get_client_for_keys(key, secret, paper)
+
+
+def get_positions_for_user(db, user_id: int | None, mode: str = "paper"):
+    """Fetch positions using DB-stored credentials for a specific user.
+    Falls back to the global client if no DB creds are found.
+    """
+    client = _get_user_client(db, user_id, mode)
+    return (client or get_client(mode)).get_all_positions()
+
+
+def get_account_for_user(db, user_id: int | None, mode: str = "paper"):
+    """Fetch account using DB-stored credentials for a specific user.
+    Falls back to the global client if no DB creds are found.
+    """
+    client = _get_user_client(db, user_id, mode)
+    return (client or get_client(mode)).get_account()
+
+
+def get_open_orders_by_symbol_for_user(db, user_id: int | None, mode: str = "paper") -> dict[str, list]:
+    """Open orders keyed by symbol, using user-scoped credentials."""
+    client = _get_user_client(db, user_id, mode) or get_client(mode)
+    orders = client.get_orders(GetOrdersRequest(status=QueryOrderStatus.OPEN))
+    result: dict[str, list] = {}
+    for o in orders:
+        result.setdefault(o.symbol, []).append(o)
+    return result
+
+
 def get_open_orders(mode: str = "paper"):
     return get_client(mode).get_orders(GetOrdersRequest(status=QueryOrderStatus.OPEN))
 
@@ -167,16 +224,20 @@ def find_recent_fills(mode: str, symbol: str, side: str, days: int = 30) -> list
 
 def find_position_close_activity(mode: str, symbol: str, days: int = 90) -> list:
     """Query /account/activities for non-trade dispositions of `symbol` —
-    mergers (MA), spinoffs (SC), non-regulatory corporate actions (NRC,
-    e.g. delisting, ticker change), and cash-in-lieu (CIL).
+    mergers (MA), symbol/name changes (SC, NC), reorgs (REORG), cash-in-lieu
+    (CIL), ACATS transfers, and stock splits (SPLIT).
 
     Used as a fallback when a position is closed on Alpaca but no SELL order
     exists. Returns list of dicts with at least {qty, price, timestamp,
     activity_type} so trade_log can record what happened to the shares.
+
+    NOTE: Alpaca rejects the entire request with `invalid activity type` if
+    ANY listed type is unrecognized — only include types from Alpaca's
+    documented enum. `NRC` was previously listed and broke this whole call.
     """
     from datetime import datetime, timedelta, timezone
     after = (datetime.now(timezone.utc) - timedelta(days=days)).date().isoformat()
-    activity_types = "MA,SC,NRC,CIL,ACATC,ACATS"
+    activity_types = "MA,SC,NC,REORG,CIL,ACATC,ACATS,SPLIT"
     try:
         raw = get_client(mode).get(
             "/account/activities",
@@ -354,9 +415,11 @@ def place_oca_exit(
     Place a single OCO (One-Cancels-Other) sell order for an existing position.
     When one leg fills, Alpaca automatically cancels the other.
 
-    Both stop_loss and take_profit must be passed explicitly as request objects —
-    Alpaca raises code 40010001 if take_profit.limit_price is missing even when
-    limit_price is set on the parent LimitOrderRequest.
+    Alpaca's API rejects OCO unless BOTH `stop_loss.stop_price` and
+    `take_profit.limit_price` are provided (error 40010001), so both kwargs
+    are required regardless of parent type. The parent is a LimitOrderRequest
+    where the parent's limit_price doubles as the take-profit working price —
+    the take_profit kwarg is the API-mandated sibling spec.
     """
     req = LimitOrderRequest(
         symbol=symbol,
@@ -366,141 +429,31 @@ def place_oca_exit(
         limit_price=round(target_price, 2),
         order_class=OrderClass.OCO,
         stop_loss=StopLossRequest(stop_price=round(stop_price, 2)),
-        take_profit=TakeProfitRequest(limit_price=round(target_price, 2)),  # ← required by Alpaca
+        take_profit=TakeProfitRequest(limit_price=round(target_price, 2)),
     )
     return get_client(mode).submit_order(req)
 
 
-def place_split_bracket_buy(
-    symbol: str,
-    qty: float,
-    stop_price: float,
-    t1_price: float,
-    t2_price: float,
-    mode: str = "paper",
-):
-    """
-    Place two market bracket orders for a split-lot T1/T2 exit strategy.
-    Lot 1: qty//2 shares — stop=stop_price, take-profit=t1_price.
-    Lot 2: remaining shares — stop=stop_price, take-profit=t2_price.
-    Both stop legs are identical so trailing stop logic treats them uniformly.
-    Raises ValueError if qty < 2 (can't split into two 1-share lots).
-    """
-    if stop_price <= 0 or t1_price <= 0 or t2_price <= 0:
-        raise ValueError(f"place_split_bracket_buy {symbol}: invalid stop/t1/t2 ({stop_price}/{t1_price}/{t2_price})")
-    if t1_price <= stop_price or t2_price <= stop_price:
-        raise ValueError(f"place_split_bracket_buy {symbol}: targets must exceed stop ${stop_price:.2f}")
-    qty_int = int(round(qty))
-    qty1    = qty_int // 2
-    qty2    = qty_int - qty1
-    if qty1 < 1 or qty2 < 1:
-        raise ValueError(f"qty {qty_int} too small to split into T1/T2 lots (min 2 shares)")
-    client = get_client(mode)
-    o1 = client.submit_order(MarketOrderRequest(
-        symbol=symbol, qty=qty1, side=OrderSide.BUY,
-        time_in_force=TimeInForce.DAY, order_class=OrderClass.BRACKET,
-        stop_loss=StopLossRequest(stop_price=round(stop_price, 2)),
-        take_profit=TakeProfitRequest(limit_price=round(t1_price, 2)),
-    ))
-    o2 = client.submit_order(MarketOrderRequest(
-        symbol=symbol, qty=qty2, side=OrderSide.BUY,
-        time_in_force=TimeInForce.DAY, order_class=OrderClass.BRACKET,
-        stop_loss=StopLossRequest(stop_price=round(stop_price, 2)),
-        take_profit=TakeProfitRequest(limit_price=round(t2_price, 2)),
-    ))
-    return o1, o2
+def verify_oca_parent(parent) -> tuple[bool, bool]:
+    """Verify that an OCO parent Order returned from submit_order has both
+    a stop and a limit (take-profit) child. Returns (has_limit, has_stop).
 
-
-def place_split_limit_bracket_buy(
-    symbol: str,
-    qty: float,
-    entry_price: float,
-    stop_price: float,
-    t1_price: float,
-    t2_price: float,
-    slippage_pct: float = 0.5,
-    mode: str = "paper",
-):
-    """
-    Place two DAY limit bracket orders for a split-lot T1/T2 exit strategy.
-    Raises ValueError if qty < 2.
-    """
-    if entry_price <= 0 or stop_price <= 0 or t1_price <= 0 or t2_price <= 0:
-        raise ValueError(
-            f"place_split_limit_bracket_buy {symbol}: invalid entry/stop/t1/t2 "
-            f"({entry_price}/{stop_price}/{t1_price}/{t2_price})"
-        )
-    if stop_price >= entry_price:
-        raise ValueError(f"place_split_limit_bracket_buy {symbol}: stop ${stop_price:.2f} must be below entry ${entry_price:.2f}")
-    if t1_price <= entry_price or t2_price <= entry_price:
-        raise ValueError(f"place_split_limit_bracket_buy {symbol}: targets must exceed entry ${entry_price:.2f}")
-    qty_int     = int(round(qty))
-    qty1        = qty_int // 2
-    qty2        = qty_int - qty1
-    if qty1 < 1 or qty2 < 1:
-        raise ValueError(f"qty {qty_int} too small to split into T1/T2 lots (min 2 shares)")
-    limit_price = round(entry_price * (1 + slippage_pct / 100), 2)
-    client      = get_client(mode)
-    o1 = client.submit_order(LimitOrderRequest(
-        symbol=symbol, qty=qty1, side=OrderSide.BUY,
-        time_in_force=TimeInForce.DAY, limit_price=limit_price,
-        order_class=OrderClass.BRACKET,
-        stop_loss=StopLossRequest(stop_price=round(stop_price, 2)),
-        take_profit=TakeProfitRequest(limit_price=round(t1_price, 2)),
-    ))
-    o2 = client.submit_order(LimitOrderRequest(
-        symbol=symbol, qty=qty2, side=OrderSide.BUY,
-        time_in_force=TimeInForce.DAY, limit_price=limit_price,
-        order_class=OrderClass.BRACKET,
-        stop_loss=StopLossRequest(stop_price=round(stop_price, 2)),
-        take_profit=TakeProfitRequest(limit_price=round(t2_price, 2)),
-    ))
-    return o1, o2
-
-
-def replace_split_oca_exits(
-    symbol: str,
-    qty1: float,
-    qty2: float,
-    new_stop: float,
-    t1_price: float,
-    t2_price: float,
-    mode: str = "paper",
-):
-    """
-    Cancel all exit orders for a split-lot position and re-place two OCOs
-    with an updated stop (trailing stop update). T1 and T2 targets are preserved.
-    """
-    cancelled = cancel_symbol_exit_orders(symbol, mode)
-    if cancelled:
-        cleared = wait_for_orders_cancelled(symbol, mode, timeout=6.0, poll_interval=0.4)
-        if not cleared:
-            logger.warning("replace_split_oca_exits: cancellation timeout for %s", symbol)
-    place_oca_exit(symbol, qty1, new_stop, t1_price, mode)
-    try:
-        place_oca_exit(symbol, qty2, new_stop, t2_price, mode)
-    except Exception as exc:
-        # Second leg failed — qty2 is now naked (qty1 has its OCO, qty2 does not).
-        # Retry once before raising so a transient API blip doesn't leave the
-        # position partially unhedged.
-        logger.error("replace_split_oca_exits: second leg failed for %s: %s — retrying", symbol, exc)
-        time.sleep(0.5)
-        try:
-            place_oca_exit(symbol, qty2, new_stop, t2_price, mode)
-        except Exception as exc2:
-            logger.error(
-                "replace_split_oca_exits: second leg retry failed for %s: %s — qty2 NAKED",
-                symbol, exc2,
-            )
-            try:
-                from . import telegram_alerts as tg
-                tg.alert_system_error_sync(
-                    f"NAKED LEG [{mode}] {symbol} qty2={qty2} — split-OCO second leg failed twice",
-                    exc2, level="URGENT",
-                )
-            except Exception:
-                pass
-            raise
+    Parent layout (see place_oca_exit): parent itself is the stop_limit, and
+    the target lives in `.legs` as the take_profit sibling. We inspect .legs
+    directly because Alpaca's "held" sibling status doesn't reliably appear
+    in status=open queries."""
+    if parent is None:
+        return False, False
+    parent_type = str(getattr(parent, "order_type", "") or getattr(parent, "type", "") or "").lower()
+    has_stop  = "stop" in parent_type
+    has_limit = "limit" in parent_type and "stop" not in parent_type  # parent is stop_limit, not pure limit
+    for leg in (getattr(parent, "legs", None) or []):
+        leg_type = str(getattr(leg, "order_type", "") or getattr(leg, "type", "") or "").lower()
+        if "stop" in leg_type:
+            has_stop = True
+        elif "limit" in leg_type:
+            has_limit = True
+    return has_limit, has_stop
 
 
 def cancel_symbol_exit_orders(symbol: str, mode: str = "paper") -> list[str]:

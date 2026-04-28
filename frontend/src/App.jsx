@@ -11,6 +11,7 @@ import SettingsPanel from './components/SettingsPanel'
 import WeeklyPlan from './components/WeeklyPlan'
 import AdminPanel from './components/AdminPanel'
 import DualMomentumTab from './components/DualMomentumTab'
+import PreTradeLog from './components/PreTradeLog'
 import { fetchPositions, updateSetting, fetchSettings } from './api/client'
 
 const POSITIONS_INTERVAL = 5000
@@ -22,6 +23,7 @@ const TAB_CONFIG = [
   { id: 'History',        icon: '◷', label: 'History' },
   { id: 'Weekly Plan',    icon: '✦', label: 'Weekly Plan' },
   { id: 'Dual Momentum',  icon: '⟳', label: 'Dual Momentum' },
+  { id: 'AI Gate',        icon: '✓', label: 'AI Gate' },
   { id: 'Settings',       icon: '⚙', label: 'Settings' },
 ]
 
@@ -190,6 +192,7 @@ function Dashboard() {
           {tab === 'History'       && <AlpacaHistoryTable />}
           {tab === 'Weekly Plan'   && <WeeklyPlan />}
           {tab === 'Dual Momentum' && <DualMomentumTab />}
+          {tab === 'AI Gate'       && <PreTradeLog />}
           {tab === 'Settings'      && <SettingsPanel />}
           {tab === 'Admin'         && <AdminPanel />}
         </div>

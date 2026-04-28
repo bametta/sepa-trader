@@ -74,6 +74,7 @@ _COLS = [
     "volume",
     "average_volume_30d_calc",
     "sector",
+    "industry",
 ]
 
 
@@ -233,6 +234,7 @@ def _score_sepa(
         "score":       score,
         "price":       round(close, 4),
         "sector":      (v.get("sector") or "").strip(),
+        "industry":    (v.get("industry") or "").strip(),
         "ema20":       round(e20, 4)  if e20  else None,
         "ema50":       round(e50, 4)  if e50  else None,
         "ema150":      round(e150, 4) if e150 else None,

@@ -18,6 +18,11 @@ class TVAlert(BaseModel):
     volume: float = 0
     score: int = 0
     secret: str = ""
+    # TradingView's native sector/industry labels. Send via Pine alert template
+    # using `{{syminfo.sector}}` and `{{syminfo.industry}}`. Used for sector
+    # exclusion before any sizing/AI/order work runs.
+    sector: str = ""
+    industry: str = ""
 
 
 @router.post("/tradingview")
@@ -53,26 +58,83 @@ async def tradingview(alert: TVAlert, db: Session = Depends(get_db)):
         market_open = False
 
     if auto_execute and market_open:
-        positions   = {p.symbol: p for p in alp.get_positions(mode)}
-        acct        = alp.get_account(mode)
+        from ..position_manager import _resolve_admin_uid as _admin_uid
+        _wh_uid     = _admin_uid(db)
+        positions   = {p.symbol: p for p in alp.get_positions_for_user(db, _wh_uid, mode)}
+        acct        = alp.get_account_for_user(db, _wh_uid, mode)
         portfolio   = float(acct.portfolio_value)
         max_pos     = int(get_setting(db, "max_positions", "10"))
+
+        if signal == "BREAKOUT" and symbol not in positions:
+            # Sector exclusion — uses the TV-native sector label sent by the
+            # alert. Resolves the configured exclusion list (which may use
+            # GICS-style names) into TV sector names via _resolve_excluded.
+            # Falls back to the RS strategy's default exclusion list when
+            # no `tv_excluded_sectors` setting is present, so existing
+            # operators get sane defaults without configuring anything.
+            tv_sector = (alert.sector or "").strip().lower()
+            if tv_sector:
+                try:
+                    from ..rs_screener import _resolve_excluded, _DEFAULT_EXCLUDED_SECTORS
+                    raw = get_setting(
+                        db, "tv_excluded_sectors",
+                        get_setting(db, "rs_excluded_sectors", ",".join(_DEFAULT_EXCLUDED_SECTORS)),
+                    )
+                    excluded = _resolve_excluded([s for s in (raw or "").split(",") if s.strip()])
+                    if tv_sector in excluded:
+                        action_taken = f"BLOCKED_SECTOR: {alert.sector}"
+                        # Skip the rest of the BREAKOUT branch entirely.
+                        signal = "_SECTOR_BLOCKED"
+                except Exception:
+                    pass
 
         if signal == "BREAKOUT" and symbol not in positions:
             if len(positions) < max_pos:
                 stop, target = _get_weekly_plan_exits(db, symbol, mode)
                 qty = _size_position(portfolio, alert.price, risk_pct, stop_pct, stop_price=stop)
+
+                # Apply min_cash_pct buffer (mirrors fill_open_slots) so a TV
+                # breakout cannot push cash below the configured floor.
+                try:
+                    from ..position_manager import _settled_funds_available
+                    min_cash_pct = float(get_setting(db, "min_cash_pct", "10.0") or "10.0")
+                    avail        = _settled_funds_available(acct, portfolio, min_cash_pct, 0.0)
+                    if avail > 0 and alert.price > 0:
+                        qty = min(qty, int(avail / alert.price))
+                    else:
+                        qty = 0
+                except Exception:
+                    pass
+
                 if qty >= 1:
                     if not _gate(db, symbol, qty, alert.price, stop, target, "TV_BREAKOUT", mode):
                         action_taken = "BLOCKED_BY_AI"
                     else:
+                        # Hard pre-submit cash guard (TV market buy goes direct
+                        # to place_market_buy, bypassing _place_entry's check).
                         try:
-                            alp.place_market_buy(symbol, qty, mode)
-                            _log_trade(db, symbol, "BUY", qty, alert.price, "TV_BREAKOUT", mode)
-                            action_taken = f"BUY {qty} shares"
-                            asyncio.create_task(tg.alert_trade("BUY", symbol, qty, alert.price, "TV_BREAKOUT", mode))
-                        except Exception as e:
-                            action_taken = f"BUY_FAILED: {e}"
+                            live_cash  = float(getattr(alp.get_account_for_user(db, _wh_uid, mode), "cash", 0) or 0)
+                            worst_cost = qty * alert.price * 1.01
+                        except Exception:
+                            live_cash, worst_cost = 0.0, float("inf")
+                        if worst_cost > live_cash:
+                            action_taken = (
+                                f"BLOCKED_CASH_GUARD: worst-case ${worst_cost:.2f} "
+                                f"> settled cash ${live_cash:.2f}"
+                            )
+                        else:
+                            try:
+                                alp.place_market_buy(symbol, qty, mode)
+                                _log_trade(db, symbol, "BUY", qty, alert.price, "TV_BREAKOUT", mode)
+                                action_taken = f"BUY {qty} shares"
+                                from ..claude_analyst import get_latest_pre_trade
+                                v, r = get_latest_pre_trade(db, symbol, mode)
+                                asyncio.create_task(tg.alert_trade(
+                                    "BUY", symbol, qty, alert.price, "TV_BREAKOUT", mode,
+                                    ai_verdict=v, ai_reason=r,
+                                ))
+                            except Exception as e:
+                                action_taken = f"BUY_FAILED: {e}"
 
         elif signal == "NO_SETUP" and symbol in positions:
             try:

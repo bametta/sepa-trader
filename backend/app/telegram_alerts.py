@@ -76,12 +76,47 @@ async def alert_breakout(symbols: list[str], mode: str):
     )
 
 
-async def alert_trade(action: str, symbol: str, qty: float, price: float, trigger: str, mode: str):
-    await send(
+async def alert_trade(
+    action: str,
+    symbol: str,
+    qty: float,
+    price: float,
+    trigger: str,
+    mode: str,
+    ai_verdict: str | None = None,
+    ai_reason: str | None = None,
+):
+    body = (
         f"*TRADE EXECUTED* [{mode.upper()}]\n\n"
-        f"Action: `{action}`\nSymbol: `{symbol}`\nQty: `{qty}`\nPrice: `${price:.2f}`\nTrigger: `{trigger}`",
-        level="INFO",
+        f"Action: `{action}`\nSymbol: `{symbol}`\nQty: `{qty}`\nPrice: `${price:.2f}`\nTrigger: `{trigger}`"
     )
+    if ai_verdict:
+        body += f"\n\n*AI gate:* `{ai_verdict}`"
+        if ai_reason:
+            body += f"\n_{ai_reason[:200]}_"
+    await send(body, level="INFO")
+
+
+def alert_trade_sync(
+    action: str,
+    symbol: str,
+    qty: float,
+    price: float,
+    trigger: str,
+    mode: str,
+    ai_verdict: str | None = None,
+    ai_reason: str | None = None,
+) -> bool:
+    """Sync trade alert for non-async call sites (monitor loop, position_manager)."""
+    body = (
+        f"*TRADE EXECUTED* [{mode.upper()}]\n\n"
+        f"Action: `{action}`\nSymbol: `{symbol}`\nQty: `{qty}`\nPrice: `${price:.2f}`\nTrigger: `{trigger}`"
+    )
+    if ai_verdict:
+        body += f"\n\n*AI gate:* `{ai_verdict}`"
+        if ai_reason:
+            body += f"\n_{ai_reason[:200]}_"
+    return send_sync(body, level="INFO")
 
 
 def alert_system_error_sync(context: str, error: str | Exception, level: str = "URGENT") -> bool:

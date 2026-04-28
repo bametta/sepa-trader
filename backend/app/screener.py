@@ -47,6 +47,7 @@ def _fetch_market_universe(
     excluded_sectors: set[str],
     exchanges: list[str] | None = None,
     max_results: int = 300,
+    excluded_industries: set[str] | None = None,
 ) -> list[str]:
     """Server-side TradingView scan for SEPA Stage-2 candidates.
 
@@ -81,7 +82,7 @@ def _fetch_market_universe(
     if price_max and price_max > 0:
         filters.append({"left": "close", "operation": "eless", "right": price_max})
 
-    columns = ["close", "sector", "average_volume_30d_calc", "market_cap_basic"]
+    columns = ["close", "sector", "average_volume_30d_calc", "market_cap_basic", "industry"]
 
     try:
         resp = httpx.post(
@@ -107,19 +108,23 @@ def _fetch_market_universe(
         logger.warning("Market-wide TV scan returned 0 rows — check filter set or TV availability")
         return []
 
-    # Local sector exclusion. `sector` column is at index 1.
+    # Local sector / industry exclusion. Columns: 0=close, 1=sector,
+    # 2=avg_vol, 3=market_cap, 4=industry.
     out: list[str] = []
     skipped_sector = 0
     for row in rows:
         try:
             full_sym = row["s"]                  # e.g. "NASDAQ:AAPL"
             sector   = (row["d"][1] or "").strip()
+            industry = (row["d"][4] or "").strip() if len(row["d"]) > 4 else ""
         except (KeyError, IndexError, TypeError):
             continue
-        # excluded_sectors is a set of LOWERCASE TV sector names (resolved via
-        # _rs_resolve). TV's `sector` column comes back capitalised, so we must
-        # lower-case it before the membership check or the filter silently fails.
+        # excluded_sectors / excluded_industries are sets of LOWERCASE TV
+        # names. TV returns capitalised values so lowercase before checking.
         if excluded_sectors and sector.lower() in excluded_sectors:
+            skipped_sector += 1
+            continue
+        if excluded_industries and industry.lower() in excluded_industries:
             skipped_sector += 1
             continue
         sym = full_sym.split(":")[-1]
@@ -235,10 +240,14 @@ def run_screener(db: Session, mode: str = None, user_id: int = None, account_val
 
     # Sector exclusion — Minervini-specific. Falls back to the legacy
     # `screener_excluded_sectors` key so existing settings keep working.
-    from .rs_screener import _resolve_excluded as _rs_resolve
+    from .rs_screener import (
+        _resolve_excluded as _rs_resolve,
+        _resolve_excluded_industries as _rs_resolve_industries,
+    )
     _excluded_csv = _s("mv_excluded_sectors", "") or _s("screener_excluded_sectors", "")
     _excluded_raw = [s.strip() for s in _excluded_csv.split(",") if s.strip()]
-    excluded_sectors = _rs_resolve(_excluded_raw) if _excluded_raw else set()
+    excluded_sectors    = _rs_resolve(_excluded_raw) if _excluded_raw else set()
+    excluded_industries = _rs_resolve_industries(_excluded_raw) if _excluded_raw else set()
 
     if account_value is None:
         try:
@@ -309,6 +318,7 @@ def run_screener(db: Session, mode: str = None, user_id: int = None, account_val
             price_min=price_min,
             price_max=price_max,
             excluded_sectors=excluded_sectors,
+            excluded_industries=excluded_industries,
         )
         if scanned:
             universe = scanned
@@ -351,6 +361,11 @@ def run_screener(db: Session, mode: str = None, user_id: int = None, account_val
                 continue
             if sector in excluded_sectors:
                 logger.debug("Minervini screener: %s excluded (sector=%s).", sym, sector)
+                continue
+        if excluded_industries:
+            industry = (result.get("industry") or "").strip().lower()
+            if industry and industry in excluded_industries:
+                logger.debug("Minervini screener: %s excluded (industry=%s).", sym, industry)
                 continue
         all_scored.append({"symbol": sym, **result})
 
@@ -471,6 +486,7 @@ def run_screener(db: Session, mode: str = None, user_id: int = None, account_val
             "status":        "PENDING",
             "mode":          mode,
             "screener_type": "minervini",
+            "sector":        (c.get("sector") or "").strip(),
         })
 
     # Always save (even empty) so last-run info is queryable
@@ -596,9 +612,14 @@ def _save_plan(db: Session, rows: list[dict], week_start: str, mode: str, user_i
     # screener never re-queues a name we already hold (e.g. position opened
     # last week, plan rebuilt today). Best-effort — if Alpaca is unreachable
     # we still save the plan; fill_open_slots will reconcile on next monitor.
+    #
+    # Use a user-scoped client (DB credentials) rather than the global env
+    # client — keys are stored in user_settings, not .env, so the global
+    # client returns 401 unauthorized.
     try:
         from . import alpaca_client as alp
-        held = {p.symbol for p in alp.get_positions(mode)}
+        held_positions = list(alp.get_positions_for_user(db, user_id, mode))
+        held = {p.symbol for p in held_positions}
         already_executed |= held
     except Exception as exc:
         logger.warning("_save_plan: could not fetch Alpaca positions for held-guard: %s", exc)
@@ -723,19 +744,86 @@ def run_both_screeners(
         if r["symbol"] not in seen:
             seen[r["symbol"]] = r
 
+    # ── R:R floor ────────────────────────────────────────────────────────────
+    # Drop picks whose plan-level R:R falls below `screener_min_rr`. The
+    # AI gate already WARN-blocks at fill time, but every borderline pick
+    # in the weekly_plan wastes a slot until the gate rejects it. Filtering
+    # at screener time keeps the plan lean.
+    try:
+        min_rr = float(_gus2(db, "screener_min_rr", "1.5", user_id) or "1.5")
+    except (TypeError, ValueError):
+        min_rr = 1.5
+    if min_rr > 0:
+        before_rr = len(seen)
+        kept: dict[str, dict] = {}
+        for sym, r in seen.items():
+            entry = float(r.get("entry_price") or 0)
+            stop  = float(r.get("stop_price")  or 0)
+            t1    = float(r.get("target1")    or 0)
+            if entry <= stop or t1 <= entry:
+                continue  # malformed exits — drop
+            rr = (t1 - entry) / (entry - stop)
+            if rr >= min_rr:
+                kept[sym] = r
+        dropped = before_rr - len(kept)
+        if dropped:
+            logger.info("Plan merge: %d picks dropped below R:R %.2fx", dropped, min_rr)
+        seen = kept
+
     # Re-rank all picks globally by RS score so highest-momentum stocks buy first
-    merged = sorted(
+    sorted_picks = sorted(
         seen.values(),
         key=lambda r: score_map.get(r["symbol"], -999.0),
         reverse=True,
     )
 
+    # ── Per-sector cap ───────────────────────────────────────────────────────
+    # Walk picks in score order and skip any whose sector is already at the
+    # cap. Forces diversity in tape regimes where one sector (Technology in
+    # the current AI cycle) dominates absolute scoring.
+    try:
+        max_per_sector = int(_gus2(db, "max_picks_per_sector", "2", user_id) or "2")
+    except (TypeError, ValueError):
+        max_per_sector = 2
+    if max_per_sector > 0:
+        from .rs_screener import gics_label as _gics_label
+        # Diagnostic: log sector field for every pick so we can verify TV values
+        for _r in sorted_picks:
+            logger.error(
+                "SECTOR-CAP-DIAG: %s tv_sector=%r → gics=%r (screener=%s)",
+                _r.get("symbol"), _r.get("sector", ""),
+                _gics_label((_r.get("sector") or "").strip().lower()) if (_r.get("sector") or "").strip() else "",
+                _r.get("screener_type"),
+            )
+        sector_counts: dict[str, int] = {}
+        merged: list[dict] = []
+        capped_out: list[str] = []
+        for r in sorted_picks:
+            tv_sec = (r.get("sector") or "").strip().lower()
+            # Map to GICS umbrella so "Electronic Technology" + "Technology
+            # Services" both count toward the same "technology" cap bucket.
+            sec = _gics_label(tv_sec) if tv_sec else ""
+            if sec and sector_counts.get(sec, 0) >= max_per_sector:
+                capped_out.append(f"{r['symbol']}({sec})")
+                continue
+            merged.append(r)
+            if sec:
+                sector_counts[sec] = sector_counts.get(sec, 0) + 1
+        if capped_out:
+            logger.error(
+                "SECTOR-CAP: %d picks dropped by sector cap (%d/sector): %s",
+                len(capped_out), max_per_sector, ", ".join(capped_out[:10]),
+            )
+    else:
+        merged = sorted_picks
+
     total_picks = len(merged)
     for i, row in enumerate(merged, 1):
         row["rank"] = i
-        if row.get("screener_type") == "rs_momentum":
-            # Score = percentile within this plan (rank 1 of N = 99th, last = ~0th)
-            row["score"] = int((1 - (i - 1) / total_picks) * 99) if total_picks > 0 else 50
+        # RS picks: keep the real percentile-vs-all-scored-candidates that the
+        # RS screener computed. Previously it was overwritten with a synthetic
+        # rank-in-plan value which made a top-25% stock look like 49th/59th
+        # in the UI — misleading and not actionable.
 
     week_start = merged[0]["week_start"] if merged else _next_monday().isoformat()
     _save_plan(db, merged, week_start, mode, user_id)

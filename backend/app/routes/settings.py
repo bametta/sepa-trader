@@ -56,6 +56,12 @@ EDITABLE_KEYS = {
     "rs_min_percentile", "rs_require_stage2",
     "rs_max_extension", "rs_top_n", "rs_max_slots",
     "rs_exchanges", "rs_excluded_sectors",
+    # Plan diversity / merge settings
+    "screener_min_rr", "max_picks_per_sector",
+    # Cash floor
+    "block_on_warn", "tv_excluded_sectors",
+    # Daily drawdown halt
+    "daily_drawdown_halt_pct",
 }
 
 

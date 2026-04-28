@@ -11,6 +11,18 @@ from . import alpaca_client as alp
 logger = logging.getLogger(__name__)
 
 
+def _resolve_admin_uid(db: Session) -> int | None:
+    """Look up the admin user's ID from the DB. Used when a function has no
+    user_id param but needs user-scoped Alpaca credentials."""
+    try:
+        row = db.execute(
+            text("SELECT id FROM users WHERE role='admin' ORDER BY id LIMIT 1")
+        ).fetchone()
+        return row[0] if row else None
+    except Exception:
+        return None
+
+
 def _size_qty(portfolio: float, entry: float, stop: float, risk_pct: float, stop_pct: float) -> float:
     stop_dollar = (entry - stop) if stop > 0 else entry * (stop_pct / 100)
     if stop_dollar <= 0:
@@ -34,23 +46,21 @@ def _is_economic(db: Session, qty: float, price: float) -> bool:
 def _settled_funds_available(acct, portfolio: float, min_cash_pct: float, committed: float = 0.0) -> float:
     """Funds genuinely available to deploy on a new buy.
 
-    Alpaca's `buying_power` includes unsettled proceeds from same-day sales,
-    which can phantom-double the available cash on rebalance days
-    (T+1 settlement, finalized 2024). Prefer settled `cash`, fall back to
-    non-marginable buying power, last resort `buying_power`.
+    Use ONLY settled `cash`. Alpaca's `buying_power` includes margin (2x on
+    margin accounts) and unsettled proceeds, which can phantom-double the
+    available cash and silently fund entries that breach the cash floor.
+    If `cash` is missing/zero, return 0 — that's a fail-closed signal to
+    skip the entry rather than fall through to leveraged buying power.
 
     `committed` is dollars already earmarked by earlier buys in the same
     multi-symbol loop, so we don't repeatedly hand out the same cash.
     """
-    settled = 0.0
-    for attr in ("cash", "non_marginable_buying_power", "buying_power"):
-        try:
-            v = float(getattr(acct, attr) or 0)
-        except (TypeError, ValueError):
-            v = 0.0
-        if v > 0:
-            settled = v
-            break
+    try:
+        settled = float(getattr(acct, "cash", 0) or 0)
+    except (TypeError, ValueError):
+        settled = 0.0
+    if settled <= 0:
+        return 0.0
     buffer  = portfolio * (min_cash_pct / 100)
     return max(0.0, settled - buffer - committed)
 
@@ -65,7 +75,7 @@ def _effective_max_positions(db: Session, mode: str) -> int:
         return configured
     try:
         from .database import get_live_account_limits
-        acct   = alp.get_account(mode)
+        acct   = alp.get_account_for_user(db, _resolve_admin_uid(db), mode)
         limits = get_live_account_limits(float(acct.portfolio_value))
         cap    = limits.get("max_positions")
         if cap is not None:
@@ -96,7 +106,7 @@ def _gate(
     try:
         from .claude_analyst import pre_trade_analysis, log_pre_trade, get_stored_weekly_plan_analysis
         stored       = get_stored_weekly_plan_analysis(db, symbol, mode)
-        acct         = alp.get_account(mode)
+        acct         = alp.get_account_for_user(db, user_id or _resolve_admin_uid(db), mode)
         portfolio    = float(acct.portfolio_value)
         cash         = float(acct.cash)
         buying_power = float(acct.buying_power)
@@ -188,17 +198,17 @@ def _place_entry(
     trigger: str,
     mode: str,
     screener_type: str = "minervini",
-    target2: float = 0.0,
+    target2: float = 0.0,  # kept for caller compat — ignored (single-OCO model)
+    user_id: int | None = None,
 ) -> str:
     """
     Submit the entry buy using the user-configured order type.
     Returns a short description string for logging.
 
-    When target2 > 0 and qty >= 2, places two bracket orders (split-lot):
-      Lot 1: qty//2 shares with take-profit at target (T1)
-      Lot 2: remaining shares with take-profit at target2 (T2)
-    stop_limit entries cannot carry brackets — split-lot falls back to T1-only
-    for stop_limit order type.
+    Single-OCO model: one stop and one target per position. The split T1/T2
+    logic was removed because Alpaca paper silently dropped sibling stop legs
+    when stacking multiple OCOs on the same symbol. `target2` is accepted for
+    caller compatibility but no longer used.
 
     Settings are split by screener source:
       mv_entry_order_type / mv_entry_slippage_pct  — Minervini/breakout picks
@@ -211,21 +221,36 @@ def _place_entry(
         order_type   = get_setting(db, "mv_entry_order_type",   "stop_limit")
         slippage_pct = float(get_setting(db, "mv_entry_slippage_pct", "1.0"))
 
-    has_exits   = stop > 0 and target > 0
-    use_split   = target2 > 0 and int(qty) >= 2 and order_type != "stop_limit"
+    # Hard pre-submit cash guard. Sizing already enforces min_cash_pct on a
+    # snapshot, but slippage and racing fills (other entries within the same
+    # cycle) can push the actual debit above settled cash and quietly draw
+    # margin. Refetch cash now and abort if worst-case cost exceeds it.
+    # Limit/stop-limit: worst case is the limit cap. Market: assume +1% slip.
+    try:
+        slip = max(slippage_pct, 1.0) if order_type == "market" else slippage_pct
+        worst_px   = entry * (1 + slip / 100)
+        worst_cost = qty * worst_px
+        live_acct  = alp.get_account_for_user(db, user_id or _resolve_admin_uid(db), mode)
+        live_cash  = float(getattr(live_acct, "cash", 0) or 0)
+        if worst_cost > live_cash:
+            msg = (
+                f"pre-submit cash guard: worst-case ${worst_cost:.2f} "
+                f"> settled cash ${live_cash:.2f} — refusing to submit "
+                f"(would draw margin)"
+            )
+            logger.warning("_place_entry %s [%s]: %s", sym, mode, msg)
+            raise RuntimeError(msg)
+    except RuntimeError:
+        raise
+    except Exception as exc:
+        # Failure to fetch cash is itself a fail-closed signal.
+        logger.error("_place_entry %s: cash guard refetch failed: %s — refusing", sym, exc)
+        raise RuntimeError(f"cash guard refetch failed: {exc}")
+
+    has_exits = stop > 0 and target > 0
 
     if order_type == "limit":
         limit_px = round(entry * (1 + slippage_pct / 100), 2)
-        if has_exits and use_split:
-            try:
-                alp.place_split_limit_bracket_buy(sym, qty, entry, stop, target, target2, slippage_pct, mode)
-                qty1 = int(qty) // 2
-                return (f"split limit bracket (lim=${limit_px} stop=${stop:.2f} "
-                        f"T1=${target:.2f}×{qty1}sh T2=${target2:.2f}×{int(qty)-qty1}sh)")
-            except ValueError:
-                pass  # qty too small — fall through to single bracket
-            except Exception as exc:
-                logger.error("_place_entry: split limit bracket FAILED for %s: %s — single bracket fallback", sym, exc)
         if has_exits:
             try:
                 alp.place_limit_bracket_buy(sym, qty, entry, stop, target, slippage_pct, mode)
@@ -241,20 +266,9 @@ def _place_entry(
     elif order_type == "stop_limit":
         limit_px = round(entry * (1 + slippage_pct / 100), 2)
         alp.place_stop_limit_buy(sym, qty, entry, slippage_pct, mode)
-        note = " [T2 exits added post-fill by monitor]" if target2 > 0 else " — exits pending fill"
-        return f"stop-limit (stop=${entry:.2f} lim=${limit_px}){note}"
+        return f"stop-limit (stop=${entry:.2f} lim=${limit_px}) — exits pending fill"
 
     else:  # "market" or unrecognised
-        if has_exits and use_split:
-            try:
-                alp.place_split_bracket_buy(sym, qty, stop, target, target2, mode)
-                qty1 = int(qty) // 2
-                return (f"split market bracket (stop=${stop:.2f} "
-                        f"T1=${target:.2f}×{qty1}sh T2=${target2:.2f}×{int(qty)-qty1}sh)")
-            except ValueError:
-                pass  # qty too small — fall through to single bracket
-            except Exception as exc:
-                logger.error("_place_entry: split market bracket FAILED for %s: %s — single bracket fallback", sym, exc)
         if has_exits:
             try:
                 alp.place_bracket_buy(sym, qty, stop, target, mode)
@@ -348,12 +362,13 @@ def run_monday_open(db: Session, mode: str | None = None):
         )
         return
 
+    admin_uid = _resolve_admin_uid(db)
     max_pos = _effective_max_positions(db, mode)
     mv_max  = int(get_setting(db, "mv_max_slots", "3") or "3")
     pb_max  = int(get_setting(db, "pb_max_slots", "2") or "2")
 
     try:
-        positions = alp.get_positions(mode)
+        positions = alp.get_positions_for_user(db, admin_uid, mode)
     except Exception as exc:
         logger.error("Monday open: could not fetch positions: %s", exc)
         return
@@ -411,7 +426,7 @@ def run_monday_open(db: Session, mode: str | None = None):
         return
 
     try:
-        acct      = alp.get_account(mode)
+        acct      = alp.get_account_for_user(db, admin_uid, mode)
         portfolio = float(acct.portfolio_value)
     except Exception as exc:
         logger.error("Monday open: could not fetch account: %s", exc)
@@ -459,7 +474,7 @@ def run_monday_open(db: Session, mode: str | None = None):
             continue
 
         try:
-            order_desc   = _place_entry(db, sym, qty, entry, stop, target, "MONDAY_OPEN", mode, stype, target2=target2)
+            order_desc   = _place_entry(db, sym, qty, entry, stop, target, "MONDAY_OPEN", mode, stype, target2=target2, user_id=admin_uid)
             order_placed = True
             logger.info("Monday open: %s qty=%.0f — %s", sym, qty, order_desc)
 
@@ -486,6 +501,16 @@ def run_monday_open(db: Session, mode: str | None = None):
             db.commit()
             held.add(sym)
             committed += qty * entry
+            try:
+                from . import telegram_alerts as tg
+                from .claude_analyst import get_latest_pre_trade
+                v, r = get_latest_pre_trade(db, sym, mode)
+                tg.alert_trade_sync(
+                    "BUY", sym, qty, entry, "MONDAY_OPEN", mode,
+                    ai_verdict=v, ai_reason=r,
+                )
+            except Exception:
+                pass
 
         except Exception as exc:
             logger.error("Monday open: buy failed for %s: %s", sym, exc)
@@ -502,8 +527,10 @@ def check_post_close(db: Session, mode: str | None = None):
     if mode is None:
         mode = get_setting(db, "trading_mode", "paper")
 
+    admin_uid = _resolve_admin_uid(db)
+
     try:
-        current = {p.symbol for p in alp.get_positions(mode)}
+        current = {p.symbol for p in alp.get_positions_for_user(db, admin_uid, mode)}
     except Exception as exc:
         logger.error("check_post_close: cannot fetch positions: %s", exc)
         return
@@ -562,12 +589,14 @@ def check_post_close(db: Session, mode: str | None = None):
             )
 
     # Resolve AI API key: prefer user-setting 'ai_api_key', fall back to legacy 'claude_api_key'
+    admin_uid = None
     try:
         from sqlalchemy import text as _t
         admin_row = db.execute(_t("SELECT id FROM users WHERE role='admin' ORDER BY id LIMIT 1")).fetchone()
         if admin_row:
+            admin_uid = admin_row[0]
             from .database import get_all_user_settings as _gaus
-            _s = _gaus(db, admin_row[0])
+            _s = _gaus(db, admin_uid)
             api_key = _s.get("ai_api_key", "") or _s.get("claude_api_key", "") or get_setting(db, "claude_api_key", "")
         else:
             api_key = get_setting(db, "claude_api_key", "")
@@ -591,7 +620,7 @@ def check_post_close(db: Session, mode: str | None = None):
         )
 
         if api_key:
-            _run_claude_analysis(db, sym, mode)
+            _run_claude_analysis(db, sym, mode, user_id=admin_uid)
 
         if auto_exec and len(current) < max_pos:
             _refill_slot(
@@ -604,9 +633,10 @@ def check_post_close(db: Session, mode: str | None = None):
                 close_price=close_price,
                 current_positions=current,
                 max_pos=max_pos,
+                user_id=admin_uid,
             )
             try:
-                current = {p.symbol for p in alp.get_positions(mode)}
+                current = {p.symbol for p in alp.get_positions_for_user(db, admin_uid, mode)}
             except Exception:
                 pass
 
@@ -627,6 +657,7 @@ def _refill_slot(
     close_price: float | None,
     current_positions: set,
     max_pos: int,
+    user_id: int | None = None,
 ):
     """
     Run slot-refill analysis and execute the recommended pick if approved.
@@ -641,7 +672,7 @@ def _refill_slot(
     mv_held, pb_held, rs_held = _count_positions_by_type(db, mode, current_positions)
 
     try:
-        acct         = alp.get_account(mode)
+        acct         = alp.get_account_for_user(db, user_id or _resolve_admin_uid(db), mode)
         portfolio    = float(acct.portfolio_value)
         cash         = float(acct.cash)
         buying_power = float(acct.buying_power)
@@ -768,7 +799,7 @@ def _refill_slot(
             )
             return
 
-        _execute_specific_pick(db=db, mode=mode, symbol=recommended, pending_picks=eligible_picks)
+        _execute_specific_pick(db=db, mode=mode, symbol=recommended, pending_picks=eligible_picks, user_id=user_id)
 
     except Exception as exc:
         logger.error(
@@ -786,7 +817,7 @@ def _refill_slot(
             pass
 
 
-def _execute_specific_pick(db: Session, mode: str, symbol: str, pending_picks: list[dict]):
+def _execute_specific_pick(db: Session, mode: str, symbol: str, pending_picks: list[dict], user_id: int | None = None):
     """Execute a specific symbol from the pending picks list."""
     pick = next((p for p in pending_picks if p["symbol"] == symbol), None)
     if not pick:
@@ -804,7 +835,7 @@ def _execute_specific_pick(db: Session, mode: str, symbol: str, pending_picks: l
         return
 
     try:
-        acct      = alp.get_account(mode)
+        acct      = alp.get_account_for_user(db, user_id or _resolve_admin_uid(db), mode)
         portfolio = float(acct.portfolio_value)
     except Exception as exc:
         logger.error("Slot refill: account fetch failed: %s", exc)
@@ -828,7 +859,7 @@ def _execute_specific_pick(db: Session, mode: str, symbol: str, pending_picks: l
         return
 
     try:
-        order_desc = _place_entry(db, symbol, qty, entry, stop, target, "SLOT_REFILL", mode, stype, target2=target2)
+        order_desc = _place_entry(db, symbol, qty, entry, stop, target, "SLOT_REFILL", mode, stype, target2=target2, user_id=user_id)
         logger.info("Slot refill: %s qty=%.0f — %s [%s]", symbol, qty, order_desc, mode)
 
         db.execute(
@@ -850,12 +881,22 @@ def _execute_specific_pick(db: Session, mode: str, symbol: str, pending_picks: l
         )
         db.commit()
         logger.info("Slot refill complete: opened %s [%s]", symbol, mode)
+        try:
+            from . import telegram_alerts as tg
+            from .claude_analyst import get_latest_pre_trade
+            v, r = get_latest_pre_trade(db, symbol, mode)
+            tg.alert_trade_sync(
+                "BUY", symbol, qty, entry, "SLOT_REFILL", mode,
+                ai_verdict=v, ai_reason=r,
+            )
+        except Exception:
+            pass
 
     except Exception as exc:
         logger.error("Slot refill buy failed for %s: %s", symbol, exc)
 
 
-def _execute_next_pick(db: Session, mode: str, held: set):
+def _execute_next_pick(db: Session, mode: str, held: set, user_id: int | None = None):
     """Fallback — execute the next PENDING pick without slot-refill analysis."""
     row = db.execute(
         text("""
@@ -888,7 +929,7 @@ def _execute_next_pick(db: Session, mode: str, held: set):
         return
 
     try:
-        acct      = alp.get_account(mode)
+        acct      = alp.get_account_for_user(db, user_id or _resolve_admin_uid(db), mode)
         portfolio = float(acct.portfolio_value)
     except Exception as exc:
         logger.error("Post-close fallback: account fetch failed: %s", exc)
@@ -916,7 +957,7 @@ def _execute_next_pick(db: Session, mode: str, held: set):
         return
 
     try:
-        order_desc = _place_entry(db, sym, qty, entry, stop, target, "POST_CLOSE", mode, stype, target2=target2)
+        order_desc = _place_entry(db, sym, qty, entry, stop, target, "POST_CLOSE", mode, stype, target2=target2, user_id=admin_uid)
         logger.info("Post-close fallback: %s qty=%.0f — %s", sym, qty, order_desc)
 
         db.execute(
@@ -938,12 +979,22 @@ def _execute_next_pick(db: Session, mode: str, held: set):
         )
         db.commit()
         logger.info("Post-close fallback: opened %s [%s]", sym, mode)
+        try:
+            from . import telegram_alerts as tg
+            from .claude_analyst import get_latest_pre_trade
+            v, r = get_latest_pre_trade(db, sym, mode)
+            tg.alert_trade_sync(
+                "BUY", sym, qty, entry, "POST_CLOSE", mode,
+                ai_verdict=v, ai_reason=r,
+            )
+        except Exception:
+            pass
 
     except Exception as exc:
         logger.error("Post-close fallback buy failed for %s: %s", sym, exc)
 
 
-def _run_claude_analysis(db: Session, closed_sym: str, mode: str):
+def _run_claude_analysis(db: Session, closed_sym: str, mode: str, user_id: int | None = None):
     try:
         from .claude_analyst import analyze_picks, log_analysis
 
@@ -977,7 +1028,7 @@ def _run_claude_analysis(db: Session, closed_sym: str, mode: str):
             "reason":      "position closed (stop hit or target reached)",
         }
 
-        analysis = analyze_picks(db, picks, closed_position=closed_ctx)
+        analysis = analyze_picks(db, picks, closed_position=closed_ctx, user_id=user_id, mode=mode)
         log_analysis(db, "post_close", closed_sym, analysis, mode)
         logger.info("Post-close analysis saved for %s [%s].", closed_sym, mode)
 
@@ -1065,7 +1116,7 @@ def fill_open_slots(
     # once and re-using is fine — the loop completes in seconds and Alpaca's
     # settled-cash field doesn't change mid-cycle absent fills.
     try:
-        acct = alp.get_account(mode)
+        acct = alp.get_account_for_user(db, user_id or _resolve_admin_uid(db), mode)
     except Exception as exc:
         logger.error("fill_open_slots [%s]: get_account failed: %s — aborting.", mode, exc)
         return
@@ -1157,6 +1208,37 @@ def fill_open_slots(
         if price <= 0:
             continue
 
+        # Re-evaluate exits at fill time. Screener-time stop/target can be
+        # days/weeks stale by the time a slot opens; price has likely moved
+        # and structural support (EMA20/50) has shifted. Recomputing from
+        # current technicals keeps R:R and risk sizing honest, and ensures
+        # the pre-trade gate sees current numbers — not what the screener
+        # froze on Monday.
+        try:
+            from .trader import _compute_fresh_exits
+            fresh_stop, fresh_target, basis = _compute_fresh_exits(db, sym, price)
+            if fresh_stop > 0 and fresh_target > 0:
+                logger.info(
+                    "fill_open_slots: re-evaluated %s — basis=%s px=$%.2f stop=$%.2f→$%.2f target=$%.2f→$%.2f",
+                    sym, basis, price, stop, fresh_stop, target, fresh_target,
+                )
+                stop, target = fresh_stop, fresh_target
+                # Persist the refreshed plan so monitor/UI read consistent values.
+                try:
+                    db.execute(
+                        text("""
+                            UPDATE weekly_plan SET stop_price = :s, target1 = :t, entry_price = :e
+                            WHERE symbol = :sym AND mode = :mode
+                              AND week_start = (SELECT MAX(week_start) FROM weekly_plan WHERE mode = :mode)
+                        """),
+                        {"s": stop, "t": target, "e": price, "sym": sym, "mode": mode},
+                    )
+                    db.commit()
+                except Exception as _exc:
+                    logger.warning("fill_open_slots: persist refreshed plan failed for %s: %s", sym, _exc)
+        except Exception as _exc:
+            logger.warning("fill_open_slots: re-evaluation failed for %s — using stored exits: %s", sym, _exc)
+
         qty = _size_qty(portfolio, price, stop, risk_pct, stop_pct)
         # Cap at max_position_pct of portfolio
         max_position_pct = float(get_setting(db, "max_position_pct", "20.0") or "20.0")
@@ -1189,7 +1271,7 @@ def fill_open_slots(
 
         order_placed = False
         try:
-            order_desc = _place_entry(db, sym, qty, price, stop, target, f"FILL_{signal}", mode, stype, target2=target2)
+            order_desc = _place_entry(db, sym, qty, price, stop, target, f"FILL_{signal}", mode, stype, target2=target2, user_id=user_id)
             order_placed = True
             logger.info(
                 "fill_open_slots [%s]: opened %s qty=%.0f signal=%s — %s",
@@ -1212,6 +1294,16 @@ def fill_open_slots(
                 {"s": sym, "q": qty, "p": price, "t": f"FILL_{signal}", "m": mode},
             )
             db.commit()
+            try:
+                from . import telegram_alerts as tg
+                from .claude_analyst import get_latest_pre_trade
+                v, r = get_latest_pre_trade(db, sym, mode, user_id=user_id)
+                tg.alert_trade_sync(
+                    "BUY", sym, qty, price, f"FILL_{signal}", mode,
+                    ai_verdict=v, ai_reason=r,
+                )
+            except Exception:
+                pass
 
             committed += qty * price
             held_symbols.add(sym)
@@ -1352,13 +1444,16 @@ def _log_alpaca_side_sell(db: Session, sym: str, mode: str) -> bool:
             return True
         # Fall through if nothing deleted — shouldn't happen but be safe.
 
-    fills = alp.find_recent_fills(mode, sym, "SELL", days=90)
+    fills = alp.find_recent_fills(mode, sym, "SELL", days=365)
     if not fills:
         # No SELL order exists — most often this means the position was
         # closed by a corporate action (merger, spinoff, delisting) rather
         # than a trade. Fall back to /account/activities and synthesize a
         # SELL row so reconciliation drift clears.
-        activities = alp.find_position_close_activity(mode, sym, days=90)
+        # 365d window: paper positions can sit closed-but-unreconciled for
+        # months between sessions; 90d was too short and surfaced as
+        # persistent POSITION DRIFT alerts that no fix could clear.
+        activities = alp.find_position_close_activity(mode, sym, days=365)
         if activities:
             inserted = 0
             for act in activities:
@@ -1385,10 +1480,52 @@ def _log_alpaca_side_sell(db: Session, sym: str, mode: str) -> bool:
             if inserted:
                 db.commit()
                 return True
+        # Last resort: nothing to reconstruct from. Before deleting, RE-VERIFY
+        # the symbol genuinely isn't in Alpaca — guards against transient API
+        # outages where get_positions returned a partial list earlier in the
+        # reconcile cycle. If still absent, delete the unmatched BUY row(s)
+        # so drift clears permanently.
+        try:
+            current_syms = {p.symbol.upper() for p in alp.get_positions_for_user(db, _resolve_admin_uid(db), mode)}
+        except Exception as exc:
+            logger.warning(
+                "[%s] %s: cannot re-verify Alpaca positions (%s) — leaving "
+                "orphaned BUY in DB; will retry next cycle.", mode, sym, exc,
+            )
+            return False
+        if sym.upper() in current_syms:
+            logger.info(
+                "[%s] %s: re-check shows position IS in Alpaca after all — "
+                "skipping cleanup, drift will resolve next cycle.", mode, sym,
+            )
+            return False
+
+        deleted = db.execute(
+            text("""
+                DELETE FROM trade_log
+                WHERE symbol = :s AND mode = :m AND action = 'BUY'
+                  AND NOT EXISTS (
+                      SELECT 1 FROM trade_log s
+                      WHERE s.symbol = :s AND s.mode = :m
+                        AND s.action = 'SELL'
+                        AND s.created_at > trade_log.created_at
+                  )
+            """),
+            {"s": sym, "m": mode},
+        ).rowcount
+        if deleted:
+            db.commit()
+            logger.warning(
+                "[%s] %s: orphaned BUY row(s) deleted (%d) — Alpaca shows no "
+                "position and no SELL fills/corp actions in last 365d. "
+                "trade_log now matches broker state.",
+                mode, sym, deleted,
+            )
+            return True
+
         logger.warning(
-            "[%s] %s closed on Alpaca but no recent SELL fills or corporate "
-            "actions found in last 90 days — cannot reconstruct trade_log",
-            mode, sym,
+            "[%s] %s: no Alpaca history found and no BUY row to delete — "
+            "drift state inconsistent. Investigate manually.", mode, sym,
         )
         return False
 
@@ -1451,7 +1588,7 @@ def backfill_missing_sells(db: Session, mode: str) -> dict:
     Safe to run repeatedly — `_log_alpaca_side_sell` is idempotent.
     """
     try:
-        alpaca_syms = {p.symbol for p in alp.get_positions(mode)}
+        alpaca_syms = {p.symbol for p in alp.get_positions_for_user(db, _resolve_admin_uid(db), mode)}
     except Exception as exc:
         logger.error("backfill_missing_sells [%s]: alpaca fetch failed: %s", mode, exc)
         return {"backfilled": [], "skipped": [], "error": str(exc)}
@@ -1513,7 +1650,7 @@ def reconcile_db_vs_alpaca(db: Session, mode: str) -> dict:
     from . import telegram_alerts as tg
 
     try:
-        alpaca_syms = {p.symbol for p in alp.get_positions(mode)}
+        alpaca_syms = {p.symbol for p in alp.get_positions_for_user(db, _resolve_admin_uid(db), mode)}
     except Exception as exc:
         logger.error("reconcile_db_vs_alpaca [%s]: alpaca fetch failed: %s", mode, exc)
         return {"drift": False, "error": str(exc)}
@@ -1558,7 +1695,7 @@ def reconcile_db_vs_alpaca(db: Session, mode: str) -> dict:
     # current position state as fallback) so trade_log reflects truth.
     if unexpected_in_alpaca:
         try:
-            alpaca_pos_by_sym = {p.symbol: p for p in alp.get_positions(mode)}
+            alpaca_pos_by_sym = {p.symbol: p for p in alp.get_positions_for_user(db, _resolve_admin_uid(db), mode)}
         except Exception as exc:
             logger.warning("reconcile: position fetch for backfill failed: %s", exc)
             alpaca_pos_by_sym = {}
