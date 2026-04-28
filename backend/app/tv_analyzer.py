@@ -171,6 +171,126 @@ def analyze(symbol: str, db=None) -> dict:
     return batch_analyze([symbol], db=db).get(symbol, {"signal": "ERROR", "score": 0, "price": None})
 
 
+# Full column set for the unified scan — same fields batch_analyze fetches via
+# symbol lookup, plus market_cap_basic for the pre-filter sort.
+_SCAN_COLS = [
+    "close", "EMA20", "EMA50", "EMA100", "EMA200", "SMA200",
+    "volume", "average_volume_30d_calc", "market_cap_basic",
+    "sector", "industry",
+]
+
+
+def scan_and_score_universe(
+    price_min: float = 0.0,
+    price_max: float = 0.0,
+    excluded_sectors: set | None = None,
+    excluded_industries: set | None = None,
+    exchanges: list | None = None,
+    max_results: int = 1500,
+    vol_surge_pct: float = 40.0,
+    ema20_pct: float = 2.0,
+    ema50_pct: float = 3.0,
+    db=None,
+) -> dict[str, dict]:
+    """Single TV scanner call: filter the full exchange, fetch SEPA columns,
+    and score everything — replaces the old two-call flow (universe fetch +
+    batch_analyze). Returns {symbol: result_dict} in the same format as
+    batch_analyze().
+
+    Server-side filters applied:
+      • price ≥ max($5, price_min)
+      • 30-day avg volume ≥ 500k
+      • market cap ≥ $300M
+      • exchange in NYSE / NASDAQ (or override)
+      • Stage-2 trend ladder: close > SMA50 > SMA150 > SMA200
+
+    Sector / industry exclusion and SEPA scoring are done client-side on the
+    returned rows so every Stage-2 candidate on the exchange is evaluated.
+    """
+    floor_price = max(5.0, price_min or 0)
+    filters: list[dict] = [
+        {"left": "close",                   "operation": "egreater", "right": floor_price},
+        {"left": "average_volume_30d_calc", "operation": "egreater", "right": 500_000},
+        {"left": "market_cap_basic",        "operation": "egreater", "right": 300_000_000},
+        {"left": "exchange", "operation": "in_range",
+         "right": exchanges or ["NYSE", "NASDAQ"]},
+        # Stage-2 trend ladder — pre-filter to structural candidates only
+        {"left": "close",  "operation": "greater", "right": "SMA50"},
+        {"left": "SMA50",  "operation": "greater", "right": "SMA150"},
+        {"left": "SMA150", "operation": "greater", "right": "SMA200"},
+    ]
+    if price_max and price_max > 0:
+        filters.append({"left": "close", "operation": "eless", "right": price_max})
+
+    def _do_request(cookie: str = ""):
+        headers = dict(_TV_HEADERS)
+        if cookie:
+            headers["Cookie"] = cookie
+        return httpx.post(
+            SCAN_URL,
+            json={
+                "filter":  filters,
+                "columns": _SCAN_COLS,
+                "range":   [0, max_results],
+                "sort":    {"sortBy": "average_volume_30d_calc", "sortOrder": "desc"},
+                "markets": ["america"],
+            },
+            timeout=60,
+            headers=headers,
+        )
+
+    global _tv_cookie
+    try:
+        resp = _do_request(_tv_cookie)
+        if resp.status_code == 401:
+            _tv_cookie = ""
+            fresh = _get_tv_cookie(db)
+            if fresh:
+                _tv_cookie = fresh
+                resp = _do_request(_tv_cookie)
+            else:
+                logger.warning("scan_and_score_universe: TV 401 and no credentials — returning empty")
+                return {}
+        if resp.status_code == 401:
+            logger.warning("scan_and_score_universe: TV 401 even after auth — returning empty")
+            return {}
+        if not resp.is_success:
+            logger.warning("scan_and_score_universe: TV returned %d — returning empty", resp.status_code)
+            return {}
+    except Exception as exc:
+        logger.error("scan_and_score_universe: request failed: %s", exc)
+        return {}
+
+    rows = resp.json().get("data") or []
+    excluded_sectors    = excluded_sectors    or set()
+    excluded_industries = excluded_industries or set()
+
+    results: dict[str, dict] = {}
+    skipped = 0
+    for row in rows:
+        try:
+            full_sym = row["s"]
+            vals     = dict(zip(_SCAN_COLS, row["d"]))
+        except (KeyError, IndexError, TypeError):
+            continue
+        sector   = (vals.get("sector")   or "").strip()
+        industry = (vals.get("industry") or "").strip()
+        if excluded_sectors    and sector.lower()   in excluded_sectors:
+            skipped += 1
+            continue
+        if excluded_industries and industry.lower() in excluded_industries:
+            skipped += 1
+            continue
+        sym = full_sym.split(":")[-1]
+        results[sym] = _score_sepa(sym, vals, vol_surge_pct, ema20_pct, ema50_pct)
+
+    logger.info(
+        "scan_and_score_universe: %d from TV, %d sector-skipped, %d scored (max_results=%d)",
+        len(rows), skipped, len(results), max_results,
+    )
+    return results
+
+
 def _score_sepa(
     symbol: str,
     v: dict,

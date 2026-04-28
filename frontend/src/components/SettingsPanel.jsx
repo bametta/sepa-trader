@@ -78,6 +78,7 @@ const SECTIONS = [
           { key: 'screener_vol_surge_pct',       label: 'Volume surge threshold % above avg (e.g. 40 = 1.4×)', type: 'number' },
           { key: 'screener_ema20_pct',           label: 'EMA20 proximity band %',                              type: 'number' },
           { key: 'screener_ema50_pct',           label: 'EMA50 proximity band %',                              type: 'number' },
+          { key: 'screener_universe_size',        label: 'Exchange scan depth — symbols pulled from TV (default 1500)', type: 'number' },
           { key: 'screener_max_ema200_ext_pct',  label: 'Max % above EMA200 — early setup filter (0 = off, default 65)', type: 'number' },
           { key: 'screener_max_ema50_ext_pct',   label: 'Max % above EMA50 — overextension filter (0 = off)',  type: 'number' },
         ],
