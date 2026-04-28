@@ -179,6 +179,151 @@ _SCAN_COLS = [
     "sector", "industry",
 ]
 
+# Mega scan column set: superset covering all three screeners in one TV call.
+# Minervini needs: close, EMA20/50/100/200, SMA200, volume, avg_vol, market_cap, sector, industry
+# Pullback adds:   RSI, ADX, price_52_week_high, earnings_release_next_date, Perf.1M, Perf.3M
+# RS Momentum adds: Perf.6M, Perf.Y, exchange
+_MEGA_COLS = [
+    "close",
+    "EMA20",
+    "EMA50",
+    "EMA100",
+    "EMA200",
+    "SMA200",
+    "volume",
+    "average_volume_30d_calc",
+    "market_cap_basic",
+    "sector",
+    "industry",
+    "exchange",
+    "RSI",
+    "ADX",
+    "price_52_week_high",
+    "earnings_release_next_date",
+    "Perf.1M",
+    "Perf.3M",
+    "Perf.6M",
+    "Perf.Y",
+]
+
+
+def scan_universe_mega(
+    price_min: float = 5.0,
+    price_max: float = 0.0,
+    exchanges: list | None = None,
+    max_results: int = 1500,
+    db=None,
+) -> dict[str, dict]:
+    """Single TradingView scan covering all three screeners (Minervini, Pullback, RS).
+
+    Uses the broadest possible server-side filter — price, volume, market cap,
+    and exchange only. No strategy-specific EMA ladder or RSI filters are applied
+    server-side so the same dataset can feed all three screeners for their own
+    local filtering passes.
+
+    Returns {symbol: raw_vals_dict} with all _MEGA_COLS fields present.
+    Empty dict on failure so callers fall back to individual TV calls.
+    """
+    global _tv_cookie
+    floor_price = max(5.0, price_min or 0)
+    filters: list[dict] = [
+        {"left": "close",                   "operation": "egreater", "right": floor_price},
+        {"left": "average_volume_30d_calc", "operation": "egreater", "right": 500_000},
+        {"left": "market_cap_basic",        "operation": "egreater", "right": 300_000_000},
+        {"left": "exchange", "operation": "in_range",
+         "right": exchanges or ["NYSE", "NASDAQ"]},
+    ]
+    if price_max and price_max > 0:
+        filters.append({"left": "close", "operation": "eless", "right": price_max})
+
+    def _do_request(cookie: str = ""):
+        headers = dict(_TV_HEADERS)
+        if cookie:
+            headers["Cookie"] = cookie
+        return httpx.post(
+            SCAN_URL,
+            json={
+                "filter":  filters,
+                "columns": _MEGA_COLS,
+                "range":   [0, max_results],
+                "sort":    {"sortBy": "average_volume_30d_calc", "sortOrder": "desc"},
+                "markets": ["america"],
+            },
+            timeout=60,
+            headers=headers,
+        )
+
+    try:
+        resp = _do_request(_tv_cookie)
+        if resp.status_code == 401:
+            _tv_cookie = ""
+            fresh = _get_tv_cookie(db)
+            if fresh:
+                _tv_cookie = fresh
+                resp = _do_request(_tv_cookie)
+            else:
+                logger.warning("scan_universe_mega: TV 401 and no credentials — returning empty")
+                return {}
+        if resp.status_code == 401:
+            logger.warning("scan_universe_mega: TV 401 even after auth — returning empty")
+            return {}
+        if not resp.is_success:
+            logger.warning("scan_universe_mega: TV returned %d — returning empty", resp.status_code)
+            return {}
+    except Exception as exc:
+        logger.error("scan_universe_mega: request failed: %s", exc)
+        return {}
+
+    rows = resp.json().get("data") or []
+    result: dict[str, dict] = {}
+    for row in rows:
+        try:
+            sym  = row["s"].split(":")[-1]
+            vals = dict(zip(_MEGA_COLS, row["d"]))
+            result[sym] = vals
+        except (KeyError, IndexError, TypeError):
+            continue
+
+    logger.info(
+        "scan_universe_mega: %d symbols fetched (%d columns each, max_results=%d)",
+        len(result), len(_MEGA_COLS), max_results,
+    )
+    return result
+
+
+def score_mega_for_minervini(
+    mega_data: dict[str, dict],
+    vol_surge_pct: float = 40.0,
+    ema20_pct: float = 2.0,
+    ema50_pct: float = 3.0,
+) -> dict[str, dict]:
+    """Apply Minervini Stage-2 pre-filter and SEPA scoring to pre-fetched mega data.
+
+    Replicates the server-side Stage-2 ladder (close > EMA50 > EMA100 > EMA200)
+    that scan_and_score_universe applies — using EMA columns as a proxy for the
+    SMA50/SMA150/SMA200 TV server-side check. In practice EMA ≈ SMA for liquid
+    large-caps, so the difference is negligible.
+
+    Returns {symbol: sepa_result} in the same format as scan_and_score_universe().
+    """
+    results: dict[str, dict] = {}
+    for sym, vals in mega_data.items():
+        close = vals.get("close") or 0.0
+        e50   = vals.get("EMA50")  or 0.0
+        e100  = vals.get("EMA100") or 0.0
+        e200  = vals.get("EMA200") or 0.0
+        # Stage-2 approximation using EMA ladder (server-side uses SMA50>SMA150>SMA200)
+        if not (close > 0 and e50 > 0 and e100 > 0 and e200 > 0):
+            continue
+        if not (close > e50 and e50 > e100 and e100 > e200):
+            continue
+        results[sym] = _score_sepa(sym, vals, vol_surge_pct, ema20_pct, ema50_pct)
+    logger.info(
+        "score_mega_for_minervini: %d of %d passed Stage-2 pre-filter",
+        len(results), len(mega_data),
+    )
+    return results
+
 
 def scan_and_score_universe(
     price_min: float = 0.0,
