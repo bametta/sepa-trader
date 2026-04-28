@@ -244,6 +244,12 @@ def run_screener(db: Session, mode: str = None, user_id: int = None, account_val
     #   the last base; entry risk is high. Default 0 (disabled).
     max_ema200_ext_pct = float(_s("screener_max_ema200_ext_pct", "65") or "0") or 0.0
     max_ema50_ext_pct  = float(_s("screener_max_ema50_ext_pct",  "0")  or "0") or 0.0
+    # How many symbols to pull from the exchange (0 = default 1500).
+    # Higher values cover more of NYSE+NASDAQ at the cost of a slightly larger
+    # HTTP response. TV's scanner handles up to ~2000 in a single request.
+    universe_size = int(_s("screener_universe_size", "1500") or "1500")
+    if universe_size <= 0:
+        universe_size = 1500
 
     # Sector exclusion — Minervini-specific. Falls back to the legacy
     # `screener_excluded_sectors` key so existing settings keep working.
@@ -310,45 +316,57 @@ def run_screener(db: Session, mode: str = None, user_id: int = None, account_val
             )
             min_score_floor = floor_from_limits
 
-    # Universe selection priority:
+    # Universe selection:
     #   1. Explicit `screener_universe` CSV override (testing / watchlist mode)
-    #   2. Market-wide TV scan (default — picks up real Stage-2 leaders fresh
-    #      every run instead of re-scoring the same hardcoded mega-caps)
-    #   3. Hardcoded DEFAULT_UNIVERSE as last-resort fallback if the TV scan
-    #      returns nothing (network blip, schema drift)
+    #      → uses the old two-call path (fetch override list then batch_analyze)
+    #   2. Full-exchange unified scan — single TV request fetches universe AND
+    #      SEPA indicators together, eliminating the second round-trip.
+    #   3. Hardcoded DEFAULT_UNIVERSE fallback if unified scan returns nothing.
     universe_raw = _s("screener_universe", "")
     if universe_raw:
         universe = [s.strip().upper() for s in universe_raw.split(",") if s.strip()]
+        logger.info(
+            "Screener: scoring %d override symbols (source=override, mode=%s)...",
+            len(universe), mode,
+        )
+        results_map = batch_analyze(
+            universe,
+            vol_surge_pct=vol_surge_pct,
+            ema20_pct=ema20_pct,
+            ema50_pct=ema50_pct,
+        )
         universe_source = "override"
     else:
-        scanned = _fetch_market_universe(
+        from .tv_analyzer import scan_and_score_universe
+        results_map = scan_and_score_universe(
             price_min=price_min,
             price_max=price_max,
             excluded_sectors=excluded_sectors,
             excluded_industries=excluded_industries,
+            max_results=universe_size,
+            vol_surge_pct=vol_surge_pct,
+            ema20_pct=ema20_pct,
+            ema50_pct=ema50_pct,
+            db=db,
         )
-        if scanned:
-            universe = scanned
-            universe_source = "market_scan"
+        if results_map:
+            universe_source = "full_exchange_scan"
         else:
-            universe = DEFAULT_UNIVERSE
-            universe_source = "fallback_default"
             logger.warning(
-                "Market-wide scan returned nothing — falling back to DEFAULT_UNIVERSE (%d names)",
-                len(universe),
+                "Full-exchange scan returned nothing — falling back to DEFAULT_UNIVERSE (%d names)",
+                len(DEFAULT_UNIVERSE),
             )
+            results_map = batch_analyze(
+                DEFAULT_UNIVERSE,
+                vol_surge_pct=vol_surge_pct,
+                ema20_pct=ema20_pct,
+                ema50_pct=ema50_pct,
+            )
+            universe_source = "fallback_default"
 
     logger.info(
-        "Screener: scanning %d symbols via TradingView (source=%s, mode=%s, tier=%s, account=$%.0f)...",
-        len(universe), universe_source, mode, tier_label, account_value,
-    )
-
-    # Single batch call — all symbols in one TradingView scanner request
-    results_map = batch_analyze(
-        universe,
-        vol_surge_pct=vol_surge_pct,
-        ema20_pct=ema20_pct,
-        ema50_pct=ema50_pct,
+        "Screener: %d candidates to score (source=%s, mode=%s, tier=%s, account=$%.0f universe_size=%d)",
+        len(results_map), universe_source, mode, tier_label, account_value, universe_size,
     )
 
     # Build scored list; apply price + sector filters
