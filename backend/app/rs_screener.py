@@ -432,7 +432,7 @@ def run_rs_screener(
     if account_value is None:
         try:
             from . import alpaca_client as alp
-            acct = alp.get_account(mode)
+            acct = alp.get_account_for_user(db, user_id, mode)
             account_value = float(acct.portfolio_value)
         except Exception as exc:
             logger.error("RS screener: cannot fetch account value: %s", exc)

@@ -87,14 +87,14 @@ def get_positions(mode: str = "paper"):
     return get_client(mode).get_all_positions()
 
 
-def get_positions_for_user(db, user_id: int, mode: str = "paper"):
-    """Fetch positions using DB-stored credentials for a specific user.
-    Falls back to the global client if no DB creds are found.
-    Avoids the 401 that get_positions() hits when keys are in user_settings
-    rather than .env.
+def _get_user_client(db, user_id: int | None, mode: str) -> TradingClient | None:
+    """Resolve a TradingClient from DB-stored credentials for a specific user.
+    Returns None if user_id is None or no credentials are found (caller falls
+    back to the global env-based client).
     """
+    if not user_id:
+        return None
     from .database import get_user_setting as _gus
-    from .config import settings as _s
     is_admin = db.execute(
         __import__("sqlalchemy").text("SELECT role FROM users WHERE id = :id"),
         {"id": user_id},
@@ -103,19 +103,45 @@ def get_positions_for_user(db, user_id: int, mode: str = "paper"):
         key    = (_gus(db, "alpaca_paper_key",    "", user_id) or "").strip()
         secret = (_gus(db, "alpaca_paper_secret", "", user_id) or "").strip()
         if is_admin:
-            key    = key    or (_s.alpaca_paper_key    or "").strip()
-            secret = secret or (_s.alpaca_paper_secret or "").strip()
+            key    = key    or (settings.alpaca_paper_key    or "").strip()
+            secret = secret or (settings.alpaca_paper_secret or "").strip()
         paper = True
     else:
         key    = (_gus(db, "alpaca_live_key",    "", user_id) or "").strip()
         secret = (_gus(db, "alpaca_live_secret", "", user_id) or "").strip()
         if is_admin:
-            key    = key    or (_s.alpaca_live_key    or "").strip()
-            secret = secret or (_s.alpaca_live_secret or "").strip()
+            key    = key    or (settings.alpaca_live_key    or "").strip()
+            secret = secret or (settings.alpaca_live_secret or "").strip()
         paper = False
     if not key or not secret:
-        return get_positions(mode)
-    return get_client_for_keys(key, secret, paper).get_all_positions()
+        return None
+    return get_client_for_keys(key, secret, paper)
+
+
+def get_positions_for_user(db, user_id: int | None, mode: str = "paper"):
+    """Fetch positions using DB-stored credentials for a specific user.
+    Falls back to the global client if no DB creds are found.
+    """
+    client = _get_user_client(db, user_id, mode)
+    return (client or get_client(mode)).get_all_positions()
+
+
+def get_account_for_user(db, user_id: int | None, mode: str = "paper"):
+    """Fetch account using DB-stored credentials for a specific user.
+    Falls back to the global client if no DB creds are found.
+    """
+    client = _get_user_client(db, user_id, mode)
+    return (client or get_client(mode)).get_account()
+
+
+def get_open_orders_by_symbol_for_user(db, user_id: int | None, mode: str = "paper") -> dict[str, list]:
+    """Open orders keyed by symbol, using user-scoped credentials."""
+    client = _get_user_client(db, user_id, mode) or get_client(mode)
+    orders = client.get_orders(GetOrdersRequest(status=QueryOrderStatus.OPEN))
+    result: dict[str, list] = {}
+    for o in orders:
+        result.setdefault(o.symbol, []).append(o)
+    return result
 
 
 def get_open_orders(mode: str = "paper"):

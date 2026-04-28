@@ -33,7 +33,7 @@ def _apply_executed_guard(
     held: set[str] = set()
     try:
         from . import alpaca_client as alp
-        held = {p.symbol for p in alp.get_positions(mode)}
+        held = {p.symbol for p in alp.get_positions_for_user(db, user_id, mode)}
     except Exception as exc:
         logger.warning(
             "_apply_executed_guard: Alpaca positions unreachable for mode=%s: %s",

@@ -58,8 +58,10 @@ async def tradingview(alert: TVAlert, db: Session = Depends(get_db)):
         market_open = False
 
     if auto_execute and market_open:
-        positions   = {p.symbol: p for p in alp.get_positions(mode)}
-        acct        = alp.get_account(mode)
+        from ..position_manager import _resolve_admin_uid as _admin_uid
+        _wh_uid     = _admin_uid(db)
+        positions   = {p.symbol: p for p in alp.get_positions_for_user(db, _wh_uid, mode)}
+        acct        = alp.get_account_for_user(db, _wh_uid, mode)
         portfolio   = float(acct.portfolio_value)
         max_pos     = int(get_setting(db, "max_positions", "10"))
 
@@ -111,7 +113,7 @@ async def tradingview(alert: TVAlert, db: Session = Depends(get_db)):
                         # Hard pre-submit cash guard (TV market buy goes direct
                         # to place_market_buy, bypassing _place_entry's check).
                         try:
-                            live_cash  = float(getattr(alp.get_account(mode), "cash", 0) or 0)
+                            live_cash  = float(getattr(alp.get_account_for_user(db, _wh_uid, mode), "cash", 0) or 0)
                             worst_cost = qty * alert.price * 1.01
                         except Exception:
                             live_cash, worst_cost = 0.0, float("inf")

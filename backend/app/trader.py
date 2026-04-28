@@ -632,7 +632,7 @@ def _gate(
             except Exception:
                 pass
         stored       = get_stored_weekly_plan_analysis(db, symbol, mode)
-        acct         = alp.get_account(mode)
+        acct         = alp.get_account_for_user(db, user_id, mode)
         portfolio    = float(acct.portfolio_value)
         cash         = float(acct.cash)
         buying_power = float(acct.buying_power)
@@ -824,8 +824,8 @@ async def run_monitor(db: Session, user_id: int | None = None, mode: str | None 
         clock       = alp.get_clock(mode)
         market_open = clock.is_open
 
-        acct         = alp.get_account(mode)
-        positions    = alp.get_positions(mode)
+        acct         = alp.get_account_for_user(db, user_id, mode)
+        positions    = alp.get_positions_for_user(db, user_id, mode)
         portfolio    = float(acct.portfolio_value)
         cash         = float(acct.cash)
         buying_power = float(acct.buying_power)
@@ -839,7 +839,7 @@ async def run_monitor(db: Session, user_id: int | None = None, mode: str | None 
             _reconcile_partial_fills(db, positions, mode)
 
             try:
-                open_orders_by_symbol = alp.get_open_orders_by_symbol(mode)
+                open_orders_by_symbol = alp.get_open_orders_by_symbol_for_user(db, user_id, mode)
 
                 # Step 1: Trailing stop adjustment
                 # Green positions get stops ratcheted up.
@@ -847,7 +847,7 @@ async def run_monitor(db: Session, user_id: int | None = None, mode: str | None 
                 _adjust_trailing_stops(db, positions, open_orders_by_symbol, mode)
 
                 # Re-fetch after potential cancel+replace from trailing stops
-                open_orders_by_symbol = alp.get_open_orders_by_symbol(mode)
+                open_orders_by_symbol = alp.get_open_orders_by_symbol_for_user(db, user_id, mode)
 
                 # Step 2: Exit guard
                 # Ensures every position has an active OCO.
@@ -947,7 +947,7 @@ async def run_monitor(db: Session, user_id: int | None = None, mode: str | None 
                     positions=positions, user_id=user_id,
                 )
                 # Re-fetch positions so watchlist step has fresh state
-                positions = alp.get_positions(mode)
+                positions = alp.get_positions_for_user(db, user_id, mode)
             except Exception as exc:
                 logger.error("fill_open_slots failed: %s", exc)
 

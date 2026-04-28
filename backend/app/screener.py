@@ -618,14 +618,7 @@ def _save_plan(db: Session, rows: list[dict], week_start: str, mode: str, user_i
     # client returns 401 unauthorized.
     try:
         from . import alpaca_client as alp
-        held_positions = None
-        if user_id:
-            try:
-                held_positions = list(alp.get_positions_for_user(db, user_id, mode))
-            except AttributeError:
-                pass  # function not yet defined — fall through to global client
-        if held_positions is None:
-            held_positions = list(alp.get_positions(mode))
+        held_positions = list(alp.get_positions_for_user(db, user_id, mode))
         held = {p.symbol for p in held_positions}
         already_executed |= held
     except Exception as exc:
@@ -796,8 +789,8 @@ def run_both_screeners(
         from .rs_screener import gics_label as _gics_label
         # Diagnostic: log sector field for every pick so we can verify TV values
         for _r in sorted_picks:
-            logger.info(
-                "Sector cap input: %s tv_sector=%r → gics=%r (screener=%s)",
+            logger.error(
+                "SECTOR-CAP-DIAG: %s tv_sector=%r → gics=%r (screener=%s)",
                 _r.get("symbol"), _r.get("sector", ""),
                 _gics_label((_r.get("sector") or "").strip().lower()) if (_r.get("sector") or "").strip() else "",
                 _r.get("screener_type"),
@@ -817,8 +810,8 @@ def run_both_screeners(
             if sec:
                 sector_counts[sec] = sector_counts.get(sec, 0) + 1
         if capped_out:
-            logger.info(
-                "Plan merge: %d picks dropped by sector cap (%d/sector): %s",
+            logger.error(
+                "SECTOR-CAP: %d picks dropped by sector cap (%d/sector): %s",
                 len(capped_out), max_per_sector, ", ".join(capped_out[:10]),
             )
     else:
