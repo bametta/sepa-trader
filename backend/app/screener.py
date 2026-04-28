@@ -488,7 +488,7 @@ def run_screener(db: Session, mode: str = None, user_id: int = None, account_val
     )
 
     summary_msg = (
-        f"Screener ({mode}/{tier_label}): scanned {len(universe)}, "
+        f"Screener ({mode}/{tier_label}): scanned {len(results_map)}, "
         f"errors {errors}, "
         f"scored {len(all_scored)}, "
         f"qualifying (>={effective_min}) {len(candidates)}, "
