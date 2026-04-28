@@ -237,6 +237,13 @@ def run_screener(db: Session, mode: str = None, user_id: int = None, account_val
     vol_surge_pct   = float(_s("screener_vol_surge_pct", "40")  or "40")
     ema20_pct       = float(_s("screener_ema20_pct",     "2.0") or "2.0")
     ema50_pct       = float(_s("screener_ema50_pct",     "3.0") or "3.0")
+    # Early-setup filters — catch stocks before the big move, not after.
+    # max_ema200_ext_pct: stocks >X% above EMA200 are late-stage (move already in).
+    #   Early Stage 2 = 15–50% above EMA200. Late Stage 2 = 70%+. Default 65%.
+    # max_ema50_ext_pct: price too far above EMA50 means it's running away from
+    #   the last base; entry risk is high. Default 0 (disabled).
+    max_ema200_ext_pct = float(_s("screener_max_ema200_ext_pct", "65") or "0") or 0.0
+    max_ema50_ext_pct  = float(_s("screener_max_ema50_ext_pct",  "0")  or "0") or 0.0
 
     # Sector exclusion — Minervini-specific. Falls back to the legacy
     # `screener_excluded_sectors` key so existing settings keep working.
@@ -366,6 +373,25 @@ def run_screener(db: Session, mode: str = None, user_id: int = None, account_val
             industry = (result.get("industry") or "").strip().lower()
             if industry and industry in excluded_industries:
                 logger.debug("Minervini screener: %s excluded (industry=%s).", sym, industry)
+                continue
+        # Early-setup guard: skip stocks that have already made the big move.
+        ema200 = result.get("ema200") or 0.0
+        if max_ema200_ext_pct > 0 and ema200 > 0:
+            ext200 = (price - ema200) / ema200 * 100
+            if ext200 > max_ema200_ext_pct:
+                logger.debug(
+                    "Minervini screener: %s late-stage (%.0f%% above EMA200, max=%.0f%%) — skipped",
+                    sym, ext200, max_ema200_ext_pct,
+                )
+                continue
+        ema50 = result.get("ema50") or 0.0
+        if max_ema50_ext_pct > 0 and ema50 > 0:
+            ext50 = (price - ema50) / ema50 * 100
+            if ext50 > max_ema50_ext_pct:
+                logger.debug(
+                    "Minervini screener: %s overextended (%.0f%% above EMA50, max=%.0f%%) — skipped",
+                    sym, ext50, max_ema50_ext_pct,
+                )
                 continue
         all_scored.append({"symbol": sym, **result})
 
