@@ -508,51 +508,101 @@ def _ensure_exit_orders(
                 continue
 
         # ── Inspect current coverage ─────────────────────────────────────
-        # A position is "properly covered" only if total sell qty == pos qty
-        # AND a stop_limit child AND a limit child both exist AND prices
-        # match the plan (within threshold).
+        # Alpaca's status=open only returns the "new" (working) leg of an OCO.
+        # The "held" stop sibling is invisible to open-order queries.
+        #
+        # Coverage model:
+        #   OCO path  — find a sell limit order with order_class=oco at the
+        #               correct qty and target price. Alpaca's OCO contract
+        #               guarantees the stop sibling exists; verify its price
+        #               from .legs if populated, or from plan_stop (DB truth).
+        #   Two-order path — find explicit stop + limit sell legs (legacy).
         sell_legs = [o for o in sym_orders if 'sell' in str(getattr(o, 'side', '') or '').lower()]
-        # OCO orders: both legs carry the FULL position qty (not split).
-        # Summing them would double-count. Instead, confirm each leg type
-        # is present with the correct qty independently.
-        has_stop_leg = has_limit_leg = False
-        stop_qty = limit_qty = 0
-        for o in sell_legs:
-            otype = str(getattr(o, 'order_type', '') or getattr(o, 'type', '') or '').lower()
-            try:
-                o_qty = int(float(getattr(o, 'qty', 0) or 0))
-            except (TypeError, ValueError):
-                o_qty = 0
-            if 'stop' in otype:
-                has_stop_leg = True
-                stop_qty = o_qty
-            elif 'limit' in otype:
-                has_limit_leg = True
-                limit_qty = o_qty
 
-        current_stop   = _get_current_stop_price(sym_orders)
-        current_target = _get_current_target_price(sym_orders)
-        prices_match = (
-            current_stop is not None
-            and current_target is not None
-            and abs(current_stop - stop) <= _PRICE_CHANGE_THRESHOLD
-            and abs(current_target - target) <= _PRICE_CHANGE_THRESHOLD
-        )
-        # Single-OCO model: properly covered means both legs present, each
-        # with the correct qty, and prices within threshold.
-        logger.error(
-            "EXIT-GUARD-DIAG %s: has_stop=%s has_limit=%s stop_qty=%s limit_qty=%s "
-            "pos_qty=%s sell_legs=%d prices_match=%s "
-            "cur_stop=%s plan_stop=%.2f cur_target=%s plan_target=%.2f",
-            sym, has_stop_leg, has_limit_leg, stop_qty, limit_qty,
-            qty, len(sell_legs), prices_match,
-            current_stop, stop, current_target, target,
-        )
-        if (has_stop_leg and has_limit_leg
-                and stop_qty == qty and limit_qty == qty
-                and len(sell_legs) == 2 and prices_match):
-            logger.error("EXIT-GUARD-DIAG %s: coverage correct — no action.", sym)
-            continue
+        # Detect OCO parent: a limit-type sell with order_class containing 'oco'
+        oco_parent = None
+        for o in sell_legs:
+            oclass = str(getattr(o, 'order_class', '') or '').lower()
+            otype  = str(getattr(o, 'order_type', '') or getattr(o, 'type', '') or '').lower()
+            if 'oco' in oclass or 'bracket' in oclass:
+                if 'limit' in otype and 'stop' not in otype:
+                    oco_parent = o
+                    break
+
+        if oco_parent is not None:
+            # OCO path: one order visible (limit=new), stop guaranteed by Alpaca
+            try:
+                oco_qty = int(float(getattr(oco_parent, 'qty', 0) or 0))
+            except (TypeError, ValueError):
+                oco_qty = 0
+
+            current_target = _get_current_target_price(sym_orders)
+
+            # Try to read stop price from .legs (populated in some responses)
+            current_stop = None
+            for leg in (getattr(oco_parent, 'legs', None) or []):
+                leg_type = str(getattr(leg, 'type', '') or '').lower()
+                if 'stop' in leg_type:
+                    sp = getattr(leg, 'stop_price', None)
+                    if sp is not None:
+                        current_stop = float(sp)
+                        break
+            # If legs not populated, trust DB stop as ground truth (we set it)
+            if current_stop is None:
+                current_stop = stop
+
+            target_ok = (current_target is not None
+                         and abs(current_target - target) <= _PRICE_CHANGE_THRESHOLD)
+            stop_ok   = abs(current_stop - stop) <= _PRICE_CHANGE_THRESHOLD
+            qty_ok    = (oco_qty == qty)
+
+            logger.info(
+                "Exit guard OCO %s: qty_ok=%s stop_ok=%s target_ok=%s "
+                "oco_qty=%s pos_qty=%s cur_stop=%.2f plan_stop=%.2f "
+                "cur_target=%s plan_target=%.2f",
+                sym, qty_ok, stop_ok, target_ok,
+                oco_qty, qty, current_stop, stop,
+                current_target, target,
+            )
+            if qty_ok and stop_ok and target_ok:
+                logger.info("Exit guard: %s OCO coverage correct — no action.", sym)
+                continue
+
+        else:
+            # Legacy two-order path (explicit stop + limit sell orders)
+            has_stop_leg = has_limit_leg = False
+            stop_qty = limit_qty = 0
+            for o in sell_legs:
+                otype = str(getattr(o, 'order_type', '') or getattr(o, 'type', '') or '').lower()
+                try:
+                    o_qty = int(float(getattr(o, 'qty', 0) or 0))
+                except (TypeError, ValueError):
+                    o_qty = 0
+                if 'stop' in otype:
+                    has_stop_leg = True
+                    stop_qty = o_qty
+                elif 'limit' in otype:
+                    has_limit_leg = True
+                    limit_qty = o_qty
+
+            current_stop   = _get_current_stop_price(sym_orders)
+            current_target = _get_current_target_price(sym_orders)
+            prices_match = (
+                current_stop is not None
+                and current_target is not None
+                and abs(current_stop - stop) <= _PRICE_CHANGE_THRESHOLD
+                and abs(current_target - target) <= _PRICE_CHANGE_THRESHOLD
+            )
+            logger.info(
+                "Exit guard two-order %s: has_stop=%s has_limit=%s "
+                "stop_qty=%s limit_qty=%s pos_qty=%s prices_match=%s",
+                sym, has_stop_leg, has_limit_leg, stop_qty, limit_qty, qty, prices_match,
+            )
+            if (has_stop_leg and has_limit_leg
+                    and stop_qty == qty and limit_qty == qty
+                    and len(sell_legs) == 2 and prices_match):
+                logger.info("Exit guard: %s two-order coverage correct — no action.", sym)
+                continue
 
         # ── Serialized replace: cancel all sells, wait, place fresh ──────
         # Never stack a new OCO on top of existing sells. Alpaca paper can

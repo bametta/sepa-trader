@@ -134,35 +134,10 @@ def get_account_for_user(db, user_id: int | None, mode: str = "paper"):
     return (client or get_client(mode)).get_account()
 
 
-# Alpaca's status=open filter excludes "held" orders (OCO siblings waiting
-# for their counterpart to fill/cancel). We fetch status=all and filter
-# locally to active statuses so both legs of every OCO are visible.
-_ACTIVE_STATUSES = {
-    "new", "held", "accepted", "pending_new", "accepted_for_bidding",
-    "partially_filled", "done_for_day", "stopped",
-    "pending_cancel", "pending_replace",
-}
-
-
-def _filter_active(orders) -> list:
-    """Keep only orders whose status is active (including held OCO siblings)."""
-    result = []
-    for o in orders:
-        status = str(getattr(o, "status", "") or "").lower()
-        if status in _ACTIVE_STATUSES:
-            result.append(o)
-    return result
-
-
 def get_open_orders_by_symbol_for_user(db, user_id: int | None, mode: str = "paper") -> dict[str, list]:
-    """Active orders (including held OCO siblings) keyed by symbol, using user-scoped credentials.
-
-    Fetches status=all and filters locally because Alpaca's status=open query
-    silently excludes 'held' orders — the stop leg of every OCO bracket is
-    held until the take-profit fires, so it would never appear with status=open.
-    """
+    """Open orders keyed by symbol, using user-scoped credentials."""
     client = _get_user_client(db, user_id, mode) or get_client(mode)
-    orders = _filter_active(client.get_orders(GetOrdersRequest(status=QueryOrderStatus.ALL, limit=200)))
+    orders = client.get_orders(GetOrdersRequest(status=QueryOrderStatus.OPEN))
     result: dict[str, list] = {}
     for o in orders:
         result.setdefault(o.symbol, []).append(o)
@@ -170,12 +145,12 @@ def get_open_orders_by_symbol_for_user(db, user_id: int | None, mode: str = "pap
 
 
 def get_open_orders(mode: str = "paper"):
-    return _filter_active(get_client(mode).get_orders(GetOrdersRequest(status=QueryOrderStatus.ALL, limit=200)))
+    return get_client(mode).get_orders(GetOrdersRequest(status=QueryOrderStatus.OPEN))
 
 
 def get_open_orders_by_symbol(mode: str = "paper") -> dict[str, list]:
-    """Return all active orders (including held OCO siblings) keyed by symbol."""
-    orders = _filter_active(get_client(mode).get_orders(GetOrdersRequest(status=QueryOrderStatus.ALL, limit=200)))
+    """Return all open orders keyed by symbol for quick lookup."""
+    orders = get_client(mode).get_orders(GetOrdersRequest(status=QueryOrderStatus.OPEN))
     result: dict[str, list] = {}
     for o in orders:
         result.setdefault(o.symbol, []).append(o)
