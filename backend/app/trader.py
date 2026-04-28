@@ -226,7 +226,15 @@ def _derive_fresh_plan(
 
 
 def _get_current_stop_price(orders: list) -> float | None:
-    """Extract the active stop price from an open OCO/bracket order's stop leg."""
+    """Extract the active stop price from open OCO/bracket orders.
+
+    Alpaca returns OCO siblings as separate top-level orders in get_orders()
+    responses — the "held" stop leg has no order_class set, only order_type=stop
+    (or stop_limit). We try the structured OCO parent first, then fall back to
+    scanning standalone stop-type sell orders so the price-match check works
+    even when .legs is empty in the list response.
+    """
+    # Pass 1: structured OCO parent with populated .legs
     for o in orders:
         order_class = str(getattr(o, 'order_class', '') or '').lower()
         side        = str(getattr(o, 'side',        '') or '').lower()
@@ -243,22 +251,34 @@ def _get_current_stop_price(orders: list) -> float | None:
             sp = getattr(o, 'stop_price', None)
             if sp is not None:
                 return float(sp)
+    # Pass 2: standalone stop-type sell order (OCO "held" sibling returned
+    # by Alpaca as a separate top-level entry with no order_class)
+    for o in orders:
+        side       = str(getattr(o, 'side',       '') or '').lower()
+        order_type = str(getattr(o, 'order_type', '') or getattr(o, 'type', '') or '').lower()
+        if 'sell' in side and 'stop' in order_type:
+            sp = getattr(o, 'stop_price', None)
+            if sp is not None:
+                return float(sp)
     return None
 
 
 def _get_current_target_price(orders: list) -> float | None:
-    """Extract the active target (limit) price from an open OCO/bracket order."""
+    """Extract the active target (limit) price from open OCO/bracket orders.
+
+    Same two-pass strategy as _get_current_stop_price: try the structured OCO
+    parent first, then fall back to standalone limit-type sell orders.
+    """
+    # Pass 1: structured OCO parent with populated .legs
     for o in orders:
         order_class = str(getattr(o, 'order_class', '') or '').lower()
         side        = str(getattr(o, 'side',        '') or '').lower()
         if 'sell' not in side:
             continue
         if any(kw in order_class for kw in ('oco', 'bracket', 'oto')):
-            # Parent limit_price is the take-profit leg
             lp = getattr(o, 'limit_price', None)
             if lp is not None:
                 return float(lp)
-            # Check child legs
             legs = getattr(o, 'legs', None) or []
             for leg in legs:
                 order_type = str(getattr(leg, 'type', '') or '').lower()
@@ -266,6 +286,14 @@ def _get_current_target_price(orders: list) -> float | None:
                     lp = getattr(leg, 'limit_price', None)
                     if lp is not None:
                         return float(lp)
+    # Pass 2: standalone limit-type sell order (OCO "new" sibling)
+    for o in orders:
+        side       = str(getattr(o, 'side',       '') or '').lower()
+        order_type = str(getattr(o, 'order_type', '') or getattr(o, 'type', '') or '').lower()
+        if 'sell' in side and 'limit' in order_type and 'stop' not in order_type:
+            lp = getattr(o, 'limit_price', None)
+            if lp is not None:
+                return float(lp)
     return None
 
 
@@ -484,18 +512,23 @@ def _ensure_exit_orders(
         # AND a stop_limit child AND a limit child both exist AND prices
         # match the plan (within threshold).
         sell_legs = [o for o in sym_orders if 'sell' in str(getattr(o, 'side', '') or '').lower()]
-        covered_qty = 0
+        # OCO orders: both legs carry the FULL position qty (not split).
+        # Summing them would double-count. Instead, confirm each leg type
+        # is present with the correct qty independently.
         has_stop_leg = has_limit_leg = False
+        stop_qty = limit_qty = 0
         for o in sell_legs:
-            try:
-                covered_qty += int(float(getattr(o, 'qty', 0) or 0))
-            except (TypeError, ValueError):
-                pass
             otype = str(getattr(o, 'order_type', '') or getattr(o, 'type', '') or '').lower()
+            try:
+                o_qty = int(float(getattr(o, 'qty', 0) or 0))
+            except (TypeError, ValueError):
+                o_qty = 0
             if 'stop' in otype:
                 has_stop_leg = True
+                stop_qty = o_qty
             elif 'limit' in otype:
                 has_limit_leg = True
+                limit_qty = o_qty
 
         current_stop   = _get_current_stop_price(sym_orders)
         current_target = _get_current_target_price(sym_orders)
@@ -505,9 +538,10 @@ def _ensure_exit_orders(
             and abs(current_stop - stop) <= _PRICE_CHANGE_THRESHOLD
             and abs(current_target - target) <= _PRICE_CHANGE_THRESHOLD
         )
-        # Single-OCO model: properly covered means total sell qty == pos qty
-        # AND exactly one stop leg + one limit leg exist AND prices match.
-        if (covered_qty == qty and has_stop_leg and has_limit_leg
+        # Single-OCO model: properly covered means both legs present, each
+        # with the correct qty, and prices within threshold.
+        if (has_stop_leg and has_limit_leg
+                and stop_qty == qty and limit_qty == qty
                 and len(sell_legs) == 2 and prices_match):
             logger.debug("Exit guard: %s coverage already correct — no action.", sym)
             continue
