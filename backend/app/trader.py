@@ -540,8 +540,8 @@ def _ensure_exit_orders(
         )
         # Single-OCO model: properly covered means both legs present, each
         # with the correct qty, and prices within threshold.
-        logger.info(
-            "Exit guard diag %s: has_stop=%s has_limit=%s stop_qty=%s limit_qty=%s "
+        logger.error(
+            "EXIT-GUARD-DIAG %s: has_stop=%s has_limit=%s stop_qty=%s limit_qty=%s "
             "pos_qty=%s sell_legs=%d prices_match=%s "
             "cur_stop=%s plan_stop=%.2f cur_target=%s plan_target=%.2f",
             sym, has_stop_leg, has_limit_leg, stop_qty, limit_qty,
@@ -551,7 +551,7 @@ def _ensure_exit_orders(
         if (has_stop_leg and has_limit_leg
                 and stop_qty == qty and limit_qty == qty
                 and len(sell_legs) == 2 and prices_match):
-            logger.info("Exit guard: %s coverage already correct — no action.", sym)
+            logger.error("EXIT-GUARD-DIAG %s: coverage correct — no action.", sym)
             continue
 
         # ── Serialized replace: cancel all sells, wait, place fresh ──────
