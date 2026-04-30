@@ -636,14 +636,53 @@ def _ensure_exit_orders(
                     sym, mode,
                 )
         except Exception as exc:
-            logger.error("Exit guard: OCO placement failed for %s: %s", sym, exc)
-            try:
-                tg.alert_system_error_sync(
-                    f"NAKED POSITION [{mode}] {sym} — OCO placement failed",
-                    exc,
+            exc_str = str(exc)
+            # PDT (pattern day trading) protection blocks OCO orders on the same
+            # day as a buy in margin accounts under $25 k. Fall back to a plain
+            # GTC stop-market order so the position is at least protected.
+            if "40310100" in exc_str or "pattern day trad" in exc_str.lower():
+                logger.warning(
+                    "Exit guard: OCO for %s blocked by PDT protection — "
+                    "falling back to stop-market at $%.2f [%s]",
+                    sym, stop, mode,
                 )
-            except Exception:
-                pass
+                try:
+                    alp.place_stop_loss_sell(sym, qty, stop, mode)
+                    logger.info(
+                        "Exit guard: PDT fallback — placed stop-market sell for %s "
+                        "qty=%d stop=$%.2f [%s]",
+                        sym, qty, stop, mode,
+                    )
+                    try:
+                        tg.alert_system_error_sync(
+                            f"PDT PROTECTION [{mode}] {sym} — OCO blocked, "
+                            f"stop-market placed at ${stop:.2f} (no take-profit). "
+                            f"Account may need $25k+ equity to lift PDT flag.",
+                            exc,
+                        )
+                    except Exception:
+                        pass
+                except Exception as stop_exc:
+                    logger.error(
+                        "Exit guard: PDT fallback stop-market also failed for %s: %s [%s]",
+                        sym, stop_exc, mode,
+                    )
+                    try:
+                        tg.alert_system_error_sync(
+                            f"NAKED POSITION [{mode}] {sym} — OCO + PDT-fallback both failed",
+                            stop_exc,
+                        )
+                    except Exception:
+                        pass
+            else:
+                logger.error("Exit guard: OCO placement failed for %s: %s", sym, exc)
+                try:
+                    tg.alert_system_error_sync(
+                        f"NAKED POSITION [{mode}] {sym} — OCO placement failed",
+                        exc,
+                    )
+                except Exception:
+                    pass
         continue
 
 
