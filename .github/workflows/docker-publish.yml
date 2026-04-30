@@ -61,4 +61,5 @@ jobs:
         working-directory: /volume2/docker/sepa-trader
         run: |
           docker compose down
+          docker image prune -f
           docker compose up -d
