@@ -433,7 +433,7 @@ def run_screener(db: Session, mode: str = None, user_id: int = None, account_val
         msg = (
             f"Minervini screener ({mode}/{tier_label}): aborting — median score "
             f"{median_score:.1f} below {DEGRADED_MEDIAN_THRESHOLD} across "
-            f"{len(all_scored)} scored / {len(universe)} universe "
+            f"{len(all_scored)} scored / {len(results_map)} universe "
             f"(errors {errors}). Likely degraded TV data or deep correction; "
             f"emitting empty plan instead of low-quality picks."
         )
@@ -443,7 +443,7 @@ def run_screener(db: Session, mode: str = None, user_id: int = None, account_val
             tg.alert_system_error_sync(
                 f"minervini_screener:{mode}",
                 f"Aborted: median score {median_score:.1f} (<{DEGRADED_MEDIAN_THRESHOLD}). "
-                f"scored={len(all_scored)}, errors={errors}/{len(universe)}.",
+                f"scored={len(all_scored)}, errors={errors}/{len(results_map)}.",
                 level="WARNING",
             )
         except Exception:
@@ -467,7 +467,7 @@ def run_screener(db: Session, mode: str = None, user_id: int = None, account_val
     )
 
     summary_msg = (
-        f"Screener ({mode}/{tier_label}): scanned {len(universe)}, "
+        f"Screener ({mode}/{tier_label}): scanned {len(results_map)}, "
         f"errors {errors}, "
         f"scored {len(all_scored)}, "
         f"qualifying (>={effective_min}) {len(candidates)}, "
@@ -481,7 +481,7 @@ def run_screener(db: Session, mode: str = None, user_id: int = None, account_val
             summary_msg += f" Price min: ${price_min:.0f}."
 
     # Surface sample errors if error rate is high
-    if errors > len(universe) * 0.5:
+    if errors > len(results_map) * 0.5:
         sample_errors = [
             f"{sym}: {r['error']}"
             for sym, r in list(results_map.items())[:3]
