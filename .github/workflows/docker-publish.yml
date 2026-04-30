@@ -50,14 +50,15 @@ jobs:
     needs: [build-backend, build-frontend]
     steps:
       - name: Update IMAGE_TAG in .env
-        run: |
-          sed -i "s/^IMAGE_TAG=.*/IMAGE_TAG=v${{ github.run_number }}/" /volume2/docker/sepa-trader/.env
+        working-directory: /volume2/docker/sepa-trader
+        run: sed -i "s/^IMAGE_TAG=.*/IMAGE_TAG=v${{ github.run_number }}/" .env
 
       - name: Pull new images
-        run: |
-          docker compose -f /volume2/docker/sepa-trader/docker-compose.yml pull
+        working-directory: /volume2/docker/sepa-trader
+        run: docker compose pull
 
       - name: Restart stack
+        working-directory: /volume2/docker/sepa-trader
         run: |
-          docker compose -f /volume2/docker/sepa-trader/docker-compose.yml down
-          docker compose -f /volume2/docker/sepa-trader/docker-compose.yml up -d
+          docker compose down
+          docker compose up -d
