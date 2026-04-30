@@ -265,17 +265,34 @@ def _place_entry(
 
     elif order_type == "stop_limit":
         limit_px = round(entry * (1 + slippage_pct / 100), 2)
+        # Pre-flight price check: Alpaca rejects buy stop-limits where the stop
+        # price is at or below the current market price (the breakout already
+        # happened — the stop would trigger instantly at a limit below live price).
+        # If we're already past the entry, fall back to a limit order at limit_px
+        # so we still capture the position rather than hard-failing.
+        try:
+            from .tv_analyzer import analyze
+            live = analyze(sym)
+            live_price = live.get("price") or 0.0
+            if live_price and live_price >= entry:
+                logger.warning(
+                    "_place_entry %s: current price $%.2f already past stop entry $%.2f "
+                    "— stop-limit would be rejected; falling back to limit buy at $%.2f [%s]",
+                    sym, live_price, entry, limit_px, mode,
+                )
+                alp.place_limit_buy(sym, qty, limit_px, mode)
+                return f"limit buy [stop already passed] (lim=${limit_px:.2f})"
+        except Exception as exc:
+            logger.debug("_place_entry %s: price pre-check failed (%s) — proceeding with stop-limit", sym, exc)
+
         order = alp.place_stop_limit_buy(sym, qty, entry, slippage_pct, mode)
-        # Brief rejection check — Alpaca occasionally accepts then immediately
-        # rejects stop-limit orders (e.g. price too far from market, fractions).
-        # Check the order status once so callers don't log a phantom BUY.
+        # Brief rejection check — catch any remaining immediate rejections.
         try:
             import time as _time
             _time.sleep(0.5)
             client = alp._get_user_client(db, user_id, mode) or alp.get_client(mode)
             order_id = str(getattr(order, "id", "") or "")
             if order_id:
-                from alpaca.trading.requests import GetOrderByIdRequest
                 refreshed = client.get_order_by_id(order_id)
                 status = str(getattr(refreshed, "status", "") or "").lower()
                 if status in ("rejected", "canceled", "expired"):
@@ -285,7 +302,7 @@ def _place_entry(
         except RuntimeError:
             raise
         except Exception:
-            pass  # refresh failed — proceed optimistically; reconcile will self-heal
+            pass  # refresh failed — reconcile will self-heal if needed
         return f"stop-limit (stop=${entry:.2f} lim=${limit_px}) — exits pending fill"
 
     else:  # "market" or unrecognised
