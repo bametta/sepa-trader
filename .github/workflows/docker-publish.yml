@@ -61,6 +61,7 @@ jobs:
         working-directory: /volume2/docker/sepa-trader
         run: |
           docker compose down
-          docker rmi njohbillie/sepa-trader-backend:v${{ github.run_number - 1 }} || true
-          docker rmi njohbillie/sepa-trader-frontend:v${{ github.run_number - 1 }} || true
+          PREV=$(( ${{ github.run_number }} - 1 ))
+          docker rmi njohbillie/sepa-trader-backend:v${PREV} || true
+          docker rmi njohbillie/sepa-trader-frontend:v${PREV} || true
           docker compose up -d
