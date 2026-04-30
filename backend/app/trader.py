@@ -22,6 +22,11 @@ _ET = pytz.timezone("America/New_York")
 
 logger = logging.getLogger(__name__)
 
+# Symbols blocked by PDT protection this session (cleared at market open).
+# Prevents the monitor from spamming PDT alerts every cycle when there is
+# genuinely nothing we can do until the next trading day.
+_pdt_blocked: set[tuple[str, str]] = set()  # (symbol, mode)
+
 
 def _size_position(
     portfolio_value: float,
@@ -470,6 +475,16 @@ def _ensure_exit_orders(
         qty = int(float(pos.qty))
         if qty <= 0:
             continue
+
+        # Skip silently if Alpaca's PDT protection already blocked all exits
+        # for this symbol today. The monitor will succeed tomorrow once the
+        # buy is no longer a same-day trade. _pdt_blocked is cleared at open.
+        if (sym, mode) in _pdt_blocked:
+            logger.debug(
+                "Exit guard: %s skipped — PDT-blocked this session [%s]", sym, mode
+            )
+            continue
+
         stop, target = _get_weekly_plan_exits(db, sym, mode)
         sym_orders = open_orders_by_symbol.get(sym, [])
 
@@ -637,43 +652,68 @@ def _ensure_exit_orders(
                 )
         except Exception as exc:
             exc_str = str(exc)
-            # PDT (pattern day trading) protection blocks OCO orders on the same
-            # day as a buy in margin accounts under $25 k. Fall back to a plain
-            # GTC stop-market order so the position is at least protected.
+            # PDT (pattern day trading) protection blocks OCO orders — and even
+            # plain stop orders — placed the same day as a buy in margin accounts
+            # under $25k. Nothing can be placed today; try stop-market as last
+            # resort, and if that also fails, park the symbol until tomorrow.
             if "40310100" in exc_str or "pattern day trad" in exc_str.lower():
                 logger.warning(
-                    "Exit guard: OCO for %s blocked by PDT protection — "
-                    "falling back to stop-market at $%.2f [%s]",
-                    sym, stop, mode,
+                    "Exit guard: OCO for %s blocked by PDT — trying stop-market fallback [%s]",
+                    sym, mode,
                 )
+                stop_placed = False
                 try:
                     alp.place_stop_loss_sell(sym, qty, stop, mode)
+                    stop_placed = True
                     logger.info(
-                        "Exit guard: PDT fallback — placed stop-market sell for %s "
+                        "Exit guard: PDT fallback — stop-market sell placed for %s "
                         "qty=%d stop=$%.2f [%s]",
                         sym, qty, stop, mode,
                     )
                     try:
                         tg.alert_system_error_sync(
-                            f"PDT PROTECTION [{mode}] {sym} — OCO blocked, "
-                            f"stop-market placed at ${stop:.2f} (no take-profit). "
-                            f"Account may need $25k+ equity to lift PDT flag.",
+                            f"⚠️ PDT PROTECTION [{mode}] {sym}\n"
+                            f"OCO blocked by Alpaca's pattern-day-trading rule.\n"
+                            f"✅ Stop-market placed at ${stop:.2f} (no take-profit today).\n"
+                            f"OCO will be set automatically at tomorrow's open.\n"
+                            f"Tip: Deposit to reach $25k+ equity to lift PDT restrictions.",
                             exc,
                         )
                     except Exception:
                         pass
                 except Exception as stop_exc:
-                    logger.error(
-                        "Exit guard: PDT fallback stop-market also failed for %s: %s [%s]",
-                        sym, stop_exc, mode,
-                    )
-                    try:
-                        tg.alert_system_error_sync(
-                            f"NAKED POSITION [{mode}] {sym} — OCO + PDT-fallback both failed",
-                            stop_exc,
+                    if "40310100" in str(stop_exc) or "pattern day trad" in str(stop_exc).lower():
+                        # Alpaca is blocking even plain stop orders today.
+                        # Park this symbol; the monitor will place exits tomorrow.
+                        _pdt_blocked.add((sym, mode))
+                        logger.error(
+                            "Exit guard: %s — ALL exits blocked by PDT today; "
+                            "parked until next open [%s]",
+                            sym, mode,
                         )
-                    except Exception:
-                        pass
+                        try:
+                            tg.alert_system_error_sync(
+                                f"⚠️ PDT PROTECTION [{mode}] {sym}\n"
+                                f"Alpaca is blocking ALL sell orders today (same-day buy).\n"
+                                f"🔒 Position unprotected until tomorrow's market open.\n"
+                                f"Bot will auto-place OCO at next open. Monitor manually.\n"
+                                f"Tip: Deposit to reach $25k+ equity to lift PDT restrictions.",
+                                stop_exc,
+                            )
+                        except Exception:
+                            pass
+                    else:
+                        logger.error(
+                            "Exit guard: PDT stop-market fallback failed for %s: %s [%s]",
+                            sym, stop_exc, mode,
+                        )
+                        try:
+                            tg.alert_system_error_sync(
+                                f"NAKED POSITION [{mode}] {sym} — OCO + stop-market both failed",
+                                stop_exc,
+                            )
+                        except Exception:
+                            pass
             else:
                 logger.error("Exit guard: OCO placement failed for %s: %s", sym, exc)
                 try:
@@ -941,6 +981,16 @@ async def run_monitor(db: Session, user_id: int | None = None, mode: str | None 
     try:
         clock       = alp.get_clock(mode)
         market_open = clock.is_open
+
+        # Clear PDT-blocked symbols at each market open so the exit guard
+        # retries OCO placement for positions bought the previous day.
+        if market_open and _pdt_blocked:
+            logger.info(
+                "run_monitor [%s]: market open — clearing %d PDT-blocked symbol(s): %s",
+                mode, len(_pdt_blocked),
+                [s for s, m in _pdt_blocked if m == mode],
+            )
+            _pdt_blocked.clear()
 
         acct         = alp.get_account_for_user(db, user_id, mode)
         positions    = alp.get_positions_for_user(db, user_id, mode)
