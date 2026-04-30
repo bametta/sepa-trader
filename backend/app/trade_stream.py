@@ -102,12 +102,6 @@ async def _start_one(mode: str) -> None:
     only allows ONE concurrent trade_updates WS per account, so a stale
     connection from a prior process needs time to expire server-side.
     """
-    creds = _resolve_creds(mode)
-    if not creds:
-        logger.info("trade_stream[%s]: no credentials — skipping WS start.", mode)
-        return
-
-    key, sec = creds
     backoff = 5.0
     BACKOFF_MAX = 120.0
     handler = _make_handler(mode)
@@ -127,6 +121,13 @@ async def _start_one(mode: str) -> None:
         return
 
     while True:
+        # Re-resolve credentials on every attempt so that credentials saved
+        # in Settings after startup are picked up without a container restart.
+        creds = _resolve_creds(mode)
+        if not creds:
+            logger.info("trade_stream[%s]: no credentials — skipping WS start.", mode)
+            return
+        key, sec = creds
         stream = TradingStream(api_key=key, secret_key=sec, paper=(mode == "paper"))
         stream.subscribe_trade_updates(handler)
         # _consume reads from this loop's queue, so set _loop ourselves.
