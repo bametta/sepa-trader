@@ -43,3 +43,21 @@ jobs:
           context: ./frontend
           push: true
           tags: njohbillie/sepa-trader-frontend:v${{ github.run_number }}
+
+  deploy:
+    name: Deploy to NAS — v${{ github.run_number }}
+    runs-on: self-hosted
+    needs: [build-backend, build-frontend]
+    steps:
+      - name: Update IMAGE_TAG in .env
+        run: |
+          sed -i "s/^IMAGE_TAG=.*/IMAGE_TAG=v${{ github.run_number }}/" /volume2/docker/sepa-trader/.env
+
+      - name: Pull new images
+        run: |
+          docker compose -f /volume2/docker/sepa-trader/docker-compose.yml pull
+
+      - name: Restart stack
+        run: |
+          docker compose -f /volume2/docker/sepa-trader/docker-compose.yml down
+          docker compose -f /volume2/docker/sepa-trader/docker-compose.yml up -d
