@@ -110,6 +110,7 @@ export const fetchTvScreeners      = () => api.get('/screener/tv-screeners').the
 export const syncTradingView    = () => api.post('/screener/sync-tradingview').then(r => r.data)
 export const exportWatchlist    = () => api.get('/screener/watchlist-export', { responseType: 'blob' }).then(r => r.data)
 export const updatePlanStatus   = (symbol, status) => api.patch(`/screener/weekly-plan/${symbol}/status`, { status }).then(r => r.data)
+export const forceBuySymbol     = (symbol) => api.post(`/screener/weekly-plan/${symbol}/force-buy`).then(r => r.data)
 export const fetchAlpacaHistory = (limit=100) => api.get(`/orders/alpaca-history?limit=${limit}`).then(r => r.data)
 export const fetchAnalyses      = (limit=20) => api.get(`/screener/analysis?limit=${limit}`).then(r => r.data)
 export const runAnalysis        = () => api.post('/screener/analysis/run').then(r => r.data)

@@ -6,6 +6,7 @@ import {
   exportWatchlist, updatePlanStatus,
   fetchAnalyses, runAnalysis, fetchSettings,
   fetchWeeklyNews,
+  forceBuySymbol,
 } from '../api/client'
 import TapeCheck from './TapeCheck'
 
@@ -346,6 +347,7 @@ export default function WeeklyPlan() {
               ddLoading={ddLoading}
               news={newsMap[row.symbol] || []}
               onStatusChange={handleStatus}
+              onForceBuy={() => qc.invalidateQueries('weeklyPlan')}
               tvLayoutId={tvLayoutId}
             />
           ))}
@@ -395,10 +397,28 @@ const AI_DECISION_META = {
   SKIP:    { label: 'Skip',    cls: 'bg-red-500/20     text-red-300     border border-red-500/30'     },
 }
 
-function PlanCard({ row, dd, ddLoading, news = [], onStatusChange, tvLayoutId }) {
+function PlanCard({ row, dd, ddLoading, news = [], onStatusChange, onForceBuy, tvLayoutId }) {
   const [expanded, setExpanded]   = useState(false)
   const [ddOpen, setDdOpen]       = useState(false)
   const [newsOpen, setNewsOpen]   = useState(false)
+  const [buying, setBuying]       = useState(false)
+  const [buyResult, setBuyResult] = useState(null)   // { ok, msg }
+
+  const handleForceBuy = async () => {
+    if (!window.confirm(`Force buy ${row.symbol} at $${Number(row.entry_price).toFixed(2)}?\nThis bypasses the position cap but still runs the AI gate.`)) return
+    setBuying(true)
+    setBuyResult(null)
+    try {
+      const res = await forceBuySymbol(row.symbol)
+      setBuyResult({ ok: true, msg: `Placed: ${res.order} (${res.qty} sh)` })
+      if (onForceBuy) onForceBuy(row.symbol)
+    } catch (err) {
+      const detail = err?.response?.data?.detail || err?.message || 'Unknown error'
+      setBuyResult({ ok: false, msg: detail })
+    } finally {
+      setBuying(false)
+    }
+  }
 
   const tvUrl = tvLayoutId
     ? `https://www.tradingview.com/chart/${tvLayoutId}/?symbol=${row.symbol}`
@@ -483,7 +503,7 @@ function PlanCard({ row, dd, ddLoading, news = [], onStatusChange, tvLayoutId })
             <p className="text-xs text-slate-400 leading-relaxed">{row.rationale}</p>
           )}
 
-          <div className="flex gap-2 pt-1">
+          <div className="flex flex-wrap gap-2 pt-1 items-center">
             {['PENDING', 'EXECUTED', 'PARTIAL', 'SKIPPED'].map(s => (
               <button
                 key={s}
@@ -495,7 +515,23 @@ function PlanCard({ row, dd, ddLoading, news = [], onStatusChange, tvLayoutId })
                 {s}
               </button>
             ))}
+
+            {row.status === 'PENDING' && (
+              <button
+                onClick={handleForceBuy}
+                disabled={buying}
+                className="text-xs px-3 py-1 rounded-md font-semibold bg-amber-500/20 text-amber-300 border border-amber-500/30 hover:bg-amber-500/35 disabled:opacity-50 disabled:cursor-not-allowed transition-colors ml-auto"
+              >
+                {buying ? 'Placing…' : 'Force Buy'}
+              </button>
+            )}
           </div>
+
+          {buyResult && (
+            <p className={`text-xs px-2 py-1 rounded-md ${buyResult.ok ? 'bg-emerald-500/15 text-emerald-300' : 'bg-red-500/15 text-red-400'}`}>
+              {buyResult.ok ? '✓' : '✗'} {buyResult.msg}
+            </p>
+          )}
 
           <button
             onClick={() => setDdOpen(o => !o)}

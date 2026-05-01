@@ -637,6 +637,123 @@ def update_plan_status(
     return {"symbol": symbol, "status": status, "mode": mode}
 
 
+@router.post("/weekly-plan/{symbol}/force-buy")
+def force_buy_plan_symbol(
+    symbol: str,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Manually execute a weekly plan entry, bypassing the position cap.
+    All other checks (AI gate, cash reserve, PDT-aware order type) still apply.
+    """
+    from fastapi import HTTPException
+    from ..position_manager import _gate, _place_entry, _size_qty, _settled_funds_available
+    from ..database import get_live_account_limits
+    from .. import alpaca_client as alp
+
+    uid  = current_user["id"]
+    mode = get_user_setting(db, "trading_mode", "paper", uid)
+
+    # Fetch the plan row
+    row = db.execute(
+        text("""
+            SELECT entry_price, stop_price, target1, target2, screener_type
+            FROM weekly_plan
+            WHERE symbol = :sym AND mode = :mode AND user_id = :uid
+              AND week_start = (
+                  SELECT MAX(week_start) FROM weekly_plan
+                  WHERE mode = :mode AND user_id = :uid
+              )
+        """),
+        {"sym": symbol.upper(), "mode": mode, "uid": uid},
+    ).fetchone()
+
+    if not row:
+        raise HTTPException(404, f"{symbol} not found in current week's plan")
+
+    entry   = float(row[0] or 0)
+    stop    = float(row[1] or 0)
+    target  = float(row[2] or 0)
+    target2 = float(row[3] or 0)
+    stype   = row[4] or "minervini"
+
+    if entry <= 0:
+        raise HTTPException(400, f"{symbol} has no entry price in plan")
+
+    # Size the position (respects cash reserve but NOT the position cap)
+    try:
+        acct      = alp.get_account_for_user(db, uid, mode)
+        portfolio = float(acct.portfolio_value)
+        cash      = float(acct.cash)
+    except Exception as exc:
+        raise HTTPException(502, f"Could not fetch account: {exc}")
+
+    risk_pct     = float(get_setting(db, "risk_pct", "2.0"))
+    stop_pct     = float(get_setting(db, "stop_loss_pct", "8.0"))
+
+    # Use tier-appropriate min_cash_pct and max_position_pct
+    limits       = get_live_account_limits(portfolio) if mode == "live" else {}
+    min_cash_pct = limits.get("min_cash_pct") or float(get_setting(db, "min_cash_pct", "10.0") or "10.0")
+    max_pos_pct  = limits.get("max_position_pct") or float(get_setting(db, "max_position_pct", "20.0") or "20.0")
+
+    qty   = _size_qty(portfolio, entry, stop, risk_pct, stop_pct)
+    avail = _settled_funds_available(acct, portfolio, min_cash_pct, 0.0)
+
+    if max_pos_pct > 0 and entry > 0:
+        max_shares = int(portfolio * max_pos_pct / 100 / entry)
+        qty = min(qty, max_shares)
+    if avail > 0 and entry > 0:
+        qty = min(qty, int(avail / entry))
+    else:
+        qty = 0
+
+    if qty < 1:
+        raise HTTPException(400, f"Insufficient buying power for {symbol} (avail=${avail:.2f})")
+
+    # AI gate (still applies)
+    if not _gate(db, symbol.upper(), qty, entry, stop, target, "FORCE_BUY", mode, user_id=uid):
+        raise HTTPException(403, f"Pre-trade AI gate blocked {symbol}")
+
+    # Place the order
+    try:
+        order_desc = _place_entry(db, symbol.upper(), qty, entry, stop, target, "FORCE_BUY", mode, stype, target2=target2, user_id=uid)
+    except Exception as exc:
+        raise HTTPException(502, f"Order placement failed: {exc}")
+
+    # Mark plan as EXECUTED and log the trade
+    db.execute(
+        text("""
+            UPDATE weekly_plan SET status = 'EXECUTED'
+            WHERE symbol = :sym AND mode = :mode AND user_id = :uid
+              AND week_start = (
+                  SELECT MAX(week_start) FROM weekly_plan WHERE mode = :mode AND user_id = :uid
+              )
+        """),
+        {"sym": symbol.upper(), "mode": mode, "uid": uid},
+    )
+    db.execute(
+        text("""
+            INSERT INTO trade_log (symbol, action, qty, price, trigger, mode)
+            VALUES (:s, 'BUY', :q, :p, 'FORCE_BUY', :m)
+        """),
+        {"s": symbol.upper(), "q": qty, "p": entry, "m": mode},
+    )
+    db.commit()
+
+    log.info("Force buy: %s qty=%d %s [%s]", symbol.upper(), qty, order_desc, mode)
+
+    try:
+        from .. import telegram_alerts as tg
+        from ..claude_analyst import get_latest_pre_trade
+        v, r = get_latest_pre_trade(db, symbol.upper(), mode)
+        tg.alert_trade_sync("BUY", symbol.upper(), qty, entry, "FORCE_BUY", mode, ai_verdict=v, ai_reason=r)
+    except Exception:
+        pass
+
+    return {"symbol": symbol.upper(), "qty": qty, "order": order_desc, "mode": mode}
+
+
 @router.get("/news")
 def get_weekly_news(current_user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
     """
