@@ -22,6 +22,11 @@ _ET = pytz.timezone("America/New_York")
 
 logger = logging.getLogger(__name__)
 
+# Symbols blocked by PDT protection this session (cleared at market open).
+# Prevents the monitor from spamming PDT alerts every cycle when there is
+# genuinely nothing we can do until the next trading day.
+_pdt_blocked: set[tuple[str, str]] = set()  # (symbol, mode)
+
 
 def _size_position(
     portfolio_value: float,
@@ -226,7 +231,15 @@ def _derive_fresh_plan(
 
 
 def _get_current_stop_price(orders: list) -> float | None:
-    """Extract the active stop price from an open OCO/bracket order's stop leg."""
+    """Extract the active stop price from open OCO/bracket orders.
+
+    Alpaca returns OCO siblings as separate top-level orders in get_orders()
+    responses — the "held" stop leg has no order_class set, only order_type=stop
+    (or stop_limit). We try the structured OCO parent first, then fall back to
+    scanning standalone stop-type sell orders so the price-match check works
+    even when .legs is empty in the list response.
+    """
+    # Pass 1: structured OCO parent with populated .legs
     for o in orders:
         order_class = str(getattr(o, 'order_class', '') or '').lower()
         side        = str(getattr(o, 'side',        '') or '').lower()
@@ -243,22 +256,34 @@ def _get_current_stop_price(orders: list) -> float | None:
             sp = getattr(o, 'stop_price', None)
             if sp is not None:
                 return float(sp)
+    # Pass 2: standalone stop-type sell order (OCO "held" sibling returned
+    # by Alpaca as a separate top-level entry with no order_class)
+    for o in orders:
+        side       = str(getattr(o, 'side',       '') or '').lower()
+        order_type = str(getattr(o, 'order_type', '') or getattr(o, 'type', '') or '').lower()
+        if 'sell' in side and 'stop' in order_type:
+            sp = getattr(o, 'stop_price', None)
+            if sp is not None:
+                return float(sp)
     return None
 
 
 def _get_current_target_price(orders: list) -> float | None:
-    """Extract the active target (limit) price from an open OCO/bracket order."""
+    """Extract the active target (limit) price from open OCO/bracket orders.
+
+    Same two-pass strategy as _get_current_stop_price: try the structured OCO
+    parent first, then fall back to standalone limit-type sell orders.
+    """
+    # Pass 1: structured OCO parent with populated .legs
     for o in orders:
         order_class = str(getattr(o, 'order_class', '') or '').lower()
         side        = str(getattr(o, 'side',        '') or '').lower()
         if 'sell' not in side:
             continue
         if any(kw in order_class for kw in ('oco', 'bracket', 'oto')):
-            # Parent limit_price is the take-profit leg
             lp = getattr(o, 'limit_price', None)
             if lp is not None:
                 return float(lp)
-            # Check child legs
             legs = getattr(o, 'legs', None) or []
             for leg in legs:
                 order_type = str(getattr(leg, 'type', '') or '').lower()
@@ -266,6 +291,14 @@ def _get_current_target_price(orders: list) -> float | None:
                     lp = getattr(leg, 'limit_price', None)
                     if lp is not None:
                         return float(lp)
+    # Pass 2: standalone limit-type sell order (OCO "new" sibling)
+    for o in orders:
+        side       = str(getattr(o, 'side',       '') or '').lower()
+        order_type = str(getattr(o, 'order_type', '') or getattr(o, 'type', '') or '').lower()
+        if 'sell' in side and 'limit' in order_type and 'stop' not in order_type:
+            lp = getattr(o, 'limit_price', None)
+            if lp is not None:
+                return float(lp)
     return None
 
 
@@ -442,6 +475,16 @@ def _ensure_exit_orders(
         qty = int(float(pos.qty))
         if qty <= 0:
             continue
+
+        # Skip silently if Alpaca's PDT protection already blocked all exits
+        # for this symbol today. The monitor will succeed tomorrow once the
+        # buy is no longer a same-day trade. _pdt_blocked is cleared at open.
+        if (sym, mode) in _pdt_blocked:
+            logger.debug(
+                "Exit guard: %s skipped — PDT-blocked this session [%s]", sym, mode
+            )
+            continue
+
         stop, target = _get_weekly_plan_exits(db, sym, mode)
         sym_orders = open_orders_by_symbol.get(sym, [])
 
@@ -480,37 +523,88 @@ def _ensure_exit_orders(
                 continue
 
         # ── Inspect current coverage ─────────────────────────────────────
-        # A position is "properly covered" only if total sell qty == pos qty
-        # AND a stop_limit child AND a limit child both exist AND prices
-        # match the plan (within threshold).
+        # Alpaca's status=open only returns the "new" (working) leg of an OCO.
+        # The "held" stop sibling is invisible to open-order queries.
+        #
+        # Coverage model:
+        #   OCO path  — find a sell limit order with order_class=oco at the
+        #               correct qty and target price. Alpaca's OCO contract
+        #               guarantees the stop sibling exists; verify its price
+        #               from .legs if populated, or from plan_stop (DB truth).
+        #   Two-order path — find explicit stop + limit sell legs (legacy).
         sell_legs = [o for o in sym_orders if 'sell' in str(getattr(o, 'side', '') or '').lower()]
-        covered_qty = 0
-        has_stop_leg = has_limit_leg = False
-        for o in sell_legs:
-            try:
-                covered_qty += int(float(getattr(o, 'qty', 0) or 0))
-            except (TypeError, ValueError):
-                pass
-            otype = str(getattr(o, 'order_type', '') or getattr(o, 'type', '') or '').lower()
-            if 'stop' in otype:
-                has_stop_leg = True
-            elif 'limit' in otype:
-                has_limit_leg = True
 
-        current_stop   = _get_current_stop_price(sym_orders)
-        current_target = _get_current_target_price(sym_orders)
-        prices_match = (
-            current_stop is not None
-            and current_target is not None
-            and abs(current_stop - stop) <= _PRICE_CHANGE_THRESHOLD
-            and abs(current_target - target) <= _PRICE_CHANGE_THRESHOLD
-        )
-        # Single-OCO model: properly covered means total sell qty == pos qty
-        # AND exactly one stop leg + one limit leg exist AND prices match.
-        if (covered_qty == qty and has_stop_leg and has_limit_leg
-                and len(sell_legs) == 2 and prices_match):
-            logger.debug("Exit guard: %s coverage already correct — no action.", sym)
-            continue
+        # Detect OCO parent: a limit-type sell with order_class containing 'oco'
+        oco_parent = None
+        for o in sell_legs:
+            oclass = str(getattr(o, 'order_class', '') or '').lower()
+            otype  = str(getattr(o, 'order_type', '') or getattr(o, 'type', '') or '').lower()
+            if 'oco' in oclass or 'bracket' in oclass:
+                if 'limit' in otype and 'stop' not in otype:
+                    oco_parent = o
+                    break
+
+        if oco_parent is not None:
+            # OCO path: one order visible (limit=new), stop guaranteed by Alpaca
+            try:
+                oco_qty = int(float(getattr(oco_parent, 'qty', 0) or 0))
+            except (TypeError, ValueError):
+                oco_qty = 0
+
+            current_target = _get_current_target_price(sym_orders)
+
+            # Try to read stop price from .legs (populated in some responses)
+            current_stop = None
+            for leg in (getattr(oco_parent, 'legs', None) or []):
+                leg_type = str(getattr(leg, 'type', '') or '').lower()
+                if 'stop' in leg_type:
+                    sp = getattr(leg, 'stop_price', None)
+                    if sp is not None:
+                        current_stop = float(sp)
+                        break
+            # If legs not populated, trust DB stop as ground truth (we set it)
+            if current_stop is None:
+                current_stop = stop
+
+            target_ok = (current_target is not None
+                         and abs(current_target - target) <= _PRICE_CHANGE_THRESHOLD)
+            stop_ok   = abs(current_stop - stop) <= _PRICE_CHANGE_THRESHOLD
+            qty_ok    = (oco_qty == qty)
+
+            if qty_ok and stop_ok and target_ok:
+                logger.debug("Exit guard: %s OCO coverage correct — no action.", sym)
+                continue
+
+        else:
+            # Legacy two-order path (explicit stop + limit sell orders)
+            has_stop_leg = has_limit_leg = False
+            stop_qty = limit_qty = 0
+            for o in sell_legs:
+                otype = str(getattr(o, 'order_type', '') or getattr(o, 'type', '') or '').lower()
+                try:
+                    o_qty = int(float(getattr(o, 'qty', 0) or 0))
+                except (TypeError, ValueError):
+                    o_qty = 0
+                if 'stop' in otype:
+                    has_stop_leg = True
+                    stop_qty = o_qty
+                elif 'limit' in otype:
+                    has_limit_leg = True
+                    limit_qty = o_qty
+
+            current_stop   = _get_current_stop_price(sym_orders)
+            current_target = _get_current_target_price(sym_orders)
+            prices_match = (
+                current_stop is not None
+                and current_target is not None
+                and abs(current_stop - stop) <= _PRICE_CHANGE_THRESHOLD
+                and abs(current_target - target) <= _PRICE_CHANGE_THRESHOLD
+            )
+            if (has_stop_leg and has_limit_leg
+                    and stop_qty == qty and limit_qty == qty
+                    and len(sell_legs) == 2 and prices_match):
+                logger.debug("Exit guard: %s two-order coverage correct — no action.", sym)
+                continue
 
         # ── Serialized replace: cancel all sells, wait, place fresh ──────
         # Never stack a new OCO on top of existing sells. Alpaca paper can
@@ -557,14 +651,78 @@ def _ensure_exit_orders(
                     sym, mode,
                 )
         except Exception as exc:
-            logger.error("Exit guard: OCO placement failed for %s: %s", sym, exc)
-            try:
-                tg.alert_system_error_sync(
-                    f"NAKED POSITION [{mode}] {sym} — OCO placement failed",
-                    exc,
+            exc_str = str(exc)
+            # PDT (pattern day trading) protection blocks OCO orders — and even
+            # plain stop orders — placed the same day as a buy in margin accounts
+            # under $25k. Nothing can be placed today; try stop-market as last
+            # resort, and if that also fails, park the symbol until tomorrow.
+            if "40310100" in exc_str or "pattern day trad" in exc_str.lower():
+                logger.warning(
+                    "Exit guard: OCO for %s blocked by PDT — trying stop-market fallback [%s]",
+                    sym, mode,
                 )
-            except Exception:
-                pass
+                stop_placed = False
+                try:
+                    alp.place_stop_loss_sell(sym, qty, stop, mode)
+                    stop_placed = True
+                    logger.info(
+                        "Exit guard: PDT fallback — stop-market sell placed for %s "
+                        "qty=%d stop=$%.2f [%s]",
+                        sym, qty, stop, mode,
+                    )
+                    try:
+                        tg.alert_system_error_sync(
+                            f"⚠️ PDT PROTECTION [{mode}] {sym}\n"
+                            f"OCO blocked by Alpaca's pattern-day-trading rule.\n"
+                            f"✅ Stop-market placed at ${stop:.2f} (no take-profit today).\n"
+                            f"OCO will be set automatically at tomorrow's open.\n"
+                            f"Tip: Deposit to reach $25k+ equity to lift PDT restrictions.",
+                            exc,
+                        )
+                    except Exception:
+                        pass
+                except Exception as stop_exc:
+                    if "40310100" in str(stop_exc) or "pattern day trad" in str(stop_exc).lower():
+                        # Alpaca is blocking even plain stop orders today.
+                        # Park this symbol; the monitor will place exits tomorrow.
+                        _pdt_blocked.add((sym, mode))
+                        logger.error(
+                            "Exit guard: %s — ALL exits blocked by PDT today; "
+                            "parked until next open [%s]",
+                            sym, mode,
+                        )
+                        try:
+                            tg.alert_system_error_sync(
+                                f"⚠️ PDT PROTECTION [{mode}] {sym}\n"
+                                f"Alpaca is blocking ALL sell orders today (same-day buy).\n"
+                                f"🔒 Position unprotected until tomorrow's market open.\n"
+                                f"Bot will auto-place OCO at next open. Monitor manually.\n"
+                                f"Tip: Deposit to reach $25k+ equity to lift PDT restrictions.",
+                                stop_exc,
+                            )
+                        except Exception:
+                            pass
+                    else:
+                        logger.error(
+                            "Exit guard: PDT stop-market fallback failed for %s: %s [%s]",
+                            sym, stop_exc, mode,
+                        )
+                        try:
+                            tg.alert_system_error_sync(
+                                f"NAKED POSITION [{mode}] {sym} — OCO + stop-market both failed",
+                                stop_exc,
+                            )
+                        except Exception:
+                            pass
+            else:
+                logger.error("Exit guard: OCO placement failed for %s: %s", sym, exc)
+                try:
+                    tg.alert_system_error_sync(
+                        f"NAKED POSITION [{mode}] {sym} — OCO placement failed",
+                        exc,
+                    )
+                except Exception:
+                    pass
         continue
 
 
@@ -823,6 +981,16 @@ async def run_monitor(db: Session, user_id: int | None = None, mode: str | None 
     try:
         clock       = alp.get_clock(mode)
         market_open = clock.is_open
+
+        # Clear PDT-blocked symbols at each market open so the exit guard
+        # retries OCO placement for positions bought the previous day.
+        if market_open and _pdt_blocked:
+            logger.info(
+                "run_monitor [%s]: market open — clearing %d PDT-blocked symbol(s): %s",
+                mode, len(_pdt_blocked),
+                [s for s, m in _pdt_blocked if m == mode],
+            )
+            _pdt_blocked.clear()
 
         acct         = alp.get_account_for_user(db, user_id, mode)
         positions    = alp.get_positions_for_user(db, user_id, mode)

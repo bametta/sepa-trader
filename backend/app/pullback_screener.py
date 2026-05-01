@@ -170,6 +170,72 @@ def get_pb_settings(db: Session, user_id: int) -> dict:
     }
 
 
+# ── Pre-fetch fast path ───────────────────────────────────────────────────────
+
+def _filter_mega_for_pullback(mega_data: dict[str, dict], cfg: dict) -> list[dict]:
+    """Apply all pullback filter logic locally to pre-fetched mega-scan data.
+
+    Mirrors the server-side conditions from _build_tv_filters plus the local
+    refinement from _local_refinement. Used when mega_data is pre-fetched by
+    run_both_screeners so the pullback screener can skip its own TV call entirely.
+    """
+    candidates = []
+    for sym, v in mega_data.items():
+        close   = v.get("close")   or 0.0
+        e20     = v.get("EMA20")   or 0.0
+        e50     = v.get("EMA50")   or 0.0
+        e100    = v.get("EMA100")  or 0.0
+        e200    = v.get("EMA200")  or 0.0
+        rsi     = v.get("RSI")     or 0.0
+        adx     = v.get("ADX")     or 0.0
+        avg_vol = v.get("average_volume_30d_calc") or 0.0
+        mcap    = v.get("market_cap_basic") or 0.0
+        perf3m  = v.get("Perf.3M") or 0.0
+        exch    = (v.get("exchange") or "").strip().upper()
+
+        # Price range
+        if cfg["price_min"] > 0 and close < cfg["price_min"]:
+            continue
+        if cfg["price_max"] > 0 and close > cfg["price_max"]:
+            continue
+        # Exchange
+        if cfg.get("exchanges") and exch not in cfg["exchanges"]:
+            continue
+        # EMA ladder (mirrors _build_tv_filters conditions)
+        if cfg["price_above_ema20"] and (not e20 or close <= e20):
+            continue
+        if cfg["ema20_above_ema50"] and (not e50 or e20 <= e50):
+            continue
+        if cfg["ema50_above_ema100"] and (not e100 or e50 <= e100):
+            continue
+        if cfg["ema100_above_ema200"] and (not e200 or e100 <= e200):
+            continue
+        # RSI reset zone
+        if rsi < cfg["rsi_min"] or rsi > cfg["rsi_max"]:
+            continue
+        # Volume / market cap
+        if cfg["avg_vol_min"] > 0 and avg_vol < cfg["avg_vol_min"]:
+            continue
+        if cfg["market_cap_min"] > 0 and mcap < cfg["market_cap_min"]:
+            continue
+        # ADX
+        if cfg["adx_min"] > 0 and adx < cfg["adx_min"]:
+            continue
+        # 3-month performance
+        if perf3m < cfg["perf_3m_min"]:
+            continue
+        # Local refinement: rel_vol, EMA50 proximity, EMA spread, 52W high, sectors
+        c = _local_refinement(sym, v, cfg)
+        if c is not None:
+            candidates.append(c)
+
+    logger.info(
+        "Pullback [mega fast-path]: %d of %d symbols passed all filters",
+        len(candidates), len(mega_data),
+    )
+    return candidates
+
+
 # ── Main entry point ──────────────────────────────────────────────────────────
 
 def run_pullback_screener(
@@ -177,6 +243,7 @@ def run_pullback_screener(
     mode: str = None,
     user_id: int = None,
     account_value: float = None,
+    prefetched_mega: dict | None = None,
 ) -> list[dict]:
     """
     Run the Pullback-to-MA screener.
@@ -188,39 +255,36 @@ def run_pullback_screener(
 
     cfg = get_pb_settings(db, user_id)
 
-    # Universe: same as Minervini screener by default
-    universe_raw = get_user_setting(db, "screener_universe", "", user_id)
-    from .screener import DEFAULT_UNIVERSE
-    universe = (
-        [s.strip().upper() for s in universe_raw.split(",") if s.strip()]
-        if universe_raw else DEFAULT_UNIVERSE
-    )
-
     # ── Pass 1: TradingView filter ────────────────────────────────────────────
-    # Option B: user has named a saved TV screener → use it directly
-    tv_screener_name = get_user_setting(db, "pb_tv_screener_name", "", user_id).strip()
-    tv_user = get_user_setting(db, "tv_username", "", user_id)
-    tv_pass = get_user_setting(db, "tv_password", "", user_id)
-
-    if tv_screener_name and tv_user and tv_pass:
+    if prefetched_mega:
+        # Fast path: caller already fetched the full exchange universe — apply
+        # all pullback filters locally, skipping a separate TV HTTP call.
         logger.info(
-            "Pullback screener [Option B]: using saved TV screener '%s'", tv_screener_name
+            "Pullback screener [mega fast-path]: filtering %d pre-fetched symbols",
+            len(prefetched_mega),
         )
-        candidates = _tv_filter_saved_screener(tv_screener_name, tv_user, tv_pass, cfg)
-        if candidates is None:
-            # Fallback to Option A when saved screener fetch fails
-            logger.warning(
-                "Saved TV screener '%s' failed — falling back to server-side filter scan.",
-                tv_screener_name,
-            )
-            candidates = _adaptive_ema_serverside(cfg)
+        candidates = _filter_mega_for_pullback(prefetched_mega, cfg)
     else:
-        # Option A: send filter conditions to TV's scanner, let TV do the filtering
-        logger.info(
-            "Pullback screener [Option A]: server-side TV filter scan (universe=%d symbols)",
-            len(universe),
-        )
-        candidates = _adaptive_ema_serverside(cfg)
+        # Option B: user has named a saved TV screener → use it directly
+        tv_screener_name = get_user_setting(db, "pb_tv_screener_name", "", user_id).strip()
+        tv_user = get_user_setting(db, "tv_username", "", user_id)
+        tv_pass = get_user_setting(db, "tv_password", "", user_id)
+
+        if tv_screener_name and tv_user and tv_pass:
+            logger.info(
+                "Pullback screener [Option B]: using saved TV screener '%s'", tv_screener_name
+            )
+            candidates = _tv_filter_saved_screener(tv_screener_name, tv_user, tv_pass, cfg)
+            if candidates is None:
+                logger.warning(
+                    "Saved TV screener '%s' failed — falling back to server-side filter scan.",
+                    tv_screener_name,
+                )
+                candidates = _adaptive_ema_serverside(cfg)
+        else:
+            # Option A: send filter conditions to TV's scanner, let TV do the filtering
+            logger.info("Pullback screener [Option A]: server-side TV filter scan")
+            candidates = _adaptive_ema_serverside(cfg)
 
     logger.info("Pullback screener: %d candidates after TV filter", len(candidates))
 

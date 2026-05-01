@@ -3,6 +3,7 @@ from alpaca.trading.requests import (
     MarketOrderRequest,
     LimitOrderRequest,
     StopLimitOrderRequest,
+    StopOrderRequest,
     GetOrdersRequest,
     StopLossRequest,
     TakeProfitRequest,
@@ -430,6 +431,27 @@ def place_oca_exit(
         order_class=OrderClass.OCO,
         stop_loss=StopLossRequest(stop_price=round(stop_price, 2)),
         take_profit=TakeProfitRequest(limit_price=round(target_price, 2)),
+    )
+    return get_client(mode).submit_order(req)
+
+
+def place_stop_loss_sell(
+    symbol: str,
+    qty: float,
+    stop_price: float,
+    mode: str = "paper",
+):
+    """
+    Place a plain GTC stop-market sell order (no take-profit leg).
+    Used as a PDT-safe fallback when an OCO is rejected due to pattern day
+    trading protection — the position is at least protected on the downside.
+    """
+    req = StopOrderRequest(
+        symbol=symbol,
+        qty=round(qty, 0),
+        side=OrderSide.SELL,
+        time_in_force=TimeInForce.GTC,
+        stop_price=round(stop_price, 2),
     )
     return get_client(mode).submit_order(req)
 

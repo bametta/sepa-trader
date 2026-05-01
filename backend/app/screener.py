@@ -197,7 +197,7 @@ def _generate_rationale(symbol: str, result: dict) -> str:
     return " ".join(parts)
 
 
-def run_screener(db: Session, mode: str = None, user_id: int = None, account_value: float = None) -> list[dict]:
+def run_screener(db: Session, mode: str = None, user_id: int = None, account_value: float = None, prefetched_mega: dict | None = None) -> list[dict]:
     """
     Scan the stock universe, select top-N SEPA candidates, save to
     weekly_plan table, and update the watchlist setting.
@@ -327,7 +327,7 @@ def run_screener(db: Session, mode: str = None, user_id: int = None, account_val
         universe = [s.strip().upper() for s in universe_raw.split(",") if s.strip()]
         logger.info(
             "Screener: scoring %d override symbols (source=override, mode=%s)...",
-            len(universe), mode,
+            len(results_map), mode,
         )
         results_map = batch_analyze(
             universe,
@@ -336,6 +336,27 @@ def run_screener(db: Session, mode: str = None, user_id: int = None, account_val
             ema50_pct=ema50_pct,
         )
         universe_source = "override"
+    elif prefetched_mega:
+        from .tv_analyzer import score_mega_for_minervini
+        results_map = score_mega_for_minervini(
+            prefetched_mega,
+            vol_surge_pct=vol_surge_pct,
+            ema20_pct=ema20_pct,
+            ema50_pct=ema50_pct,
+        )
+        universe_source = "mega_scan"
+        if not results_map:
+            logger.warning(
+                "Mega scan produced no Minervini candidates — falling back to full exchange scan"
+            )
+            from .tv_analyzer import scan_and_score_universe
+            results_map = scan_and_score_universe(
+                price_min=price_min, price_max=price_max,
+                excluded_sectors=excluded_sectors, excluded_industries=excluded_industries,
+                max_results=universe_size, vol_surge_pct=vol_surge_pct,
+                ema20_pct=ema20_pct, ema50_pct=ema50_pct, db=db,
+            )
+            universe_source = "full_exchange_scan"
     else:
         from .tv_analyzer import scan_and_score_universe
         results_map = scan_and_score_universe(
@@ -711,7 +732,7 @@ def run_both_screeners(
     RS screener can be disabled via the rs_screener_enabled setting.
     """
     from .pullback_screener import run_pullback_screener
-    from .rs_screener import run_rs_screener, fetch_rs_universe, get_rs_settings
+    from .rs_screener import run_rs_screener
 
     def _phase(msg):
         logger.info("Screener phase: %s", msg)
@@ -743,30 +764,55 @@ def run_both_screeners(
         )
     logger.info("Account value for screener run: $%.0f (mode=%s)", av, mode)
 
-    _phase("Minervini: scanning universe via TradingView…")
-    min_rows = run_screener(db, mode=mode, user_id=user_id, account_value=av)
+    # ── Single mega TV scan — feeds all three screeners ───────────────────────
+    # One HTTP request fetches the full exchange universe with every column
+    # needed by Minervini + Pullback + RS Momentum. Each screener then filters
+    # and scores locally, eliminating 2–3 separate TV round-trips per run.
+    _phase("Fetching unified exchange scan (one TV call for all three screeners)…")
+    from .tv_analyzer import scan_universe_mega
+    universe_size = int(_gus2(db, "screener_universe_size", "1500") or "1500") or 1500
+    mega_data: dict[str, dict] = {}
+    try:
+        mega_data = scan_universe_mega(
+            price_min=float(_gus2(db, "screener_price_min", "0") or "0"),
+            price_max=float(_gus2(db, "screener_price_max", "0") or "0"),
+            max_results=universe_size,
+            db=db,
+        )
+    except Exception as exc:
+        logger.error("Mega scan failed (non-fatal — screeners will fall back to own TV calls): %s", exc)
+
+    logger.info("Mega scan: %d symbols loaded for all screeners", len(mega_data))
+
+    _phase(f"Mega scan done ({len(mega_data)} symbols). Running Minervini screener…")
+    min_rows = run_screener(
+        db, mode=mode, user_id=user_id, account_value=av,
+        prefetched_mega=mega_data or None,
+    )
 
     _phase(f"Minervini done — {len(min_rows)} candidates. Running Pullback screener…")
-    pb_rows  = run_pullback_screener(db, mode=mode, user_id=user_id, account_value=av)
+    pb_rows = run_pullback_screener(
+        db, mode=mode, user_id=user_id, account_value=av,
+        prefetched_mega=mega_data or None,
+    )
 
     rs_enabled = _gus2(db, "rs_screener_enabled", "true", user_id).lower() == "true"
-    score_map: dict[str, float] = {}
-    rs_tv_data: dict[str, dict] = {}
     rs_rows: list[dict] = []
     if rs_enabled:
-        _phase(f"Pullback done — {len(pb_rows)} candidates. Fetching global RS universe…")
-        try:
-            rs_cfg                  = get_rs_settings(db, user_id)
-            score_map, rs_tv_data   = fetch_rs_universe(rs_cfg)
-        except Exception as exc:
-            logger.error("RS universe fetch failed (non-fatal): %s", exc)
-
-        _phase(f"RS universe fetched ({len(score_map)} symbols). Running RS Momentum screener…")
+        _phase(f"Pullback done — {len(pb_rows)} candidates. Running RS Momentum screener…")
+        # Compute RS scores from mega_data for the RS screener's pass 1.
+        # The mega scan has all _RS_COLS fields. We build score_map locally so
+        # run_rs_screener can skip its own TV fetch entirely.
+        score_map: dict[str, float] = {}
+        if mega_data:
+            from .rs_screener import _rs_score as _compute_rs
+            for _sym, _v in mega_data.items():
+                score_map[_sym] = _compute_rs(_v)
         try:
             rs_rows = run_rs_screener(
                 db, mode=mode, user_id=user_id, account_value=av,
                 score_map=score_map or None,
-                tv_data=rs_tv_data or None,
+                tv_data=mega_data or None,
             )
         except Exception as exc:
             logger.error("RS screener failed (non-fatal): %s", exc)

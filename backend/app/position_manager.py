@@ -265,7 +265,44 @@ def _place_entry(
 
     elif order_type == "stop_limit":
         limit_px = round(entry * (1 + slippage_pct / 100), 2)
-        alp.place_stop_limit_buy(sym, qty, entry, slippage_pct, mode)
+        # Pre-flight price check: Alpaca rejects buy stop-limits where the stop
+        # price is at or below the current market price (the breakout already
+        # happened — the stop would trigger instantly at a limit below live price).
+        # If we're already past the entry, fall back to a limit order at limit_px
+        # so we still capture the position rather than hard-failing.
+        try:
+            from .tv_analyzer import analyze
+            live = analyze(sym)
+            live_price = live.get("price") or 0.0
+            if live_price and live_price >= entry:
+                logger.warning(
+                    "_place_entry %s: current price $%.2f already past stop entry $%.2f "
+                    "— stop-limit would be rejected; falling back to limit buy at $%.2f [%s]",
+                    sym, live_price, entry, limit_px, mode,
+                )
+                alp.place_limit_buy(sym, qty, limit_px, mode)
+                return f"limit buy [stop already passed] (lim=${limit_px:.2f})"
+        except Exception as exc:
+            logger.debug("_place_entry %s: price pre-check failed (%s) — proceeding with stop-limit", sym, exc)
+
+        order = alp.place_stop_limit_buy(sym, qty, entry, slippage_pct, mode)
+        # Brief rejection check — catch any remaining immediate rejections.
+        try:
+            import time as _time
+            _time.sleep(0.5)
+            client = alp._get_user_client(db, user_id, mode) or alp.get_client(mode)
+            order_id = str(getattr(order, "id", "") or "")
+            if order_id:
+                refreshed = client.get_order_by_id(order_id)
+                status = str(getattr(refreshed, "status", "") or "").lower()
+                if status in ("rejected", "canceled", "expired"):
+                    raise RuntimeError(
+                        f"Entry order for {sym} was {status} by Alpaca immediately after submission."
+                    )
+        except RuntimeError:
+            raise
+        except Exception:
+            pass  # refresh failed — reconcile will self-heal if needed
         return f"stop-limit (stop=${entry:.2f} lim=${limit_px}) — exits pending fill"
 
     else:  # "market" or unrecognised
@@ -470,7 +507,7 @@ def run_monday_open(db: Session, mode: str | None = None):
             )
             continue
 
-        if not _gate(db, sym, qty, entry, stop, target, "MONDAY_OPEN", mode):
+        if not _gate(db, sym, qty, entry, stop, target, "MONDAY_OPEN", mode, user_id=admin_uid):
             continue
 
         try:
@@ -855,7 +892,7 @@ def _execute_specific_pick(db: Session, mode: str, symbol: str, pending_picks: l
         logger.info("Slot refill: %s position size < 1 share (avail=$%.2f) — skipping.", symbol, avail)
         return
 
-    if not _gate(db, symbol, qty, entry, stop, target, "SLOT_REFILL", mode):
+    if not _gate(db, symbol, qty, entry, stop, target, "SLOT_REFILL", mode, user_id=user_id):
         return
 
     try:
@@ -953,7 +990,7 @@ def _execute_next_pick(db: Session, mode: str, held: set, user_id: int | None = 
         )
         return
 
-    if not _gate(db, sym, qty, entry, stop, target, "POST_CLOSE", mode):
+    if not _gate(db, sym, qty, entry, stop, target, "POST_CLOSE", mode, user_id=admin_uid):
         return
 
     try:
@@ -1689,6 +1726,68 @@ def reconcile_db_vs_alpaca(db: Session, mode: str) -> dict:
 
     missing_in_alpaca   = sorted(db_syms - alpaca_syms)   # DB thinks open, broker says no
     unexpected_in_alpaca = sorted(alpaca_syms - db_syms)  # broker holds, DB has no record
+
+    # Self-heal missing_in_alpaca: DB has a BUY record but Alpaca has no position.
+    # This happens when an entry order was rejected or expired after the BUY was
+    # logged — the plan stays EXECUTED and the slot is stuck forever.
+    # For each missing symbol: check whether Alpaca actually filled a BUY.
+    # If no fill exists → the order was rejected/expired → revert plan to PENDING
+    # and delete the phantom BUY so the slot can be refilled next cycle.
+    if missing_in_alpaca:
+        phantom_healed: list[str] = []
+        for sym in list(missing_in_alpaca):
+            try:
+                buy_fills = alp.find_recent_fills(mode, sym, "BUY", days=7)
+            except Exception:
+                buy_fills = []
+            if buy_fills:
+                # A real fill exists — position may have been closed manually or
+                # the reconcile window is stale. Leave the alert as-is.
+                continue
+            # No fill → entry order never executed. Revert plan + purge phantom BUY.
+            try:
+                db.execute(
+                    text("""
+                        UPDATE weekly_plan SET status = 'PENDING'
+                        WHERE symbol = :sym AND mode = :mode
+                          AND week_start = (
+                              SELECT MAX(week_start) FROM weekly_plan WHERE mode = :mode
+                          )
+                          AND status = 'EXECUTED'
+                    """),
+                    {"sym": sym, "mode": mode},
+                )
+                # Remove the phantom BUY row(s) that have no subsequent SELL
+                db.execute(
+                    text("""
+                        DELETE FROM trade_log
+                        WHERE symbol = :sym AND mode = :mode AND action = 'BUY'
+                          AND created_at >= NOW() - INTERVAL '7 days'
+                          AND NOT EXISTS (
+                              SELECT 1 FROM trade_log s
+                              WHERE s.symbol  = trade_log.symbol
+                                AND s.mode    = trade_log.mode
+                                AND s.action  = 'SELL'
+                                AND s.created_at > trade_log.created_at
+                          )
+                    """),
+                    {"sym": sym, "mode": mode},
+                )
+                db.commit()
+                phantom_healed.append(sym)
+                logger.warning(
+                    "reconcile [%s]: %s — no Alpaca fill found, entry was rejected/expired. "
+                    "Reverted plan to PENDING and purged phantom BUY.",
+                    mode, sym,
+                )
+            except Exception as exc:
+                logger.error("reconcile [%s]: self-heal for %s failed: %s", mode, sym, exc)
+                try:
+                    db.rollback()
+                except Exception:
+                    pass
+        if phantom_healed:
+            missing_in_alpaca = sorted(set(missing_in_alpaca) - set(phantom_healed))
 
     # Self-heal unexpected_in_alpaca: positions Alpaca shows that have no DB
     # BUY row. Reconstruct the BUY from the actual filled-order history (or
