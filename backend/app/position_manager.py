@@ -1744,7 +1744,28 @@ def reconcile_db_vs_alpaca(db: Session, mode: str) -> dict:
                 # A real fill exists — position may have been closed manually or
                 # the reconcile window is stale. Leave the alert as-is.
                 continue
-            # No fill → entry order never executed. Revert plan + purge phantom BUY.
+
+            # Check for an open/pending BUY order (stop-limit not yet triggered).
+            # If one exists the position simply hasn't opened yet — do NOT revert
+            # the plan to PENDING or we'll place a second entry on the next cycle.
+            try:
+                open_buys = [
+                    o for o in alp.get_open_orders_by_symbol(mode).get(sym, [])
+                    if 'buy' in str(getattr(o, 'side', '') or '').lower()
+                    and str(getattr(o, 'status', '') or '').lower()
+                    not in ('canceled', 'filled', 'expired', 'rejected')
+                ]
+            except Exception:
+                open_buys = []
+            if open_buys:
+                logger.debug(
+                    "reconcile [%s]: %s — no position yet but open BUY order exists "
+                    "(stop-limit pending trigger). Skipping revert.",
+                    mode, sym,
+                )
+                continue
+
+            # No fill and no open order → entry was rejected/expired. Revert plan + purge phantom BUY.
             try:
                 db.execute(
                     text("""
