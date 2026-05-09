@@ -27,6 +27,10 @@ logger = logging.getLogger(__name__)
 # genuinely nothing we can do until the next trading day.
 _pdt_blocked: set[tuple[str, str]] = set()  # (symbol, mode)
 
+# Symbols that have already triggered a size-mismatch alert this session.
+# Cleared at market open so a fresh alert fires the next day if still wrong.
+_size_mismatch_alerted: set[tuple[str, str]] = set()  # (symbol, mode)
+
 
 def _size_position(
     portfolio_value: float,
@@ -487,6 +491,40 @@ def _ensure_exit_orders(
 
         stop, target = _get_weekly_plan_exits(db, sym, mode)
         sym_orders = open_orders_by_symbol.get(sym, [])
+
+        # ── Position-size mismatch alert ─────────────────────────────────
+        # If the actual position is >20% larger than the plan intended, something
+        # went wrong (e.g. double entry). Alert once per session per symbol so
+        # the monitor doesn't spam. Cleared at market open each day.
+        try:
+            planned_qty_row = db.execute(
+                text("""
+                    SELECT position_size FROM weekly_plan
+                    WHERE symbol = :sym AND mode = :mode
+                    ORDER BY week_start DESC LIMIT 1
+                """),
+                {"sym": sym, "mode": mode},
+            ).fetchone()
+            planned_qty = int(float(planned_qty_row[0] or 0)) if planned_qty_row else 0
+            if planned_qty > 0 and qty > planned_qty * 1.2:
+                logger.warning(
+                    "Exit guard: %s position size mismatch — actual=%d planned=%d (%.0f%% over) [%s]",
+                    sym, qty, planned_qty, (qty / planned_qty - 1) * 100, mode,
+                )
+                if (sym, mode) not in _size_mismatch_alerted:
+                    _size_mismatch_alerted.add((sym, mode))
+                    try:
+                        tg.alert_system_error_sync(
+                            f"⚠️ SIZE MISMATCH [{mode}] {sym}\n"
+                            f"Position is {qty} shares but plan expected {planned_qty} "
+                            f"({(qty / planned_qty - 1) * 100:.0f}% over). "
+                            f"Possible double entry — review and adjust manually.",
+                            RuntimeError(f"actual={qty} planned={planned_qty}"),
+                        )
+                    except Exception:
+                        pass
+        except Exception as _size_exc:
+            logger.debug("Exit guard: size-mismatch check failed for %s: %s", sym, _size_exc)
 
         # ── In-flight BUY guard ──────────────────────────────────────────
         # If an entry order is still partially filling, pos.qty may grow.
@@ -982,15 +1020,22 @@ async def run_monitor(db: Session, user_id: int | None = None, mode: str | None 
         clock       = alp.get_clock(mode)
         market_open = clock.is_open
 
-        # Clear PDT-blocked symbols at each market open so the exit guard
-        # retries OCO placement for positions bought the previous day.
-        if market_open and _pdt_blocked:
-            logger.info(
-                "run_monitor [%s]: market open — clearing %d PDT-blocked symbol(s): %s",
-                mode, len(_pdt_blocked),
-                [s for s, m in _pdt_blocked if m == mode],
-            )
-            _pdt_blocked.clear()
+        # Clear per-session alert trackers at each market open so stale flags
+        # don't suppress alerts that should fire again the next trading day.
+        if market_open and (_pdt_blocked or _size_mismatch_alerted):
+            if _pdt_blocked:
+                logger.info(
+                    "run_monitor [%s]: market open — clearing %d PDT-blocked symbol(s): %s",
+                    mode, len(_pdt_blocked),
+                    [s for s, m in _pdt_blocked if m == mode],
+                )
+                _pdt_blocked.clear()
+            if _size_mismatch_alerted:
+                logger.info(
+                    "run_monitor [%s]: market open — clearing %d size-mismatch alert(s)",
+                    mode, len(_size_mismatch_alerted),
+                )
+                _size_mismatch_alerted.clear()
 
         acct         = alp.get_account_for_user(db, user_id, mode)
         positions    = alp.get_positions_for_user(db, user_id, mode)
