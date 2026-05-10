@@ -6,6 +6,163 @@ import TwoFactorSetup from './TwoFactorSetup'
 const DAYS = ['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday']
 const EXCHANGES = ['NYSE', 'NASDAQ', 'AMEX', 'CBOE', 'OTC']
 
+// ── Hover tooltips for every settings field ───────────────────────────────────
+const FIELD_TOOLTIPS = {
+  // Trading Mode
+  trading_mode:         'Controls which mode is shown in the UI. Both paper and live accounts run simultaneously — this only affects the display, not execution.',
+  paper_auto_execute:   'When on, the system automatically places simulated orders in your Alpaca paper account. Turn off to review signals manually before any order is placed.',
+  live_auto_execute:    '⚠️ Real money. When on, live orders fire automatically. Only enable after validating the full system in paper mode first.',
+
+  // Risk & Position Sizing
+  risk_pct:             'Dollar risk per trade = portfolio × this %. Share count is calculated backwards from this: shares = risk$ ÷ (entry − stop). Every trade carries the same dollar risk regardless of price or stop width.',
+  stop_loss_pct:        'Fallback stop distance used when EMA20/EMA50 cannot anchor a structural stop. Screeners compute structural stops first — this is the safety floor for edge cases.',
+  max_position_pct:     'Hard cap: no single position can exceed this % of portfolio value. Overrides the risk-math share count when a tight stop would otherwise create dangerous concentration.',
+  min_cash_pct:         'The system checks settled cash before every buy and refuses to drop below this floor. Prevents drawing on margin and keeps dry powder available for fresh setups.',
+  min_position_dollars: 'Orders with a notional value below this are rejected. Tiny positions are net-negative after slippage, bracket leg churn, and commissions.',
+  max_positions:        'No new entries fire once this many positions are open across all three strategies combined. The absolute portfolio ceiling.',
+  mv_max_slots:         'Minervini can hold at most this many positions simultaneously, independent of overall capacity. Prevents one strategy from crowding out the others.',
+  pb_max_slots:         'Pullback can hold at most this many simultaneous positions.',
+  rs_max_slots:         'RS Momentum can hold at most this many simultaneous positions.',
+
+  // Minervini — Universe & Filters
+  screener_universe:        'Comma-separated tickers to scan (e.g. AAPL,MSFT). Leave blank for a market-wide TradingView scan — recommended for maximum opportunity discovery.',
+  screener_top_n:           'How many Minervini candidates to include in the weekly plan. Set to 0 to auto-derive from your position cap.',
+  screener_min_score:       'Minimum SEPA score to qualify. Set to 0 for adaptive mode — the screener auto-adjusts the threshold based on how many setups are available.',
+  screener_price_min:       'Stocks below this price are excluded. Filters out penny stocks and low-float names with erratic fills and wide spreads.',
+  screener_price_max:       'Stocks above this price are excluded. Use to keep position sizing manageable relative to your account size.',
+  screener_vol_surge_pct:   'Volume must be at least this % above the 10-day average on the signal day. Higher values demand stronger institutional conviction (e.g. 40 = requires 1.4× avg volume).',
+  screener_ema20_pct:       'Stock must be within this % band near EMA20. Controls how tight the pullback to the short-term moving average must be to qualify.',
+  screener_ema50_pct:       'Stock must be within this % band near EMA50. Controls pullback depth to the mid-term moving average.',
+  screener_universe_size:   'How many symbols to pull from TradingView before local filtering. Larger = more thorough but slower. 1500 covers most liquid US equities.',
+  screener_max_ema200_ext_pct: 'Rejects stocks extended more than this % above EMA200. Filters out late-stage parabolic runners. Set to 0 to disable.',
+  screener_max_ema50_ext_pct:  'Rejects stocks extended more than this % above EMA50. Prevents buying into overextended moves prone to snap-back. Set to 0 to disable.',
+
+  // Minervini — Plan Diversity
+  screener_min_rr:      'Minimum risk-to-reward ratio = (target − entry) ÷ (entry − stop). Borderline setups below this are dropped before the AI gate reviews them.',
+  max_picks_per_sector: 'Maximum picks from any single sector in the weekly plan. Prevents overconcentration in one theme (e.g. no more than 2 semiconductor picks).',
+
+  // Minervini — Sectors & Entry
+  mv_excluded_sectors:     'Stocks in these sectors are filtered out of Minervini results regardless of score or momentum.',
+  mv_entry_order_type:     'How the entry order is submitted. Stop-limit is recommended for breakouts — it only activates when price actually clears the pivot, avoiding premature fills.',
+  mv_entry_slippage_pct:   'Limit price = entry × (1 + slippage%). Wider tolerance increases fill rate on fast-moving breakout days.',
+
+  // Minervini — Schedule
+  screener_auto_run:         'Whether the Minervini screener runs automatically on the configured schedule. Disable to run manually only.',
+  screener_schedule_days:    'Which days of the week the Slot 1 screener fires. Thursday/Friday evenings are typical for weekly plan generation.',
+  screener_schedule_times:   'Times the Slot 1 screener runs (24h ET). Multiple times allowed — e.g. 20:00 after markets close.',
+  screener_schedule_days_2:  'Days for an optional second screener slot — useful for a midweek refresh without replacing the main plan.',
+  screener_schedule_times_2: 'Run times for the optional second screener slot.',
+
+  // Pullback — Source
+  pb_tv_screener_name: 'Name of a saved TradingView screener to use as the source universe. Leave blank to use the built-in filter settings below instead.',
+  pb_exchanges:        'Which exchanges to scan for pullback candidates. NYSE + NASDAQ covers most liquid US equities.',
+  pb_top_n:            'How many pullback candidates to include in the weekly plan.',
+
+  // Pullback — Filters
+  pb_price_min:         'Minimum stock price. Filters out illiquid penny stocks with wide spreads and erratic price action.',
+  pb_price_max:         'Maximum stock price. Higher-priced stocks require larger notional for the same risk-dollar exposure.',
+  pb_rsi_min:           'RSI must be at or above this level. Avoids stocks still deep in oversold territory where the downtrend may not be over.',
+  pb_rsi_max:           'RSI must be at or below this level. Ensures the stock has genuinely pulled back and is not overbought at entry.',
+  pb_avg_vol_min:       'Minimum 10-day average daily volume. Ensures liquidity for bracket order execution without significant market impact.',
+  pb_rel_vol_min:       'Current volume relative to the 10-day average. Values below 1.0 indicate below-average activity — the pullback may lack conviction.',
+  pb_market_cap_min:    'Filters out micro and small caps with thin float, wide spreads, and higher susceptibility to manipulation.',
+  pb_week_change_min:   'Minimum 1-week price change %. Prevents entering stocks in a sharp short-term downtrend disguised as a normal pullback.',
+  pb_ema50_proximity:   'Maximum % distance between price and EMA50. The pullback thesis requires price to be testing or near its mid-term moving average.',
+  pb_beta_max:          'Maximum beta. High-beta stocks have wider intraday swings that can trigger stops on normal volatility before the thesis plays out.',
+  pb_earnings_days_min: 'Minimum days until the next earnings announcement. Avoids entering before a binary event that can gap straight through the stop.',
+  pb_ema_spread_min:    'Minimum % spread between EMA20 and EMA50. Rejects flat, compressed EMA structures where the uptrend is losing momentum.',
+  pb_adx_min:           'Minimum ADX reading. ADX measures trend strength — values below 20 indicate a ranging, directionless stock with no real trend to pull back into.',
+  pb_52w_high_pct_max:  'Maximum % below the 52-week high. Stocks too far from their high are likely in Stage 3/4, not the Stage 2 uptrend the pullback thesis requires.',
+  pb_3m_perf_min:       'Minimum 3-month performance %. Filters out stocks that have been consistently underperforming the market over the medium term.',
+  pb_min_revenue_growth:'Minimum year-over-year revenue growth %. Adds a fundamental anchor to the technical setup. Set to 0 to ignore fundamentals.',
+  pb_block_unknown_earnings: 'Automatically exclude stocks whose next earnings date is unconfirmed. Prevents unexpected binary event exposure on unknown dates.',
+
+  // Pullback — EMA Ladder
+  pb_price_above_ema20:   'Requires price to be above EMA20 — the core short-term trend condition for a pullback setup. Never relaxed in adaptive mode.',
+  pb_ema20_above_ema50:   'Requires EMA20 above EMA50. Confirms the short-term trend is aligned with the mid-term trend. Never relaxed.',
+  pb_ema50_above_ema100:  'Requires EMA50 above EMA100. Confirms mid-term trend is above long-term. Can be relaxed automatically when the screener returns too few results.',
+  pb_ema100_above_ema200: 'Requires EMA100 above EMA200 — the full Stage 2 EMA ladder. This is the first condition relaxed when the screener returns too few candidates.',
+
+  // Pullback — PPST
+  pb_ppst_required:     'Requires the Pivot Point SuperTrend to show a bullish signal. Adds a momentum confirmation layer on top of the EMA ladder conditions.',
+  pb_ppst_pivot_period: 'Lookback period for the PPST pivot point calculation. Should match your TradingView chart settings (default 2).',
+  pb_ppst_multiplier:   'ATR multiplier for the PPST SuperTrend bands. Higher values = wider bands = fewer, more reliable signals.',
+  pb_ppst_period:       'ATR period for the PPST calculation. Matches TradingView\'s default of 10.',
+
+  // Pullback — AI chart review
+  pb_ai_chart_review:    'Send each candidate\'s chart to the AI for a technical review before including it in the weekly plan. Slower but filters out weak or ambiguous setups.',
+  pb_ai_chart_min_grade: 'Minimum chart grade to pass the AI review. A = only pristine setups, B = solid setups (recommended), C = allows marginal setups through.',
+
+  // Pullback — Sectors & Entry
+  pb_excluded_sectors:    'Pullback picks from these sectors are filtered out regardless of their technical score.',
+  pb_entry_order_type:    'How the entry order is submitted. Limit is recommended for pullbacks — the stock is already near your entry price and doesn\'t need chasing.',
+  pb_entry_slippage_pct:  'Limit price = entry × (1 + slippage%). Small tolerance is appropriate for pullbacks where you\'re already near the target price.',
+
+  // Pullback — Schedule
+  pb_screener_auto_run:          'Whether the Pullback screener runs automatically on the configured schedule.',
+  pb_screener_schedule_days:     'Which days the Slot 1 Pullback screener fires.',
+  pb_screener_schedule_times:    'Times the Slot 1 Pullback screener runs (24h ET).',
+  pb_screener_schedule_days_2:   'Days for the optional second Pullback screener slot.',
+  pb_screener_schedule_times_2:  'Run times for the optional second Pullback screener slot.',
+
+  // RS Momentum
+  rs_screener_enabled: 'Master switch for the RS Momentum screener. When disabled, no RS picks are generated or added to the weekly plan.',
+  rs_exchanges:        'Which exchanges to scan for RS Momentum candidates.',
+  rs_price_min:        'Minimum stock price. Filters out penny stocks with unreliable momentum signals.',
+  rs_price_max:        'Maximum stock price. Set to 0 for no ceiling.',
+  rs_avg_vol_min:      'Minimum average daily volume. Ensures positions can be entered and exited cleanly without moving the market.',
+  rs_market_cap_min:   'Minimum market cap. Filters out micro-caps with unpredictable momentum and thin liquidity.',
+  rs_min_percentile:   'Only stocks whose RS score ranks at or above this percentile qualify. 75 = top 25% of the scanned universe by relative strength.',
+  rs_max_extension:    'Maximum % above EMA50. Prevents buying stocks already overextended and likely to pull back before continuing higher.',
+  rs_top_n:            'How many RS Momentum picks to include in the weekly plan.',
+  rs_require_stage2:   'Requires price > EMA50 > EMA200 — the classic Stage 2 uptrend filter. Excludes stocks recovering from a downtrend or still building a base.',
+  rs_excluded_sectors: 'RS picks from these sectors are excluded. Typically commodities and defensives, which skew RS rankings based on macro factors rather than company-specific momentum.',
+
+  // RS — Schedule
+  rs_screener_auto_run:          'Whether the RS Momentum screener runs automatically on the configured schedule.',
+  rs_screener_schedule_days:     'Which days the Slot 1 RS screener fires.',
+  rs_screener_schedule_times:    'Times the Slot 1 RS screener runs (24h ET).',
+  rs_screener_schedule_days_2:   'Days for the optional second RS screener slot.',
+  rs_screener_schedule_times_2:  'Run times for the optional second RS screener slot.',
+
+  // Combined Screener
+  combined_screener_auto_run:          'Runs all three screeners (Minervini + Pullback + RS) in a single TradingView API call. Recommended as the primary weekly plan generator — one scan instead of three.',
+  combined_screener_schedule_days:     'Which days the Slot 1 combined screener fires.',
+  combined_screener_schedule_times:    'Times the Slot 1 combined screener runs (24h ET).',
+  combined_screener_schedule_days_2:   'Days for the optional second combined screener slot.',
+  combined_screener_schedule_times_2:  'Run times for the optional second combined screener slot.',
+
+  // Monitor — Cycle
+  monitor_enabled:          'Master switch for the position management loop. When off, no trailing stops, exit guards, T1 partial exits, or time stops fire. Positions are unmanaged.',
+  monitor_interval_minutes: 'How often the monitor cycle runs during market hours. Shorter = faster reactions to T1 hits and trailing stop milestones, but more API calls to Alpaca and TradingView.',
+  auto_execute:             'Whether Monday open orders fire automatically from the weekly plan. When off, the system logs what would have been bought but places no orders.',
+
+  // Monitor — Apex Loss Prevention
+  daily_drawdown_halt_pct: 'Circuit breaker. When today\'s P&L drops below this % of yesterday\'s closing equity, all new buys are blocked for the rest of the session. Exits and trailing stops continue running. Resets automatically at next market open. Set to 0 to disable.',
+  time_stop_days:           'Positions open longer than this many trading days are evaluated for closure if they haven\'t moved enough. Prevents dead money from tying up buying power. Set to 0 to disable.',
+  time_stop_max_gain_pct:   'Positions with unrealized gain at or above this % survive the time stop regardless of how long they\'ve been open. Only flat or losing positions that have gone nowhere are closed.',
+
+  // Integrations
+  tv_chart_layout_id: 'TradingView chart layout ID used for AI chart reviews. Find it in your chart URL: tradingview.com/chart/YOUR_ID_HERE/',
+  tv_username:        'TradingView account username. Used by the screener to authenticate and pull real-time market data.',
+  tv_password:        'TradingView account password. Stored encrypted. Required for the screener to log in and access live data.',
+  watchlist:          'Comma-separated tickers monitored for live breakout signals during the trading day. Entries fire independently of the weekly plan when a breakout is detected.',
+  webhook_secret:     'Secret token for validating incoming webhooks (e.g. from TradingView alerts). Prevents unauthorised external triggers.',
+
+  // Alpaca
+  alpaca_paper_key:    'API key for your Alpaca paper trading account. Used for all paper mode order placement and position monitoring.',
+  alpaca_paper_secret: 'API secret for your Alpaca paper trading account.',
+  alpaca_live_key:     'API key for your Alpaca live (real money) account. Used only when live auto-execute is enabled.',
+  alpaca_live_secret:  'API secret for your Alpaca live account.',
+
+  // AI
+  ai_provider: 'Which AI provider to use for pre-trade analysis and chart reviews. Claude (Anthropic) is the default and most tightly integrated.',
+  ai_api_key:  'API key for the selected AI provider. Required for pre-trade gate analysis and AI chart reviews to function.',
+  ai_model:    'Specific model ID to use (e.g. claude-opus-4-5). Leave blank to use the provider\'s recommended default.',
+  ai_base_url: 'Base URL for OpenAI-compatible providers (xAI, DeepSeek, Groq, Mistral, etc.). Not needed for Anthropic or standard OpenAI.',
+  block_on_warn: 'When on, the AI pre-trade gate blocks entries it flags as warnings, not just outright rejections. More conservative — fewer entries, fewer costly mistakes.',
+}
+
 // All TradingView sectors with short display labels and growth classification
 // Growth = sectors that fit momentum strategies; non-growth = typically excluded by default.
 // TV names (used by RS screener) are listed alongside GICS aliases for Minervini/Pullback screeners.
@@ -527,16 +684,50 @@ export default function SettingsPanel() {
   )
 }
 
+// ── Info tooltip shown on hover next to every field label ────────────────────
+function InfoTooltip({ text }) {
+  const [visible, setVisible] = useState(false)
+  if (!text) return null
+  return (
+    <span
+      className="relative inline-flex items-center flex-shrink-0 cursor-help"
+      onMouseEnter={() => setVisible(true)}
+      onMouseLeave={() => setVisible(false)}
+    >
+      {/* ℹ circle icon */}
+      <svg
+        className="w-3.5 h-3.5 text-slate-500 hover:text-slate-300 transition-colors"
+        viewBox="0 0 20 20" fill="currentColor"
+      >
+        <path fillRule="evenodd" clipRule="evenodd"
+          d="M18 10a8 8 0 11-16 0 8 8 0 0116 0zm-7-4a1 1 0 11-2 0 1 1 0 012 0zM9 9a.75.75 0 000 1.5h.253a.25.25 0 01.244.304l-.459 2.066A1.75 1.75 0 0010.747 15H11a.75.75 0 000-1.5h-.253a.25.25 0 01-.244-.304l.459-2.066A1.75 1.75 0 009.253 9H9z"
+        />
+      </svg>
+      {visible && (
+        <div className="absolute bottom-full left-0 mb-2 w-64 bg-slate-900 border border-slate-600 rounded-lg p-2.5 text-xs text-slate-300 shadow-2xl z-50 pointer-events-none leading-relaxed">
+          {text}
+          {/* caret */}
+          <div className="absolute top-full left-3 border-[5px] border-transparent border-t-slate-600" />
+        </div>
+      )}
+    </span>
+  )
+}
+
 function Field({ field, value, saving, onSave,
                  tvScreeners, tvLoading, tvError, tvOpen, onBrowseTv, onCloseTv }) {
   const [local, setLocal] = useState(null)
   // Use local (optimistic) → DB value → field default → empty string
   const current = local ?? (value !== '' && value !== undefined ? value : (field.defaultValue ?? ''))
+  // Tooltip text: field-level override first, then central lookup
+  const tip = field.tooltip || FIELD_TOOLTIPS[field.key] || ''
 
   if (field.type === 'tv_screener') {
     return (
       <div className="bg-surface rounded-lg p-3">
-        <label className="text-xs text-slate-400 block mb-1">{field.label}</label>
+        <label className="text-xs text-slate-400 flex items-center gap-1 mb-1">
+          <span>{field.label}</span><InfoTooltip text={tip} />
+        </label>
         <div className="flex gap-2 items-center">
           <input
             type="text"
@@ -584,7 +775,9 @@ function Field({ field, value, saving, onSave,
     const on = current === 'true'
     return (
       <div className="flex items-center justify-between bg-surface rounded-lg p-3 h-full">
-        <span className="text-sm text-slate-300">{field.label}</span>
+        <span className="text-sm text-slate-300 flex items-center gap-1">
+          {field.label}<InfoTooltip text={tip} />
+        </span>
         <button
           onClick={() => {
             const next = on ? 'false' : 'true'
@@ -614,7 +807,9 @@ function Field({ field, value, saving, onSave,
     }
     return (
       <div className="bg-surface rounded-lg p-3">
-        <label className="text-xs text-slate-400 block mb-2">{field.label}</label>
+        <label className="text-xs text-slate-400 flex items-center gap-1 mb-2">
+          <span>{field.label}</span><InfoTooltip text={tip} />
+        </label>
         <div className="flex gap-1.5 flex-wrap">
           {EXCHANGES.map(ex => (
             <button
@@ -655,7 +850,9 @@ function Field({ field, value, saving, onSave,
     const defensiveSectors = ALL_SECTORS.filter(s => !s.growth)
     return (
       <div className="bg-surface rounded-lg p-3">
-        <label className="text-xs text-slate-400 block mb-1">{field.label}</label>
+        <label className="text-xs text-slate-400 flex items-center gap-1 mb-1">
+          <span>{field.label}</span><InfoTooltip text={tip} />
+        </label>
         <p className="text-[10px] text-slate-500 mb-2">
           Highlighted sectors are <span className="text-red-400 font-medium">blocked</span>. Click to toggle. Growth sectors are shown first.
         </p>
@@ -720,7 +917,9 @@ function Field({ field, value, saving, onSave,
     }
     return (
       <div className="bg-surface rounded-lg p-3">
-        <label className="text-xs text-slate-400 block mb-2">{field.label}</label>
+        <label className="text-xs text-slate-400 flex items-center gap-1 mb-2">
+          <span>{field.label}</span><InfoTooltip text={tip} />
+        </label>
         <div className="flex gap-1.5 flex-wrap">
           {DAY_LABELS.map((name, idx) => (
             <button
@@ -754,7 +953,9 @@ function Field({ field, value, saving, onSave,
 
     return (
       <div className="bg-surface rounded-lg p-3">
-        <label className="text-xs text-slate-400 block mb-2">{field.label}</label>
+        <label className="text-xs text-slate-400 flex items-center gap-1 mb-2">
+          <span>{field.label}</span><InfoTooltip text={tip} />
+        </label>
         <div className="space-y-2">
           {times.map((t, idx) => (
             <div key={`${t}-${idx}`} className="flex gap-2 items-center">
@@ -789,7 +990,9 @@ function Field({ field, value, saving, onSave,
   if (field.type === 'select') {
     return (
       <div className="bg-surface rounded-lg p-3">
-        <label className="text-xs text-slate-400 block mb-1">{field.label}</label>
+        <label className="text-xs text-slate-400 flex items-center gap-1 mb-1">
+          <span>{field.label}</span><InfoTooltip text={tip} />
+        </label>
         <select
           value={current}
           onChange={e => { setLocal(e.target.value); onSave(e.target.value) }}
@@ -808,7 +1011,9 @@ function Field({ field, value, saving, onSave,
 
   return (
     <div className="bg-surface rounded-lg p-3">
-      <label className="text-xs text-slate-400 block mb-1">{field.label}</label>
+      <label className="text-xs text-slate-400 flex items-center gap-1 mb-1">
+        <span>{field.label}</span><InfoTooltip text={tip} />
+      </label>
       <div className="flex gap-2 items-center">
         <input
           type={field.type === 'number' ? 'number' : field.type === 'password' ? 'password' : field.type === 'time' ? 'time' : 'text'}
