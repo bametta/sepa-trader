@@ -76,6 +76,10 @@ EDITABLE_KEYS = {
     "combined_screener_auto_run",
     "combined_screener_schedule_days", "combined_screener_schedule_times",
     "combined_screener_schedule_days_2", "combined_screener_schedule_times_2",
+    # Apex system — loss prevention
+    "time_stop_days",           # trading days before time stop fires (0 = disabled)
+    "time_stop_max_gain_pct",   # close if unrealized < this % after N days
+    "min_position_dollars",     # minimum notional for sub-economic order guard
 }
 
 

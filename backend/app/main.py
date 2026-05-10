@@ -180,6 +180,20 @@ def _run_migrations():
             ADD COLUMN IF NOT EXISTS ai_analysis JSONB
         """))
 
+        # ── Apex system: T1 partial-exit tracking (phase-5) ──────────────────
+        # t1_taken      — TRUE once the software T1 partial exit has fired
+        # original_stop — the structural stop at entry time; preserved so
+        #                 trailing-stop R calculations stay accurate after the
+        #                 stop is moved to breakeven on T1.
+        db.execute(text("""
+            ALTER TABLE weekly_plan
+            ADD COLUMN IF NOT EXISTS t1_taken BOOLEAN DEFAULT FALSE
+        """))
+        db.execute(text("""
+            ALTER TABLE weekly_plan
+            ADD COLUMN IF NOT EXISTS original_stop NUMERIC(12,4)
+        """))
+
         # ── Split strategy_config by trading_mode ────────────────────────────
         # Originally one row per (user_id, strategy_name) with shared settings
         # across paper/live. Now one row per (user_id, strategy_name, trading_mode)

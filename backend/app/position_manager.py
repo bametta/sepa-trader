@@ -3,10 +3,14 @@ Position manager: Monday open fills + midweek slot refill with AI analysis.
 Pre-trade gate runs before every buy. Live <$10K accounts use conservative limits.
 """
 import logging
+import pytz
+from datetime import datetime
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 from .database import get_setting, set_setting
 from . import alpaca_client as alp
+
+_ET = pytz.timezone("America/New_York")
 
 logger = logging.getLogger(__name__)
 
@@ -106,7 +110,25 @@ def _gate(
     Fails open (returns True) on exception — screener-derived picks are
     pre-vetted; a broken AI connection should not hard-block planned trades.
     (Contrast with trader.py _gate which fails closed for unplanned entries.)
+
+    Also enforces the daily drawdown halt latch (Apex Pillar 5): if the
+    monitor cycle already tripped the circuit breaker today, block all new
+    entries regardless of caller (Monday open, slot refill, post-close).
     """
+    # ── Apex Pillar 5: daily drawdown circuit breaker ─────────────────────
+    try:
+        today_et  = datetime.now(_ET).strftime("%Y-%m-%d")
+        halt_key  = f"drawdown_halt_{mode}_date"
+        prior_halt = get_setting(db, halt_key, "")
+        if prior_halt == today_et:
+            logger.warning(
+                "Pre-trade gate: daily drawdown halt active [%s] — blocking %s",
+                mode, symbol,
+            )
+            return False
+    except Exception as _cb_exc:
+        logger.debug("Pre-trade gate: circuit-breaker check failed (%s) — proceeding", _cb_exc)
+
     try:
         from .claude_analyst import pre_trade_analysis, log_pre_trade, get_stored_weekly_plan_analysis
         from .trader import _get_tape_context
@@ -408,6 +430,18 @@ def run_monday_open(db: Session, mode: str | None = None):
         )
         return
 
+    # ── Apex Pillar 5: daily drawdown circuit breaker ─────────────────────
+    try:
+        today_et  = datetime.now(_ET).strftime("%Y-%m-%d")
+        halt_key  = f"drawdown_halt_{mode}_date"
+        if get_setting(db, halt_key, "") == today_et:
+            logger.warning(
+                "Monday open [%s]: daily drawdown halt active — skipping all buys.", mode,
+            )
+            return
+    except Exception as _cb_exc:
+        logger.debug("Monday open: circuit-breaker check failed (%s) — proceeding", _cb_exc)
+
     admin_uid = _resolve_admin_uid(db)
     max_pos = _effective_max_positions(db, mode)
     mv_max  = int(get_setting(db, "mv_max_slots", "3") or "3")
@@ -512,6 +546,45 @@ def run_monday_open(db: Session, mode: str | None = None):
 
         if sym in held or entry <= 0:
             continue
+
+        # ── Apex Pillar 1: re-evaluate exits with live price action ──────
+        # Screener-computed stops can be 3–5 days old by Monday open.
+        # _compute_fresh_exits derives structurally-anchored levels from
+        # current EMA20/EMA50, so the bracket placed today reflects where
+        # the market actually is — not where it was Thursday evening.
+        try:
+            from .trader import _compute_fresh_exits
+            fresh_stop, fresh_target, basis = _compute_fresh_exits(db, sym, entry)
+            if fresh_stop > 0 and stop > 0 and abs(fresh_stop - stop) / stop > 0.01:
+                logger.info(
+                    "Monday open: %s fresh stop $%.2f→$%.2f (basis=%s)",
+                    sym, stop, fresh_stop, basis,
+                )
+                stop, target = fresh_stop, fresh_target
+                # Persist so fill_open_slots and the exit guard see the same values
+                try:
+                    db.execute(
+                        text("""
+                            UPDATE weekly_plan
+                            SET stop_price = :s, target1 = :t
+                            WHERE symbol = :sym AND mode = :mode
+                              AND week_start = (
+                                  SELECT MAX(week_start) FROM weekly_plan WHERE mode = :mode
+                              )
+                        """),
+                        {"s": stop, "t": target, "sym": sym, "mode": mode},
+                    )
+                    db.commit()
+                except Exception as _upd_exc:
+                    logger.warning(
+                        "Monday open: could not persist fresh exits for %s: %s", sym, _upd_exc,
+                    )
+                    db.rollback()
+        except Exception as _fe_exc:
+            logger.warning(
+                "Monday open: fresh exits failed for %s (%s) — using screener values",
+                sym, _fe_exc,
+            )
 
         qty = _size_qty(portfolio, entry, stop, risk_pct, stop_pct)
         # Settlement-aware: cap by settled cash net of running spend

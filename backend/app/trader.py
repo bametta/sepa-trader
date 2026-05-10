@@ -306,33 +306,77 @@ def _get_current_target_price(orders: list) -> float | None:
     return None
 
 
-# ── Trailing stop tiers ───────────────────────────────────────────────────────
+# ── Trailing stop tiers (Apex v2) ────────────────────────────────────────────
 # Only applied when position is green — never touches red positions.
-# Tier 1 — gain >= 1R: move stop to breakeven (entry)
-# Tier 2 — gain >= 2R: move stop to entry + 1R (lock in 1R profit)
-# Tier 3 — gain >= 3R: trail stop at current_price - 1R (dynamic trailing)
+# Tier 1 — gain >= 1R : move stop to breakeven (entry)
+# Tier 2+ — gain >= 2R: EMA20 × 0.99 structural trailing (tracks momentum);
+#                        falls back to entry + 1R when EMA20 is unavailable.
 # Stop only ever moves UP — never down.
-
-_TRAIL_TIERS = [
-    (3.0, lambda entry, R, price: price - R),
-    (2.0, lambda entry, R, price: entry + R),
-    (1.0, lambda entry, R, price: entry),
-]
 
 _MIN_STOP_IMPROVEMENT_PCT = 0.005
 
 
-def _compute_new_stop(entry: float, original_stop: float, current_price: float) -> float | None:
+def _compute_new_stop(
+    entry: float,
+    original_stop: float,
+    current_price: float,
+    ema20: float = 0.0,
+) -> float | None:
+    """Compute the new stop level for a green position.
+
+    Tier 1 (>=1R): move to breakeven.
+    Tier 2+ (>=2R): EMA20 × 0.99 structural trailing when EMA20 > entry;
+                    falls back to entry + 1R when EMA20 is below entry or
+                    unavailable (e.g. TV API failure).
+    """
     R = entry - original_stop
     if R <= 0:
         return None
     gain_r = (current_price - entry) / R
-    for threshold, fn in _TRAIL_TIERS:
-        if gain_r >= threshold:
-            new_stop = round(fn(entry, R, current_price), 2)
-            max_stop = round(current_price * 0.995, 2)
-            return min(new_stop, max_stop)
-    return None
+
+    if gain_r >= 2.0:
+        if ema20 > 0 and ema20 > entry:
+            new_stop = round(ema20 * 0.99, 2)     # structural: just below EMA20
+        else:
+            new_stop = round(entry + R, 2)          # fallback: lock in 1R profit
+    elif gain_r >= 1.0:
+        new_stop = round(entry, 2)                  # breakeven
+    else:
+        return None
+
+    max_stop = round(current_price * 0.995, 2)
+    return min(new_stop, max_stop)
+
+
+def _get_plan_stop_for_trailing(
+    db: Session, symbol: str, mode: str,
+) -> tuple[float, float, float]:
+    """Return (r_ref_stop, target, current_plan_stop) for trailing-stop logic.
+
+    r_ref_stop      — stop used for R calculation. After a T1 partial exit the
+                      plan stop moves to breakeven; we keep the original
+                      structural stop so gain_r stays meaningful.
+    target          — current target1 in the plan.
+    current_plan_stop — the live stop_price (may be BE after T1).
+    """
+    row = db.execute(
+        text("""
+            SELECT stop_price, target1, original_stop, t1_taken
+            FROM weekly_plan
+            WHERE symbol = :sym AND mode = :mode
+            ORDER BY week_start DESC LIMIT 1
+        """),
+        {"sym": symbol, "mode": mode},
+    ).fetchone()
+    if not row:
+        return 0.0, 0.0, 0.0
+    current_stop = float(row[0] or 0)
+    target       = float(row[1] or 0)
+    orig_stop    = float(row[2] or 0)
+    t1_taken     = bool(row[3])
+    # If T1 was already taken, original_stop holds the pre-BE structural level
+    r_ref = orig_stop if (t1_taken and orig_stop > 0) else current_stop
+    return r_ref, target, current_stop
 
 
 def _adjust_trailing_stops(
@@ -354,12 +398,24 @@ def _adjust_trailing_stops(
         if current_price <= entry:
             continue  # red or flat — never touch
 
-        stop_orig, target = _get_weekly_plan_exits(db, sym, mode)
-        if stop_orig <= 0 or target <= 0:
+        r_ref_stop, target, current_plan_stop = _get_plan_stop_for_trailing(db, sym, mode)
+        if r_ref_stop <= 0 or target <= 0:
             logger.debug("Trailing stop: %s has no plan exits — skipping.", sym)
             continue
 
-        new_stop = _compute_new_stop(entry, stop_orig, current_price)
+        # Fetch EMA20 for positions at >= 2R gain so we can use structural trailing
+        R      = entry - r_ref_stop
+        gain_r = (current_price - entry) / R if R > 0 else 0.0
+        ema20  = 0.0
+        if R > 0 and gain_r >= 2.0:
+            try:
+                from .tv_analyzer import analyze as _tv_analyze
+                tech  = _tv_analyze(sym) or {}
+                ema20 = float(tech.get("ema20") or 0)
+            except Exception as _ema_exc:
+                logger.debug("Trailing stop: EMA20 fetch failed for %s: %s — fallback", sym, _ema_exc)
+
+        new_stop = _compute_new_stop(entry, r_ref_stop, current_price, ema20)
         if new_stop is None:
             continue  # gain < 1R
 
@@ -374,8 +430,8 @@ def _adjust_trailing_stops(
                 )
                 new_stop = target_cap
 
-        current_stop      = _get_current_stop_price(open_orders_by_symbol.get(sym, []))
-        effective_current = current_stop if current_stop else stop_orig
+        live_stop         = _get_current_stop_price(open_orders_by_symbol.get(sym, []))
+        effective_current = live_stop if live_stop else current_plan_stop
 
         if new_stop <= effective_current * (1 + _MIN_STOP_IMPROVEMENT_PCT):
             logger.debug(
@@ -383,9 +439,6 @@ def _adjust_trailing_stops(
                 sym, new_stop, effective_current,
             )
             continue
-
-        R      = entry - stop_orig
-        gain_r = (current_price - entry) / R
 
         logger.info(
             "Trailing stop: %s  gain=%.1fR  price=$%.2f  old=$%.2f → new=$%.2f  "
@@ -424,6 +477,219 @@ def _adjust_trailing_stops(
                 )
             except Exception:
                 pass
+
+
+# ── Apex Pillar 2: Software-managed T1 partial exit ──────────────────────────
+# Bypasses Alpaca's bracket-stacking limitation. When price hits target1 (2R),
+# sell 50% of the position at market, move the stop to breakeven, and let
+# the remaining 50% run to target2 (3R) with an EMA20-anchored trailing stop.
+
+_t1_alerted: set = set()   # session-level dedup; prevents repeat Telegram alerts
+
+
+def _check_t1_partial_exit(
+    db: Session,
+    positions: list,
+    open_orders_by_symbol: dict,
+    mode: str,
+) -> None:
+    """Fire a 50% market sell when price >= target1 and t1 hasn't been taken yet.
+
+    After the partial exit:
+    - OCO is replaced: remaining shares, stop = breakeven (entry), target = target2.
+    - weekly_plan: t1_taken=TRUE, original_stop saved, stop_price → entry, target1 → target2.
+    """
+    for pos in positions:
+        sym   = pos.symbol
+        qty   = int(float(pos.qty))
+        price = float(pos.current_price)
+        entry = float(pos.avg_entry_price)
+
+        if qty < 2:          # need at least 2 shares to split
+            continue
+        if price <= entry:   # only fire on green positions
+            continue
+
+        try:
+            plan = db.execute(
+                text("""
+                    SELECT target1, target2, entry_price, stop_price, t1_taken
+                    FROM weekly_plan
+                    WHERE symbol = :sym AND mode = :mode
+                    ORDER BY week_start DESC LIMIT 1
+                """),
+                {"sym": sym, "mode": mode},
+            ).fetchone()
+        except Exception as exc:
+            logger.warning("T1 check: DB fetch failed for %s: %s", sym, exc)
+            continue
+
+        if not plan or plan[4]:   # missing plan or t1 already taken
+            continue
+
+        t1          = float(plan[0] or 0)
+        t2          = float(plan[1] or 0)
+        plan_entry  = float(plan[2] or entry)
+        orig_stop   = float(plan[3] or 0)   # structural stop before we overwrite
+
+        if t1 <= 0 or price < t1:
+            continue
+
+        # ── T1 hit ─────────────────────────────────────────────────────────
+        sell_qty   = max(1, qty // 2)
+        remain_qty = qty - sell_qty
+        be_stop    = round(plan_entry, 2)    # breakeven = our fill entry
+        exit_tgt   = t2 if t2 > 0 else round(price * 1.04, 2)   # fallback 4%
+
+        logger.info(
+            "T1 PARTIAL EXIT [%s]: %s price=$%.2f hit T1=$%.2f — "
+            "selling %d/%d shares | stop→BE $%.2f | target→T2 $%.2f",
+            mode, sym, price, t1, sell_qty, qty, be_stop, exit_tgt,
+        )
+
+        # Sell half
+        try:
+            alp.place_market_sell(sym, sell_qty, mode)
+            _log_trade(db, sym, "SELL", sell_qty, price, "T1_PARTIAL", mode)
+        except Exception as exc:
+            logger.error("T1 partial exit: sell failed for %s: %s", sym, exc)
+            continue
+
+        # Move OCO for the remaining half: stop = BE, target = T2
+        if remain_qty > 0:
+            try:
+                alp.replace_oca_exit(sym, remain_qty, be_stop, exit_tgt, mode)
+            except Exception as exc:
+                logger.error(
+                    "T1 partial exit: OCO replace failed for %s "
+                    "(remain=%d stop=$%.2f tgt=$%.2f): %s",
+                    sym, remain_qty, be_stop, exit_tgt, exc,
+                )
+
+        # Persist: save original_stop, mark t1_taken, move stop to BE, update target
+        try:
+            db.execute(
+                text("""
+                    UPDATE weekly_plan
+                    SET t1_taken      = TRUE,
+                        original_stop = :orig,
+                        stop_price    = :be,
+                        target1       = :t2
+                    WHERE symbol = :sym AND mode = :mode
+                      AND week_start = (
+                          SELECT MAX(week_start) FROM weekly_plan WHERE mode = :mode
+                      )
+                """),
+                {"orig": orig_stop, "be": be_stop, "t2": exit_tgt,
+                 "sym": sym, "mode": mode},
+            )
+            db.commit()
+        except Exception as exc:
+            logger.error("T1 partial exit: DB update failed for %s: %s", sym, exc)
+            db.rollback()
+
+        # Alert (once per position per session)
+        if (sym, mode) not in _t1_alerted:
+            _t1_alerted.add((sym, mode))
+            try:
+                tg.send_sync(
+                    f"*T1 PARTIAL EXIT* [{mode.upper()}] {sym}\n\n"
+                    f"Sold `{sell_qty}` shares @ `${price:.2f}` (T1 = `${t1:.2f}`)\n"
+                    f"Remaining: `{remain_qty}` shares | Stop → BE `${be_stop:.2f}` | "
+                    f"Target → T2 `${exit_tgt:.2f}`\n"
+                    f"🎯 Banked 2R on half — zero cost-basis on remainder",
+                    level="INFO",
+                )
+            except Exception:
+                pass
+
+
+# ── Apex Pillar 4: Time stop ──────────────────────────────────────────────────
+# Positions that drift flat or negative for too many trading days are dead
+# money — close them to recycle buying power into fresh setups.
+
+def _check_time_stops(
+    db: Session,
+    positions: list,
+    mode: str,
+) -> None:
+    """Close positions that have been open >= time_stop_days without sufficient
+    gain. Sends a Telegram alert before closing so the trade can be overridden.
+
+    Settings:
+      time_stop_days        — trading days threshold (default 10; 0 = disabled)
+      time_stop_max_gain_pct — max unrealized gain % below which time stop fires
+                               (default 2.0; positions above this are left alone)
+    """
+    try:
+        ts_days = int(get_setting(db, "time_stop_days",        "10")  or "10")
+        ts_gain = float(get_setting(db, "time_stop_max_gain_pct", "2.0") or "2.0")
+    except (TypeError, ValueError):
+        ts_days, ts_gain = 10, 2.0
+
+    if ts_days <= 0:
+        return   # feature disabled
+
+    now = datetime.now(_ET)
+
+    for pos in positions:
+        sym           = pos.symbol
+        qty           = float(pos.qty)
+        current_price = float(pos.current_price)
+        avg_entry     = float(pos.avg_entry_price)
+
+        try:
+            row = db.execute(
+                text("""
+                    SELECT created_at FROM trade_log
+                    WHERE symbol = :sym AND mode = :mode AND action = 'BUY'
+                    ORDER BY created_at DESC LIMIT 1
+                """),
+                {"sym": sym, "mode": mode},
+            ).fetchone()
+        except Exception as exc:
+            logger.warning("Time stop: DB fetch failed for %s: %s", sym, exc)
+            continue
+
+        if not row:
+            continue
+
+        entry_ts = row[0]
+        if entry_ts.tzinfo is None:
+            entry_ts = pytz.utc.localize(entry_ts)
+
+        calendar_days = (now.astimezone(pytz.utc) - entry_ts).days
+        trading_days  = int(calendar_days * 5 / 7)   # approx 5 market days / 7 cal days
+
+        if trading_days < ts_days:
+            continue
+
+        unrealized_pct = (current_price - avg_entry) / avg_entry * 100 if avg_entry > 0 else 0.0
+
+        if unrealized_pct >= ts_gain:
+            continue   # position is running — let it ride
+
+        logger.info(
+            "TIME STOP [%s]: %s — %d trading days, unrealized=%.1f%% < %.1f%% threshold — closing",
+            mode, sym, trading_days, unrealized_pct, ts_gain,
+        )
+
+        try:
+            tg.send_sync(
+                f"*TIME STOP* [{mode.upper()}] {sym}\n\n"
+                f"Open `{trading_days}` trading days | "
+                f"Unrealized: `{unrealized_pct:+.1f}%` (threshold `<{ts_gain:+.1f}%`)\n"
+                f"🕐 Closing — recycling buying power into fresh setups",
+                level="WARN",
+            )
+        except Exception:
+            pass
+
+        try:
+            alp.close_position(sym, mode)
+            _log_trade(db, sym, "SELL", qty, current_price, "TIME_STOP", mode)
+        except Exception as exc:
+            logger.error("Time stop: close failed for %s: %s", sym, exc)
 
 
 # ── Exit guard ────────────────────────────────────────────────────────────────
@@ -1054,8 +1320,17 @@ async def run_monitor(db: Session, user_id: int | None = None, mode: str | None 
             try:
                 open_orders_by_symbol = alp.get_open_orders_by_symbol_for_user(db, user_id, mode)
 
-                # Step 1: Trailing stop adjustment
-                # Green positions get stops ratcheted up.
+                # Step 1a: T1 partial exit (Apex)
+                # If price >= target1 and position hasn't been halved yet,
+                # sell 50 %, move OCO stop to breakeven, target → T2.
+                _check_t1_partial_exit(db, positions, open_orders_by_symbol, mode)
+
+                # Re-fetch positions after potential partial sell
+                positions             = alp.get_positions_for_user(db, user_id, mode)
+                open_orders_by_symbol = alp.get_open_orders_by_symbol_for_user(db, user_id, mode)
+
+                # Step 1b: Trailing stop adjustment (Apex)
+                # Green positions get stops ratcheted: 1R→BE, 2R+→EMA20×0.99.
                 # Red positions are untouched.
                 _adjust_trailing_stops(db, positions, open_orders_by_symbol, mode)
 
@@ -1073,6 +1348,13 @@ async def run_monitor(db: Session, user_id: int | None = None, mode: str | None 
                     tg.alert_system_error_sync(f"Monitor stop-mgmt cycle [{mode}]", exc)
                 except Exception:
                     pass
+
+            # Step 2b: Time stop (Apex) — runs outside the inner try so a
+            # trailing-stop failure doesn't suppress dead-money exits.
+            try:
+                _check_time_stops(db, positions, mode)
+            except Exception as exc:
+                logger.error("Time stop cycle failed: %s", exc)
 
         # Step 3: Signal evaluation
         stage2_lost   = []
