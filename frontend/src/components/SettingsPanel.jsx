@@ -52,13 +52,15 @@ const SECTIONS = [
     title: 'Risk & Position Sizing',
     description: 'Applies to all three SEPA-family strategies (Minervini, Pullback, RS).',
     fields: [
-      { key: 'risk_pct',         label: 'Risk per trade %',                          type: 'number' },
-      { key: 'stop_loss_pct',    label: 'Default stop loss %',                       type: 'number' },
-      { key: 'max_position_pct', label: 'Max position size % (hard cap)',            type: 'number' },
-      { key: 'max_positions',    label: 'Max simultaneous positions (overall cap)',  type: 'number' },
-      { key: 'mv_max_slots',     label: 'Minervini slots (breakout picks, default 3)', type: 'number' },
-      { key: 'pb_max_slots',     label: 'Pullback slots (EMA picks, default 2)',       type: 'number' },
-      { key: 'rs_max_slots',     label: 'RS Momentum slots (default 2)',               type: 'number' },
+      { key: 'risk_pct',              label: 'Risk per trade %',                                          type: 'number' },
+      { key: 'stop_loss_pct',         label: 'Default stop loss %',                                       type: 'number' },
+      { key: 'max_position_pct',      label: 'Max position size % of portfolio (hard cap)',               type: 'number' },
+      { key: 'min_cash_pct',          label: 'Cash reserve floor % (never deploy below this)',            type: 'number' },
+      { key: 'min_position_dollars',  label: 'Min position value $ (sub-economic order floor, default 500)', type: 'number' },
+      { key: 'max_positions',         label: 'Max simultaneous positions (overall cap)',                   type: 'number' },
+      { key: 'mv_max_slots',          label: 'Minervini slots (breakout picks, default 3)',                type: 'number' },
+      { key: 'pb_max_slots',          label: 'Pullback slots (EMA picks, default 2)',                     type: 'number' },
+      { key: 'rs_max_slots',          label: 'RS Momentum slots (default 2)',                             type: 'number' },
     ],
   },
 
@@ -282,20 +284,33 @@ const SECTIONS = [
   {
     title: 'Monitor',
     description: 'In-cycle position management — exits, trailing stops, slot refills.',
-    fields: [
-      { key: 'monitor_enabled',          label: 'Monitor enabled (auto-place exits & manage positions)', type: 'toggle', defaultValue: 'true' },
-      { key: 'monitor_interval_minutes', label: 'Monitor check frequency', type: 'select',
-        options: [
-          { value: '1',  label: 'Every 1 minute (fastest reactions, max API load)' },
-          { value: '5',  label: 'Every 5 minutes' },
-          { value: '10', label: 'Every 10 minutes' },
-          { value: '15', label: 'Every 15 minutes' },
-          { value: '30', label: 'Every 30 minutes (default)' },
-          { value: '60', label: 'Every 60 minutes' },
+    subsections: [
+      {
+        title: 'Cycle',
+        fields: [
+          { key: 'monitor_enabled',          label: 'Monitor enabled (auto-place exits & manage positions)', type: 'toggle', defaultValue: 'true' },
+          { key: 'monitor_interval_minutes', label: 'Monitor check frequency', type: 'select',
+            options: [
+              { value: '1',  label: 'Every 1 minute (fastest reactions, max API load)' },
+              { value: '5',  label: 'Every 5 minutes' },
+              { value: '10', label: 'Every 10 minutes' },
+              { value: '15', label: 'Every 15 minutes' },
+              { value: '30', label: 'Every 30 minutes (default)' },
+              { value: '60', label: 'Every 60 minutes' },
+            ],
+            defaultValue: '30',
+          },
+          { key: 'auto_execute', label: 'Auto-execute new entries on Monday open', type: 'toggle', defaultValue: 'true' },
         ],
-        defaultValue: '30',
       },
-      { key: 'auto_execute', label: 'Auto-execute new entries on Monday open', type: 'toggle', defaultValue: 'true' },
+      {
+        title: 'Apex Loss Prevention',
+        fields: [
+          { key: 'daily_drawdown_halt_pct',  label: 'Daily drawdown halt % (block all new buys when day P&L falls below; 0 = off)', type: 'number' },
+          { key: 'time_stop_days',           label: 'Time stop — trading days before dead-money exit (0 = off)',                     type: 'number' },
+          { key: 'time_stop_max_gain_pct',   label: 'Time stop — min unrealized gain % to survive (positions above this are left alone)', type: 'number' },
+        ],
+      },
     ],
   },
 
