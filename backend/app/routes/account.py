@@ -125,7 +125,8 @@ def accounts_overview(
         "dual_momentum": "Dual Momentum",
     }
 
-    result = {"paper": [], "live": []}
+    total_deposited = float(user_settings.get("total_deposited") or 0)
+    result = {"paper": [], "live": [], "total_deposited": total_deposited}
 
     for mode in ("paper", "live"):
         # ── Main account ──────────────────────────────────────────────────────
@@ -189,3 +190,19 @@ def account(
         "day_pnl":         day_pnl,
         "day_pnl_pct":     (day_pnl / last_equity * 100) if last_equity else 0.0,
     }
+
+
+@router.patch("/deposits")
+def update_total_deposited(
+    body: dict,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Save the user's total deposited capital for net P&L calculation."""
+    from ..database import set_user_setting
+    amount = body.get("total_deposited")
+    if amount is None or not isinstance(amount, (int, float)) or amount < 0:
+        from fastapi import HTTPException
+        raise HTTPException(400, "total_deposited must be a non-negative number")
+    set_user_setting(db, "total_deposited", str(float(amount)), current_user["id"])
+    return {"total_deposited": float(amount)}

@@ -1,6 +1,7 @@
-import { useQuery } from 'react-query'
-import { fetchAccountsOverview, fetchAccount } from '../api/client'
-import { useQueryClient } from 'react-query'
+import { useState, useRef } from 'react'
+import { useQuery, useQueryClient } from 'react-query'
+import { fetchAccountsOverview, fetchAccount, updateTotalDeposited } from '../api/client'
+
 
 function fmt(n, sign = false) {
   if (n == null) return '—'
@@ -8,7 +9,7 @@ function fmt(n, sign = false) {
   return `${prefix}$${Math.abs(n).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
 }
 
-function AccountCard({ acct, onModeChange }) {
+function AccountCard({ acct, onModeChange, totalDeposited, onDepositSaved }) {
   const isProfit      = acct.day_pnl >= 0
   const plColor       = isProfit ? 'text-emerald-400' : 'text-red-400'
   const totalPlColor  = (acct.unrealized_pl ?? 0) >= 0 ? 'text-emerald-400' : 'text-red-400'
@@ -16,6 +17,38 @@ function AccountCard({ acct, onModeChange }) {
   const glowClass     = isProfit
     ? 'shadow-[0_0_16px_rgba(16,185,129,0.08)]'
     : 'shadow-[0_0_16px_rgba(239,68,68,0.08)]'
+
+  const netPnl        = totalDeposited > 0 ? (acct.portfolio_value - totalDeposited) : null
+  const netPnlColor   = netPnl == null ? 'text-slate-400' : netPnl >= 0 ? 'text-emerald-400' : 'text-red-400'
+  const netPnlPct     = totalDeposited > 0 ? ((acct.portfolio_value / totalDeposited - 1) * 100) : null
+
+  const [editing, setEditing]   = useState(false)
+  const [inputVal, setInputVal] = useState('')
+  const [saving, setSaving]     = useState(false)
+  const inputRef = useRef(null)
+
+  const startEdit = () => {
+    setInputVal(totalDeposited > 0 ? totalDeposited.toString() : '')
+    setEditing(true)
+    setTimeout(() => inputRef.current?.focus(), 50)
+  }
+
+  const saveDeposit = async () => {
+    const amount = parseFloat(inputVal)
+    if (isNaN(amount) || amount < 0) { setEditing(false); return }
+    setSaving(true)
+    try {
+      await updateTotalDeposited(amount)
+      onDepositSaved?.()
+    } catch (e) { /* silent */ }
+    setSaving(false)
+    setEditing(false)
+  }
+
+  const handleKey = (e) => {
+    if (e.key === 'Enter') saveDeposit()
+    if (e.key === 'Escape') setEditing(false)
+  }
 
   return (
     <div className={`card p-4 flex flex-col gap-3 ${glowClass}`}>
@@ -66,6 +99,54 @@ function AccountCard({ acct, onModeChange }) {
           <div className="label mb-1">Total P&L</div>
           <div className={`text-sm font-bold num ${totalPlColor}`}>{fmt(acct.unrealized_pl ?? 0, true)}</div>
           <div className="text-[10px] text-slate-600">realized + unrealized</div>
+        </div>
+
+        {/* Row 4: Net vs Deposits — spans full width */}
+        <div className={`stat-card col-span-2 ${netPnl == null ? '' : netPnl >= 0 ? 'border-emerald-500/10' : 'border-red-500/10'}`}>
+          <div className="flex items-center justify-between mb-1">
+            <div className="label">Net vs Deposits</div>
+            <button
+              onClick={startEdit}
+              className="text-[10px] text-slate-500 hover:text-slate-300 transition-colors px-1"
+              title="Set total deposited capital"
+            >
+              {totalDeposited > 0 ? `Deposited: ${fmt(totalDeposited)} ✎` : '+ Set deposit ✎'}
+            </button>
+          </div>
+
+          {editing ? (
+            <div className="flex items-center gap-2 mt-1">
+              <span className="text-slate-400 text-sm">$</span>
+              <input
+                ref={inputRef}
+                type="number"
+                value={inputVal}
+                onChange={e => setInputVal(e.target.value)}
+                onKeyDown={handleKey}
+                placeholder="Total deposited"
+                className="flex-1 bg-slate-700 text-slate-100 text-sm rounded px-2 py-0.5 outline-none border border-slate-500 focus:border-sky-500 num"
+              />
+              <button
+                onClick={saveDeposit}
+                disabled={saving}
+                className="text-xs px-2 py-0.5 rounded bg-sky-500/20 text-sky-300 hover:bg-sky-500/30 disabled:opacity-50"
+              >
+                {saving ? '…' : 'Save'}
+              </button>
+              <button onClick={() => setEditing(false)} className="text-xs text-slate-500 hover:text-slate-300">✕</button>
+            </div>
+          ) : (
+            <div className="flex items-baseline gap-3">
+              <div className={`text-sm font-bold num ${netPnlColor}`}>
+                {netPnl == null ? '— set deposit above' : fmt(netPnl, true)}
+              </div>
+              {netPnlPct != null && (
+                <div className={`text-[10px] num ${netPnlColor} opacity-70`}>
+                  {netPnlPct >= 0 ? '+' : ''}{netPnlPct.toFixed(2)}%
+                </div>
+              )}
+            </div>
+          )}
         </div>
       </div>
     </div>
@@ -128,8 +209,10 @@ export default function AccountSummary({ onModeChange, refetchInterval = 5000 })
     )
   }
 
-  const accounts   = (isPaper ? data?.paper : data?.live) ?? []
-  const lastSync   = dataUpdatedAt ? new Date(dataUpdatedAt).toLocaleTimeString() : null
+  const accounts        = (isPaper ? data?.paper : data?.live) ?? []
+  const totalDeposited  = data?.total_deposited ?? 0
+  const lastSync        = dataUpdatedAt ? new Date(dataUpdatedAt).toLocaleTimeString() : null
+  const qc              = useQueryClient()
   const liveStyle  = !isPaper
     ? 'border-orange-500/20 shadow-[0_0_0_1px_rgba(249,115,22,0.1)]'
     : 'border-border'
@@ -171,6 +254,8 @@ export default function AccountSummary({ onModeChange, refetchInterval = 5000 })
                 key={acct.name}
                 acct={acct}
                 onModeChange={acct.name === 'Main' ? onModeChange : null}
+                totalDeposited={acct.name === 'Main' ? totalDeposited : 0}
+                onDepositSaved={() => qc.invalidateQueries('accounts-overview')}
               />
             ))}
           </div>
