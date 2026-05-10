@@ -457,8 +457,8 @@ def run_rs_screener(
         if stop_distance <= 0:
             continue
 
-        target1 = round(price * (1 + 2 * stop_pct / 100), 2)   # 2R
-        target2 = round(price * (1 + 3 * stop_pct / 100), 2)   # 3R
+        target1 = round(price + 2 * stop_distance, 2)            # true 2R
+        target2 = round(price + 3 * stop_distance, 2)            # true 3R
 
         # Risk-based position sizing, capped at max_position_pct
         risk_dollars = account_value * risk_pct / 100

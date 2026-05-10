@@ -326,10 +326,16 @@ def run_pullback_screener(
 
     for rank, c in enumerate(top, 1):
         price    = float(c["price"])
-        stop     = round(price * (1 - stop_pct / 100), 4)
-        target1  = round(price * (1 + stop_pct * 2 / 100), 4)
-        target2  = round(price * (1 + stop_pct * 3 / 100), 4)
+        e50      = float(c.get("ema50") or 0.0)
+        # Stop at EMA50 − 1 % buffer (structural invalidation for the pullback thesis).
+        # Fall back to a flat stop_pct below price when EMA50 is unavailable.
+        stop     = round(e50 * 0.99, 2) if e50 > 0 else round(price * (1 - stop_pct / 100), 4)
         stop_d   = price - stop
+        if stop_d <= 0:
+            continue
+        # Targets at true 2R and 3R of the actual stop distance
+        target1  = round(price + 2 * stop_d, 4)
+        target2  = round(price + 3 * stop_d, 4)
         risk_sh  = int(risk_dollars / stop_d) if stop_d > 0 else 0
         max_sh   = int((account_value * max_pos / 100) / price) if price > 0 else 0
         shares   = min(risk_sh, max_sh)
