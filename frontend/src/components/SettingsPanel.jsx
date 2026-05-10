@@ -112,9 +112,11 @@ const SECTIONS = [
       {
         title: 'Schedule (ET)',
         fields: [
-          { key: 'screener_auto_run',       label: 'Auto-run enabled',                type: 'toggle',    defaultValue: 'true' },
-          { key: 'screener_schedule_days',  label: 'Days to run (click to toggle)',   type: 'day_picker', span: true },
-          { key: 'screener_schedule_times', label: 'Run times (24h ET, e.g. 20:00)', type: 'time_list',  span: true },
+          { key: 'screener_auto_run',         label: 'Auto-run enabled',                       type: 'toggle',     defaultValue: 'true' },
+          { key: 'screener_schedule_days',    label: 'Slot 1 — Days (click to toggle)',         type: 'day_picker', span: true },
+          { key: 'screener_schedule_times',   label: 'Slot 1 — Run times (24h ET, e.g. 20:00)',type: 'time_list',  span: true },
+          { key: 'screener_schedule_days_2',  label: 'Slot 2 — Days (optional)',                type: 'day_picker', span: true },
+          { key: 'screener_schedule_times_2', label: 'Slot 2 — Run times (24h ET, e.g. 16:30)',type: 'time_list',  span: true },
         ],
       },
     ],
@@ -208,9 +210,11 @@ const SECTIONS = [
       {
         title: 'Schedule (ET)',
         fields: [
-          { key: 'pb_screener_auto_run',       label: 'Auto-run enabled',                type: 'toggle',    defaultValue: 'true' },
-          { key: 'pb_screener_schedule_days',  label: 'Days to run (click to toggle)',   type: 'day_picker', span: true },
-          { key: 'pb_screener_schedule_times', label: 'Run times (24h ET, e.g. 20:00)', type: 'time_list',  span: true },
+          { key: 'pb_screener_auto_run',         label: 'Auto-run enabled',                        type: 'toggle',     defaultValue: 'true' },
+          { key: 'pb_screener_schedule_days',    label: 'Slot 1 — Days (click to toggle)',          type: 'day_picker', span: true },
+          { key: 'pb_screener_schedule_times',   label: 'Slot 1 — Run times (24h ET, e.g. 20:00)', type: 'time_list',  span: true },
+          { key: 'pb_screener_schedule_days_2',  label: 'Slot 2 — Days (optional)',                 type: 'day_picker', span: true },
+          { key: 'pb_screener_schedule_times_2', label: 'Slot 2 — Run times (24h ET, e.g. 16:30)', type: 'time_list',  span: true },
         ],
       },
     ],
@@ -246,9 +250,11 @@ const SECTIONS = [
       {
         title: 'Schedule (ET)',
         fields: [
-          { key: 'rs_screener_auto_run',       label: 'Auto-run enabled',                type: 'toggle',     defaultValue: 'true' },
-          { key: 'rs_screener_schedule_days',  label: 'Days to run (click to toggle)',   type: 'day_picker', span: true },
-          { key: 'rs_screener_schedule_times', label: 'Run times (24h ET, e.g. 20:00)', type: 'time_list',  span: true },
+          { key: 'rs_screener_auto_run',         label: 'Auto-run enabled',                        type: 'toggle',     defaultValue: 'true' },
+          { key: 'rs_screener_schedule_days',    label: 'Slot 1 — Days (click to toggle)',          type: 'day_picker', span: true },
+          { key: 'rs_screener_schedule_times',   label: 'Slot 1 — Run times (24h ET, e.g. 20:00)', type: 'time_list',  span: true },
+          { key: 'rs_screener_schedule_days_2',  label: 'Slot 2 — Days (optional)',                 type: 'day_picker', span: true },
+          { key: 'rs_screener_schedule_times_2', label: 'Slot 2 — Run times (24h ET, e.g. 16:30)', type: 'time_list',  span: true },
         ],
       },
     ],

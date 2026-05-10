@@ -158,52 +158,86 @@ async def _monday_open_job():
             db.close()
 
 
+def _check_schedule_slots(db, prefix: str, now_et) -> str | None:
+    """
+    Check whether either schedule slot (primary or secondary) matches now_et.
+    Returns the run_key (YYYY-MM-DD HH:MM) if a slot fires and hasn't run yet,
+    or None if nothing should run.
+
+    Primary slot  : {prefix}_schedule_days  + {prefix}_schedule_times
+    Secondary slot: {prefix}_schedule_days_2 + {prefix}_schedule_times_2
+
+    Both slots share the same last-run key ({prefix}_last_auto_run) so a run
+    from either slot blocks the other for the same minute.
+    """
+    current_hm  = now_et.strftime("%H:%M")
+    current_day = now_et.weekday()
+    run_key     = now_et.strftime("%Y-%m-%d %H:%M")
+
+    last_run_key = f"{prefix}_last_auto_run"
+    if get_setting(db, last_run_key, "") == run_key:
+        return None  # already fired this minute
+
+    def _slot_matches(days_key: str, times_key: str, days_legacy_key: str | None, times_legacy_key: str | None) -> bool:
+        days_raw = get_setting(db, days_key, "").strip()
+        if days_raw:
+            try:
+                days = {int(d.strip()) for d in days_raw.split(",") if d.strip().isdigit()}
+            except ValueError:
+                return False
+        elif days_legacy_key:
+            try:
+                days = {int(get_setting(db, days_legacy_key, "-1"))}
+            except ValueError:
+                return False
+        else:
+            return False
+
+        if current_day not in days:
+            return False
+
+        times_raw = get_setting(db, times_key, "").strip()
+        if times_raw:
+            times = {t.strip() for t in times_raw.split(",") if t.strip()}
+        elif times_legacy_key:
+            t = get_setting(db, times_legacy_key, "").strip()
+            times = {t} if t else set()
+        else:
+            return False
+
+        return current_hm in times
+
+    slot1 = _slot_matches(
+        f"{prefix}_schedule_days",   f"{prefix}_schedule_times",
+        f"{prefix}_schedule_day" if prefix == "screener" else None,
+        f"{prefix}_schedule_time" if prefix == "screener" else None,
+    )
+    slot2 = _slot_matches(
+        f"{prefix}_schedule_days_2", f"{prefix}_schedule_times_2",
+        None, None,
+    )
+
+    if slot1 or slot2:
+        return run_key
+    return None
+
+
 async def _screener_watchdog():
     """
-    Runs every minute. Fires the screener when all conditions are met:
-      1. screener_auto_run == "true"
-      2. current ET weekday is in screener_schedule_days (comma-separated 0–6)
-         Falls back to legacy screener_schedule_day (single int) if not set.
-      3. current ET HH:MM is in screener_schedule_times (comma-separated)
-         Falls back to legacy screener_schedule_time if not set.
-    Tracks last run per slot (YYYY-MM-DD HH:MM) to prevent double-firing.
+    Runs every minute. Fires the Minervini screener when either schedule
+    slot matches (primary or secondary). Supports two independent day+time
+    pairs — e.g. weekdays at 16:30 and Sunday at 20:00.
+    Tracks last run per minute to prevent double-firing.
     """
     db = SessionLocal()
+    run_key = None
     try:
         if get_setting(db, "screener_auto_run", "true") != "true":
             return
 
-        now_et = datetime.now(_ET)
-
-        # ── Days: multi (new) → single legacy fallback ────────────────────────
-        days_raw = get_setting(db, "screener_schedule_days", "").strip()
-        if days_raw:
-            try:
-                schedule_days = {int(d.strip()) for d in days_raw.split(",") if d.strip().isdigit()}
-            except ValueError:
-                schedule_days = set()
-        else:
-            try:
-                schedule_days = {int(get_setting(db, "screener_schedule_day", "6"))}
-            except ValueError:
-                schedule_days = {6}
-
-        if now_et.weekday() not in schedule_days:
-            return
-
-        # ── Times: multi (new) → single legacy fallback ───────────────────────
-        times_raw = get_setting(db, "screener_schedule_times", "").strip()
-        if times_raw:
-            schedule_times = {t.strip() for t in times_raw.split(",") if t.strip()}
-        else:
-            schedule_times = {get_setting(db, "screener_schedule_time", "20:00")}
-
-        current_hm = now_et.strftime("%H:%M")
-        if current_hm not in schedule_times:
-            return
-
-        run_key = now_et.strftime("%Y-%m-%d %H:%M")
-        if get_setting(db, "screener_last_auto_run", "") == run_key:
+        now_et  = datetime.now(_ET)
+        run_key = _check_schedule_slots(db, "screener", now_et)
+        if not run_key:
             return
 
         set_setting(db, "screener_last_auto_run", run_key)
@@ -247,42 +281,18 @@ async def _screener_watchdog():
 
 async def _pb_screener_watchdog():
     """
-    Runs every minute. Fires the Pullback screener when all conditions are met:
-      1. pb_screener_auto_run == "true"
-      2. current ET weekday is in pb_screener_schedule_days (comma-separated 0–6)
-      3. current ET HH:MM is in pb_screener_schedule_times (comma-separated)
-    Tracks last run per slot (YYYY-MM-DD HH:MM) to prevent double-firing.
+    Fires every minute. Runs the Pullback screener when either schedule slot
+    matches (primary or secondary). Supports two independent day+time pairs.
     """
     db = SessionLocal()
+    run_key = None
     try:
         if get_setting(db, "pb_screener_auto_run", "true") != "true":
             return
 
-        now_et = datetime.now(_ET)
-
-        days_raw = get_setting(db, "pb_screener_schedule_days", "").strip()
-        if days_raw:
-            try:
-                schedule_days = {int(d.strip()) for d in days_raw.split(",") if d.strip().isdigit()}
-            except ValueError:
-                schedule_days = set()
-        else:
-            return  # no schedule configured — skip
-
-        if now_et.weekday() not in schedule_days:
-            return
-
-        times_raw = get_setting(db, "pb_screener_schedule_times", "").strip()
-        if not times_raw:
-            return  # no times configured — skip
-
-        schedule_times = {t.strip() for t in times_raw.split(",") if t.strip()}
-        current_hm = now_et.strftime("%H:%M")
-        if current_hm not in schedule_times:
-            return
-
-        run_key = now_et.strftime("%Y-%m-%d %H:%M")
-        if get_setting(db, "pb_screener_last_auto_run", "") == run_key:
+        now_et  = datetime.now(_ET)
+        run_key = _check_schedule_slots(db, "pb_screener", now_et)
+        if not run_key:
             return
 
         set_setting(db, "pb_screener_last_auto_run", run_key)
@@ -326,42 +336,18 @@ async def _pb_screener_watchdog():
 
 async def _rs_screener_watchdog():
     """
-    Fires every minute. Runs the RS Momentum screener when ALL of:
-      1. rs_screener_auto_run == "true"
-      2. current ET weekday is in rs_screener_schedule_days (comma-separated 0–6)
-      3. current ET HH:MM is in rs_screener_schedule_times (comma-separated)
-    Tracks last run per slot (YYYY-MM-DD HH:MM) to prevent double-firing.
+    Fires every minute. Runs the RS Momentum screener when either schedule slot
+    matches (primary or secondary). Supports two independent day+time pairs.
     """
     db = SessionLocal()
+    run_key = None
     try:
         if get_setting(db, "rs_screener_auto_run", "true") != "true":
             return
 
-        now_et = datetime.now(_ET)
-
-        days_raw = get_setting(db, "rs_screener_schedule_days", "").strip()
-        if days_raw:
-            try:
-                schedule_days = {int(d.strip()) for d in days_raw.split(",") if d.strip().isdigit()}
-            except ValueError:
-                schedule_days = set()
-        else:
-            return  # no schedule configured — skip
-
-        if now_et.weekday() not in schedule_days:
-            return
-
-        times_raw = get_setting(db, "rs_screener_schedule_times", "").strip()
-        if not times_raw:
-            return  # no times configured — skip
-
-        schedule_times = {t.strip() for t in times_raw.split(",") if t.strip()}
-        current_hm = now_et.strftime("%H:%M")
-        if current_hm not in schedule_times:
-            return
-
-        run_key = now_et.strftime("%Y-%m-%d %H:%M")
-        if get_setting(db, "rs_screener_last_auto_run", "") == run_key:
+        now_et  = datetime.now(_ET)
+        run_key = _check_schedule_slots(db, "rs_screener", now_et)
+        if not run_key:
             return
 
         set_setting(db, "rs_screener_last_auto_run", run_key)
