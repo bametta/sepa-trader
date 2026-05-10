@@ -260,6 +260,24 @@ const SECTIONS = [
     ],
   },
 
+  // ── Combined Screener ─────────────────────────────────────────────────────
+  {
+    title: 'Combined Screener',
+    description: 'Runs all three strategies (Minervini + Pullback + RS) in a single scan. Recommended as the primary weekly plan generator — one TV API call instead of three.',
+    subsections: [
+      {
+        title: 'Schedule (ET)',
+        fields: [
+          { key: 'combined_screener_auto_run',         label: 'Auto-run enabled',                        type: 'toggle',     defaultValue: 'true' },
+          { key: 'combined_screener_schedule_days',    label: 'Slot 1 — Days (click to toggle)',          type: 'day_picker', span: true },
+          { key: 'combined_screener_schedule_times',   label: 'Slot 1 — Run times (24h ET, e.g. 20:00)', type: 'time_list',  span: true },
+          { key: 'combined_screener_schedule_days_2',  label: 'Slot 2 — Days (optional)',                 type: 'day_picker', span: true },
+          { key: 'combined_screener_schedule_times_2', label: 'Slot 2 — Run times (24h ET, e.g. 16:30)', type: 'time_list',  span: true },
+        ],
+      },
+    ],
+  },
+
   // ── Monitor ────────────────────────────────────────────────────────────────
   {
     title: 'Monitor',

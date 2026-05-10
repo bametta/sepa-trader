@@ -389,6 +389,63 @@ async def _rs_screener_watchdog():
         db2.close()
 
 
+async def _combined_screener_watchdog():
+    """
+    Fires every minute. Runs all three screeners (Minervini + Pullback + RS)
+    in a single TV API call when either schedule slot matches.
+    Configured via combined_screener_schedule_days/times (slots 1 & 2).
+    This is the recommended primary weekly plan generator.
+    """
+    db = SessionLocal()
+    run_key = None
+    try:
+        if get_setting(db, "combined_screener_auto_run", "true") != "true":
+            return
+
+        now_et  = datetime.now(_ET)
+        run_key = _check_schedule_slots(db, "combined_screener", now_et)
+        if not run_key:
+            return
+
+        set_setting(db, "combined_screener_last_auto_run", run_key)
+        set_setting(db, "screener_status", "running")
+        set_setting(db, "screener_error",  "")
+        db.commit()
+
+    finally:
+        db.close()
+
+    db2 = SessionLocal()
+    try:
+        from .screener import run_both_screeners
+        from sqlalchemy import text as _text
+        admin_row = db2.execute(
+            _text("SELECT id FROM users WHERE role = 'admin' ORDER BY id LIMIT 1")
+        ).fetchone()
+        admin_id = admin_row[0] if admin_row else None
+
+        logger.info("Scheduled combined screener starting (%s ET)…", run_key)
+        results = run_both_screeners(db2, user_id=admin_id)
+        set_setting(db2, "screener_status", "done")
+        set_setting(db2, "screener_count",  str(len(results)))
+        logger.info("Scheduled combined screener done. %d stocks selected.", len(results))
+    except Exception as exc:
+        logger.error("Scheduled combined screener failed: %s", exc)
+        db3 = SessionLocal()
+        try:
+            set_setting(db3, "screener_status", "error")
+            set_setting(db3, "screener_error",  str(exc)[:500])
+        finally:
+            db3.close()
+        try:
+            from . import telegram_alerts as tg
+            tg.alert_system_error_sync("Combined screener (scheduled)", exc)
+        except Exception:
+            pass
+    finally:
+        db2.close()
+
+
 async def _run_screener_for_mode(uid: int, mode: str) -> int:
     """
     Runs all three screeners (Minervini + Pullback + RS) for one mode and
@@ -753,6 +810,15 @@ def start_scheduler():
         _rs_screener_watchdog,
         CronTrigger(minute="*"),
         id="rs_screener_watchdog",
+        replace_existing=True,
+    )
+
+    # Watchdog for the combined screener (all 3 strategies, single TV call)
+    # (uses combined_screener_schedule_days/times settings)
+    scheduler.add_job(
+        _combined_screener_watchdog,
+        CronTrigger(minute="*"),
+        id="combined_screener_watchdog",
         replace_existing=True,
     )
 
