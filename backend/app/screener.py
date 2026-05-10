@@ -860,31 +860,43 @@ def run_both_screeners(
             logger.info("Plan merge: %d picks dropped below R:R %.2fx", dropped, min_rr)
         seen = kept
 
-    # Re-rank all picks globally by RS score so highest-momentum stocks buy first
-    sorted_picks = sorted(
-        seen.values(),
-        key=lambda r: score_map.get(r["symbol"], -999.0),
-        reverse=True,
+    # ── Re-rank: within-strategy RS sort, then round-robin interleave ────────
+    # Each strategy's picks are sorted by RS momentum score (highest first) so
+    # the best-momentum pick from each group fills its slot first. Groups are
+    # then interleaved round-robin (best MV → best PB → best RS → 2nd MV → …)
+    # so every strategy gets fair top-slot representation. Without interleaving,
+    # RS picks (pre-filtered to the top momentum percentile) monopolise ranks
+    # 1–N and push quality Minervini/Pullback setups to the bottom of the plan.
+    import itertools as _itertools
+
+    def _sort_by_rs(picks: list) -> list:
+        return sorted(picks, key=lambda r: score_map.get(r["symbol"], -999.0), reverse=True)
+
+    mv_group = _sort_by_rs([r for r in seen.values() if r.get("screener_type") in ("minervini", "both")])
+    pb_group = _sort_by_rs([r for r in seen.values() if r.get("screener_type") == "pullback"])
+    rs_group = _sort_by_rs([r for r in seen.values() if r.get("screener_type") == "rs_momentum"])
+
+    sorted_picks = [
+        pick
+        for triple in _itertools.zip_longest(mv_group, pb_group, rs_group)
+        for pick in triple
+        if pick is not None
+    ]
+
+    logger.info(
+        "Plan merge: %d MV + %d PB + %d RS picks → %d total (interleaved round-robin)",
+        len(mv_group), len(pb_group), len(rs_group), len(sorted_picks),
     )
 
     # ── Per-sector cap ───────────────────────────────────────────────────────
-    # Walk picks in score order and skip any whose sector is already at the
-    # cap. Forces diversity in tape regimes where one sector (Technology in
-    # the current AI cycle) dominates absolute scoring.
+    # Walk picks in interleaved order and skip any whose sector is already at
+    # the cap. Forces diversity so one sector can't crowd out all slots.
     try:
         max_per_sector = int(_gus2(db, "max_picks_per_sector", "2", user_id) or "2")
     except (TypeError, ValueError):
         max_per_sector = 2
     if max_per_sector > 0:
         from .rs_screener import gics_label as _gics_label
-        # Diagnostic: log sector field for every pick so we can verify TV values
-        for _r in sorted_picks:
-            logger.error(
-                "SECTOR-CAP-DIAG: %s tv_sector=%r → gics=%r (screener=%s)",
-                _r.get("symbol"), _r.get("sector", ""),
-                _gics_label((_r.get("sector") or "").strip().lower()) if (_r.get("sector") or "").strip() else "",
-                _r.get("screener_type"),
-            )
         sector_counts: dict[str, int] = {}
         merged: list[dict] = []
         capped_out: list[str] = []
@@ -900,10 +912,14 @@ def run_both_screeners(
             if sec:
                 sector_counts[sec] = sector_counts.get(sec, 0) + 1
         if capped_out:
-            logger.error(
-                "SECTOR-CAP: %d picks dropped by sector cap (%d/sector): %s",
+            logger.info(
+                "Plan merge: %d picks dropped by sector cap (%d/sector): %s",
                 len(capped_out), max_per_sector, ", ".join(capped_out[:10]),
             )
+        logger.debug(
+            "Sector distribution after cap: %s",
+            {s: n for s, n in sorted(sector_counts.items(), key=lambda x: -x[1])},
+        )
     else:
         merged = sorted_picks
 
