@@ -377,6 +377,91 @@ def trigger_pullback_screener(
     return {"status": "running", "screener": "pullback", "mode": mode}
 
 
+@router.post("/run-rs")
+def trigger_rs_screener(
+    background_tasks: BackgroundTasks,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Run only the RS Momentum screener in background."""
+    uid  = current_user["id"]
+    mode = get_all_user_settings(db, uid).get("trading_mode", "paper")
+    log.info("Screener /run-rs triggered: uid=%s mode=%s", uid, mode)
+    set_user_setting(db, "screener_status",     "running",        uid)
+    set_user_setting(db, "screener_error",      "",               uid)
+    set_user_setting(db, "screener_phase",      "Starting…",      uid)
+    set_user_setting(db, "screener_started_at", str(time.time()), uid)
+    db.commit()
+
+    def _run():
+        db2 = SessionLocal()
+        try:
+            def _phase(msg):
+                set_user_setting(db2, "screener_phase", msg, uid)
+                db2.commit()
+
+            from ..rs_screener import run_rs_screener
+            from ..screener import _save_plan, _next_monday
+
+            _phase("RS Momentum: fetching TradingView data…")
+            rs_rows = run_rs_screener(db2, mode=mode, user_id=uid)
+            _phase(f"RS done — {len(rs_rows)} candidates. Merging with existing plan…")
+
+            week_start = rs_rows[0]["week_start"] if rs_rows else _next_monday().isoformat()
+
+            # Keep existing non-RS rows for this week
+            existing = db2.execute(
+                text("""
+                    SELECT week_start, symbol, rank, score, signal,
+                           entry_price, stop_price, target1, target2,
+                           position_size, risk_amount, rationale, status,
+                           mode, screener_type
+                    FROM weekly_plan
+                    WHERE week_start = :w AND mode = :m
+                      AND user_id IS NOT DISTINCT FROM :uid
+                      AND COALESCE(screener_type, 'minervini') != 'rs_momentum'
+                """),
+                {"w": week_start, "m": mode, "uid": uid},
+            ).fetchall()
+
+            seen: dict = {}
+            for r in existing:
+                seen[r.symbol] = dict(r._mapping)
+            for r in rs_rows:
+                sym = r["symbol"]
+                if sym in seen:
+                    seen[sym]["screener_type"] = "both"
+                else:
+                    seen[sym] = r
+
+            merged = list(seen.values())
+            for i, row in enumerate(merged, 1):
+                row["rank"] = i
+
+            _save_plan(db2, merged, week_start, mode, uid)
+
+            set_user_setting(db2, "screener_status", "done",                                uid)
+            set_user_setting(db2, "screener_phase",  f"Done — {len(merged)} stocks selected", uid)
+            set_user_setting(db2, "screener_count",  str(len(merged)),                       uid)
+            db2.commit()
+        except Exception as exc:
+            err_msg = f"{exc}\n{traceback.format_exc()}"
+            log.error("RS screener failed:\n%s", err_msg)
+            db3 = SessionLocal()
+            try:
+                set_user_setting(db3, "screener_status", "error",        uid)
+                set_user_setting(db3, "screener_phase",  "Failed",       uid)
+                set_user_setting(db3, "screener_error",  str(exc)[:500], uid)
+                db3.commit()
+            finally:
+                db3.close()
+        finally:
+            db2.close()
+
+    background_tasks.add_task(_run)
+    return {"status": "running", "screener": "rs_momentum", "mode": mode}
+
+
 @router.get("/pullback-settings")
 def get_pullback_settings(
     current_user: dict = Depends(get_current_user),

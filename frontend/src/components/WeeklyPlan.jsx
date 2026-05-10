@@ -2,7 +2,7 @@ import { useState, useEffect, useRef } from 'react'
 import { useQuery, useQueryClient } from 'react-query'
 import {
   fetchWeeklyPlan, fetchWeeklyDD, forceRefreshDD, fetchScreenerStatus,
-  runScreener, runMinerviniScreener, runPullbackScreener,
+  runScreener, runMinerviniScreener, runPullbackScreener, runRsScreener,
   exportWatchlist, updatePlanStatus,
   fetchAnalyses, runAnalysis, fetchSettings,
   fetchWeeklyNews,
@@ -247,22 +247,22 @@ export default function WeeklyPlan() {
             {syncing ? 'Exporting…' : '↓ TV Watchlist'}
           </button>
 
-          {/* Dropdown-style split run button */}
+          {/* Split run button: Run All + individual screeners */}
           <div className="flex rounded-lg overflow-hidden border border-accent/30">
             <button
               onClick={handleRunScreener}
               disabled={running}
               className="px-3 py-1.5 text-sm font-medium bg-accent hover:bg-indigo-500 text-white disabled:opacity-50 transition-colors flex items-center gap-2"
-              title="Run both screeners"
+              title="Run all three screeners (Minervini + Pullback + RS Momentum)"
             >
               {running && <span className="inline-block w-3 h-3 border-2 border-white border-t-transparent rounded-full animate-spin" />}
-              {running ? 'Scanning…' : 'Run Both'}
+              {running ? 'Scanning…' : 'Run All'}
             </button>
             <button
               onClick={async () => { setRunning(true); setMsg(null); setElapsed(0); try { await runMinerviniScreener(); refetchStatus() } catch(e) { setRunning(false); setMsg(e?.response?.data?.detail || 'Failed'); setMsgType('error') } }}
               disabled={running}
               className="px-2 py-1.5 text-xs font-medium bg-accent/70 hover:bg-indigo-600 text-white/80 disabled:opacity-50 transition-colors border-l border-white/10"
-              title="Run Minervini only"
+              title="Run Minervini (SEPA) only"
             >MIN</button>
             <button
               onClick={async () => { setRunning(true); setMsg(null); setElapsed(0); try { await runPullbackScreener(); refetchStatus() } catch(e) { setRunning(false); setMsg(e?.response?.data?.detail || 'Failed'); setMsgType('error') } }}
@@ -270,6 +270,12 @@ export default function WeeklyPlan() {
               className="px-2 py-1.5 text-xs font-medium bg-cyan-700/80 hover:bg-cyan-600 text-white/80 disabled:opacity-50 transition-colors border-l border-white/10"
               title="Run Pullback-to-MA only"
             >PB</button>
+            <button
+              onClick={async () => { setRunning(true); setMsg(null); setElapsed(0); try { await runRsScreener(); refetchStatus() } catch(e) { setRunning(false); setMsg(e?.response?.data?.detail || 'Failed'); setMsgType('error') } }}
+              disabled={running}
+              className="px-2 py-1.5 text-xs font-medium bg-emerald-700/80 hover:bg-emerald-600 text-white/80 disabled:opacity-50 transition-colors border-l border-white/10"
+              title="Run RS Momentum only"
+            >RS</button>
           </div>
         </div>
       </div>

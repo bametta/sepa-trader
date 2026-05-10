@@ -106,6 +106,7 @@ export const fetchScreenerStatus = () => api.get('/screener/status').then(r => r
 export const runScreener           = () => api.post('/screener/run').then(r => r.data)
 export const runMinerviniScreener  = () => api.post('/screener/run-minervini').then(r => r.data)
 export const runPullbackScreener   = () => api.post('/screener/run-pullback').then(r => r.data)
+export const runRsScreener         = () => api.post('/screener/run-rs').then(r => r.data)
 export const fetchPullbackSettings = () => api.get('/screener/pullback-settings').then(r => r.data)
 export const fetchTvScreeners      = () => api.get('/screener/tv-screeners').then(r => r.data)
 export const syncTradingView    = () => api.post('/screener/sync-tradingview').then(r => r.data)
