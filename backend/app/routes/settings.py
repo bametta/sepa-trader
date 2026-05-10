@@ -64,6 +64,18 @@ EDITABLE_KEYS = {
     "block_on_warn", "tv_excluded_sectors",
     # Daily drawdown halt
     "daily_drawdown_halt_pct",
+    # Minervini screener — slot 2 schedule
+    "screener_schedule_days_2", "screener_schedule_times_2",
+    # Pullback screener — slot 2 schedule
+    "pb_screener_schedule_days_2", "pb_screener_schedule_times_2",
+    # RS Momentum screener — schedule (all slots)
+    "rs_screener_auto_run",
+    "rs_screener_schedule_days", "rs_screener_schedule_times",
+    "rs_screener_schedule_days_2", "rs_screener_schedule_times_2",
+    # Combined screener (runs all 3 strategies in one TV API call)
+    "combined_screener_auto_run",
+    "combined_screener_schedule_days", "combined_screener_schedule_times",
+    "combined_screener_schedule_days_2", "combined_screener_schedule_times_2",
 }
 
 
