@@ -243,6 +243,14 @@ const SECTIONS = [
             defaultValue: 'Energy Minerals,Industrial Services,Non-Energy Minerals,Process Industries,Utilities,Consumer Non-Durables' },
         ],
       },
+      {
+        title: 'Schedule (ET)',
+        fields: [
+          { key: 'rs_screener_auto_run',       label: 'Auto-run enabled',                type: 'toggle',     defaultValue: 'true' },
+          { key: 'rs_screener_schedule_days',  label: 'Days to run (click to toggle)',   type: 'day_picker', span: true },
+          { key: 'rs_screener_schedule_times', label: 'Run times (24h ET, e.g. 20:00)', type: 'time_list',  span: true },
+        ],
+      },
     ],
   },
 
