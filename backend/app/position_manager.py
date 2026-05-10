@@ -102,25 +102,34 @@ def _gate(
     mode: str,
     user_id: int | None = None,
 ) -> bool:
-    """Pre-trade AI gate. Returns True if order should proceed. Fails open."""
+    """Pre-trade AI gate. Returns True if order should proceed.
+    Fails open (returns True) on exception — screener-derived picks are
+    pre-vetted; a broken AI connection should not hard-block planned trades.
+    (Contrast with trader.py _gate which fails closed for unplanned entries.)
+    """
     try:
         from .claude_analyst import pre_trade_analysis, log_pre_trade, get_stored_weekly_plan_analysis
-        stored       = get_stored_weekly_plan_analysis(db, symbol, mode)
-        acct         = alp.get_account_for_user(db, user_id or _resolve_admin_uid(db), mode)
-        portfolio    = float(acct.portfolio_value)
-        cash         = float(acct.cash)
-        buying_power = float(acct.buying_power)
+        from .trader import _get_tape_context
+        effective_uid = user_id or _resolve_admin_uid(db)
+        stored        = get_stored_weekly_plan_analysis(db, symbol, mode)
+        acct          = alp.get_account_for_user(db, effective_uid, mode)
+        portfolio     = float(acct.portfolio_value)
+        cash          = float(acct.cash)
+        buying_power  = float(acct.buying_power)
+        tape_context  = _get_tape_context(db, effective_uid)
 
         result = pre_trade_analysis(
             db=db, symbol=symbol, side="BUY", qty=qty,
             entry_price=entry, stop_price=stop, target_price=target,
             trigger=trigger, portfolio_value=portfolio,
             cash=cash, buying_power=buying_power, mode=mode,
-            user_id=user_id, stored_analysis=stored,
+            user_id=effective_uid, stored_analysis=stored,
+            tape_context=tape_context,
         )
         log_pre_trade(
             db, symbol, trigger,
             result["verdict"], result["reason"], result["analysis"], mode,
+            user_id=effective_uid,
         )
 
         if not result["proceed"]:
@@ -403,6 +412,7 @@ def run_monday_open(db: Session, mode: str | None = None):
     max_pos = _effective_max_positions(db, mode)
     mv_max  = int(get_setting(db, "mv_max_slots", "3") or "3")
     pb_max  = int(get_setting(db, "pb_max_slots", "2") or "2")
+    rs_max  = int(get_setting(db, "rs_max_slots", "2") or "2")
 
     try:
         positions = alp.get_positions_for_user(db, admin_uid, mode)
@@ -420,10 +430,11 @@ def run_monday_open(db: Session, mode: str | None = None):
 
     mv_slots = min(max(0, mv_max - mv_held), max_pos - total_held)
     pb_slots = min(max(0, pb_max - pb_held), max_pos - total_held - mv_slots)
+    rs_slots = min(max(0, rs_max - rs_held), max_pos - total_held - mv_slots - pb_slots)
 
     logger.info(
-        "Monday open [%s]: held=%d (mv=%d pb=%d rs=%d) | slots: mv=%d pb=%d | max_pos=%d",
-        mode, total_held, mv_held, pb_held, rs_held, mv_slots, pb_slots, max_pos,
+        "Monday open [%s]: held=%d (mv=%d pb=%d rs=%d) | slots: mv=%d pb=%d rs=%d | max_pos=%d",
+        mode, total_held, mv_held, pb_held, rs_held, mv_slots, pb_slots, rs_slots, max_pos,
     )
 
     # Fetch Minervini picks (screener_type = 'minervini' or 'both')
@@ -456,7 +467,22 @@ def run_monday_open(db: Session, mode: str | None = None):
         {"slots": pb_slots, "mode": mode},
     ).fetchall() if pb_slots > 0 else []
 
-    rows = list(mv_rows) + list(pb_rows)
+    # Fetch RS Momentum picks (screener_type = 'rs_momentum')
+    rs_rows = db.execute(
+        text("""
+            SELECT symbol, entry_price, stop_price, target1, target2,
+                   screener_type
+            FROM weekly_plan
+            WHERE week_start = (SELECT MAX(week_start) FROM weekly_plan WHERE mode = :mode)
+              AND mode = :mode AND status = 'PENDING'
+              AND screener_type = 'rs_momentum'
+            ORDER BY rank ASC
+            LIMIT :slots
+        """),
+        {"slots": rs_slots, "mode": mode},
+    ).fetchall() if rs_slots > 0 else []
+
+    rows = list(mv_rows) + list(pb_rows) + list(rs_rows)
 
     if not rows:
         logger.info("Monday open: no PENDING picks for mode=%s.", mode)
@@ -990,11 +1016,12 @@ def _execute_next_pick(db: Session, mode: str, held: set, user_id: int | None = 
         )
         return
 
-    if not _gate(db, sym, qty, entry, stop, target, "POST_CLOSE", mode, user_id=admin_uid):
+    effective_uid = user_id or _resolve_admin_uid(db)
+    if not _gate(db, sym, qty, entry, stop, target, "POST_CLOSE", mode, user_id=effective_uid):
         return
 
     try:
-        order_desc = _place_entry(db, sym, qty, entry, stop, target, "POST_CLOSE", mode, stype, target2=target2, user_id=admin_uid)
+        order_desc = _place_entry(db, sym, qty, entry, stop, target, "POST_CLOSE", mode, stype, target2=target2, user_id=effective_uid)
         logger.info("Post-close fallback: %s qty=%.0f — %s", sym, qty, order_desc)
 
         db.execute(

@@ -338,15 +338,8 @@ const SECTIONS = [
   },
 ]
 
-// Open by default: top-level config + the per-strategy "Universe & Filters"
-// panels so the user lands on the most-edited controls.
-const DEFAULT_OPEN = new Set([
-  'Trading Mode',
-  'Risk & Position Sizing',
-  'Minervini Screener',
-  'Pullback Screener',
-  'RS Momentum Screener',
-])
+// All sections start collapsed — click any header to expand.
+const DEFAULT_OPEN = new Set()
 
 export default function SettingsPanel() {
   const qc            = useQueryClient()
