@@ -825,18 +825,6 @@ def start_scheduler():
         replace_existing=True,
     )
 
-    # Mon–Fri 9:31 AM ET — Apex market-open position sync
-    # Runs stop-management only (T1 partial exits, EMA20 trailing, exit guard,
-    # time stops) immediately at open so existing positions don't wait up to
-    # monitor_interval_minutes for their first Apex cycle of the day.
-    # Fires 4 minutes BEFORE Monday open (9:35) so it never races with new buys.
-    scheduler.add_job(
-        _market_open_position_sync,
-        CronTrigger(day_of_week="mon-fri", hour=9, minute=31, timezone="America/New_York"),
-        id="market_open_position_sync",
-        replace_existing=True,
-    )
-
     # Monday 9:35 AM ET — fill position slots from the weekly plan
     scheduler.add_job(
         _monday_open_job,
