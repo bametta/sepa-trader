@@ -806,23 +806,56 @@ def _ensure_exit_orders(
             logger.info("Exit guard: %s has in-flight BUY — deferring [%s]", sym, mode)
             continue
 
-        # ── Re-analyze and synthesize a fresh plan if none exists ────────
-        # An entry-anchored "default" goes stale the moment the stock moves
-        # off the original entry. _derive_fresh_plan re-reads CURRENT price
-        # action, picks a structural stop (EMA20/EMA50/fallback) anchored to
-        # the current price, and persists the plan so trailing-stop logic and
-        # subsequent cycles all see the same exits.
-        if stop <= 0 or target <= 0:
+        # ── Check T1 status before any exit derivation ───────────────────
+        # If T1 has already been taken, the stop is intentionally at breakeven
+        # (entry price). Re-deriving would overwrite the BE stop with a new
+        # structural level that could be below entry — always preserve it.
+        try:
+            t1_row = db.execute(
+                text("""
+                    SELECT t1_taken FROM weekly_plan
+                    WHERE symbol = :sym AND mode = :mode
+                    ORDER BY week_start DESC LIMIT 1
+                """),
+                {"sym": sym, "mode": mode},
+            ).fetchone()
+            t1_taken = bool(t1_row[0]) if t1_row else False
+        except Exception:
+            t1_taken = False
+
+        # ── Re-analyze and synthesize a fresh plan ────────────────────────
+        # Always re-derive from current price action when placing a fresh OCO,
+        # UNLESS T1 has been taken (BE stop must be preserved).
+        #
+        # Why: screener plans are generated Thursday/Friday. By Monday open,
+        # a pre-market runner may have moved 5%+ and the stale stop/target
+        # would place a premature or mis-sized OCO.
+        #
+        # Guardrail: only move the stop HIGHER — never back off a trailing
+        # stop that has already ratcheted above the fresh structural level.
+        if not t1_taken:
             entry_price   = float(getattr(pos, "avg_entry_price", 0) or 0)
             current_price = float(getattr(pos, "current_price", 0) or entry_price)
             if entry_price <= 0 and current_price <= 0:
                 logger.warning("Exit guard: %s no anchor price — cannot derive plan [%s]", sym, mode)
                 continue
-            stop, target = _derive_fresh_plan(db, sym, mode, entry_price, current_price, user_id=user_id)
-            if stop <= 0 or target <= 0:
+            fresh_stop, fresh_target = _derive_fresh_plan(
+                db, sym, mode, entry_price, current_price, user_id=user_id
+            )
+            if fresh_stop > 0 and fresh_target > 0:
+                # Ratchet only — never back off a stop that's already higher
+                new_stop = max(fresh_stop, stop) if stop > 0 else fresh_stop
+                if new_stop != stop or fresh_target != target:
+                    logger.info(
+                        "Exit guard: %s refreshed exits — stop $%.2f→$%.2f target $%.2f→$%.2f [%s]",
+                        sym, stop, new_stop, target, fresh_target, mode,
+                    )
+                stop, target = new_stop, fresh_target
+            elif stop <= 0 or target <= 0:
+                # No fresh plan AND no existing plan — cannot place OCO
                 logger.warning(
                     "Exit guard: %s plan derivation returned invalid prices "
-                    "(stop=%.2f target=%.2f) — skipping [%s]", sym, stop, target, mode,
+                    "(stop=%.2f target=%.2f) — skipping [%s]", sym, fresh_stop, fresh_target, mode,
                 )
                 continue
 
