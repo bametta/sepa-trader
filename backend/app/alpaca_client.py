@@ -543,7 +543,19 @@ def wait_for_orders_cancelled(
                 except Exception:
                     pass  # order not found → already gone
             if all_terminal:
-                return True
+                # Also scan for OCO siblings — Alpaca cascades the cancel
+                # to the sibling leg (different ID, not in order_ids).
+                # The sibling can linger as "held" for a second or two after
+                # the parent reaches pending_cancel.
+                open_orders   = get_open_orders_by_symbol(mode)
+                symbol_orders = open_orders.get(symbol, [])
+                remaining     = [
+                    o for o in symbol_orders
+                    if 'sell' in str(getattr(o, 'side', '') or '').lower()
+                ]
+                if not remaining:
+                    return True
+                # Siblings still settling — fall through to next poll tick
         else:
             # Fallback: scan open sell orders for the symbol
             open_orders   = get_open_orders_by_symbol(mode)

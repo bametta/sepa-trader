@@ -703,6 +703,13 @@ def _check_time_stops(
             pass
 
         try:
+            # Cancel existing OCO first — shares held_for_orders block a
+            # market close ("insufficient qty available").
+            _cancelled = alp.cancel_symbol_exit_orders(sym, mode)
+            if _cancelled:
+                alp.wait_for_orders_cancelled(
+                    sym, mode, timeout=8.0, poll_interval=0.5, order_ids=_cancelled
+                )
             alp.close_position(sym, mode)
             _log_trade(db, sym, "SELL", qty, current_price, "TIME_STOP", mode)
         except Exception as exc:
