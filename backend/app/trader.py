@@ -212,7 +212,8 @@ def _derive_fresh_plan(
     if entry_price > 0 and px_now > entry_price * 1.03:
         chosen_stop = max(chosen_stop, round(entry_price, 2))
 
-    target = round(px_now + (px_now - chosen_stop) * rr, 2)
+    t1 = round(px_now + (px_now - chosen_stop) * rr, 2)        # 2.5R default
+    t2 = round(px_now + (px_now - chosen_stop) * rr * 1.5, 2)  # ~3.75R — 50% further than T1
 
     # Persist so we don't re-derive every monitor cycle
     try:
@@ -220,7 +221,7 @@ def _derive_fresh_plan(
             text("""
                 INSERT INTO weekly_plan
                     (week_start, symbol, rank, score, entry_price, stop_price,
-                     target1, status, mode, user_id)
+                     target1, target2, status, mode, user_id)
                 VALUES (
                     COALESCE(
                         (SELECT MAX(week_start) FROM weekly_plan
@@ -228,11 +229,11 @@ def _derive_fresh_plan(
                            AND (:uid IS NULL OR user_id = :uid)),
                         CURRENT_DATE
                     ),
-                    :sym, 99, 0, :entry, :stop, :target, 'EXECUTED', :mode, :uid
+                    :sym, 99, 0, :entry, :stop, :t1, :t2, 'EXECUTED', :mode, :uid
                 )
             """),
             {"sym": symbol, "entry": entry_price or px_now,
-             "stop": chosen_stop, "target": target, "mode": mode, "uid": user_id},
+             "stop": chosen_stop, "t1": t1, "t2": t2, "mode": mode, "uid": user_id},
         )
         db.commit()
     except Exception as exc:
@@ -240,10 +241,10 @@ def _derive_fresh_plan(
 
     logger.warning(
         "Exit guard: %s reanalyzed (no plan) — basis=%s px=$%.2f stop=$%.2f "
-        "target=$%.2f (R:R=%.1f) [%s]",
-        symbol, basis, px_now, chosen_stop, target, rr, mode,
+        "t1=$%.2f t2=$%.2f (R:R=%.1f) [%s]",
+        symbol, basis, px_now, chosen_stop, t1, t2, rr, mode,
     )
-    return chosen_stop, target
+    return chosen_stop, t1
 
 
 def _get_current_stop_price(orders: list) -> float | None:
