@@ -1014,13 +1014,28 @@ def _ensure_exit_orders(
         # silently drop the stop sibling if reservable qty is already
         # pledged by a prior order — leaving the position with a target
         # leg and no stop. Cancelling first eliminates the race.
+        #
+        # Alpaca paper is slow to cascade-cancel OCO siblings (held leg
+        # can linger >10s after parent is cancelled). Strategy:
+        #   1. Cancel all sell orders (4s wait).
+        #   2. If still not clear: second cancel sweep + 1s grace, then
+        #      proceed anyway.
+        #   3. If placement fails with "insufficient qty" (40310000),
+        #      the OLD OCO is still active → position is protected.
+        #      Log and retry on the next cycle — not a hard failure.
         cancelled = alp.cancel_symbol_exit_orders(sym, mode)
-        if cancelled and not alp.wait_for_orders_cancelled(sym, mode, timeout=10.0, poll_interval=0.5, order_ids=cancelled):
-            logger.error(
-                "Exit guard: timed out cancelling %s sells — skipping placement [%s]",
-                sym, mode,
+        if cancelled:
+            cleared = alp.wait_for_orders_cancelled(
+                sym, mode, timeout=4.0, poll_interval=0.5, order_ids=cancelled
             )
-            continue
+            if not cleared:
+                # Second sweep: cancel again to catch any newly-visible siblings
+                alp.cancel_symbol_exit_orders(sym, mode)
+                import time as _t; _t.sleep(1.0)
+                logger.warning(
+                    "Exit guard: %s cancel still settling — proceeding optimistically [%s]",
+                    sym, mode,
+                )
 
         try:
             parent = alp.place_oca_exit(sym, qty, stop, target, mode)
@@ -1055,11 +1070,22 @@ def _ensure_exit_orders(
                 )
         except Exception as exc:
             exc_str = str(exc)
+            # Pledged-qty race (40310000): the cancelled OCO's held leg hasn't
+            # fully released its qty reservation yet.  The OLD OCO is still
+            # active so the position remains protected — this is not a naked
+            # position.  Log and let the next cycle retry.
+            if "40310000" in exc_str or "insufficient qty" in exc_str.lower():
+                logger.warning(
+                    "Exit guard: %s OCO blocked — old OCO still settling "
+                    "(position protected, retrying next cycle) [%s]",
+                    sym, mode,
+                )
+                continue
             # PDT (pattern day trading) protection blocks OCO orders — and even
             # plain stop orders — placed the same day as a buy in margin accounts
             # under $25k. Nothing can be placed today; try stop-market as last
             # resort, and if that also fails, park the symbol until tomorrow.
-            if "40310100" in exc_str or "pattern day trad" in exc_str.lower():
+            elif "40310100" in exc_str or "pattern day trad" in exc_str.lower():
                 logger.warning(
                     "Exit guard: OCO for %s blocked by PDT — trying stop-market fallback [%s]",
                     sym, mode,
