@@ -561,6 +561,25 @@ def _check_t1_partial_exit(
             mode, sym, price, t1, sell_qty, qty, be_stop, exit_tgt,
         )
 
+        # Cancel the existing OCO BEFORE placing the market sell.
+        # Without this, the OCO target leg (at T1 price) fires concurrently
+        # and sells the full position alongside our half-share market sell.
+        try:
+            cancelled = alp.cancel_symbol_exit_orders(sym, mode)
+            if cancelled:
+                cleared = alp.wait_for_orders_cancelled(
+                    sym, mode, timeout=6.0, poll_interval=0.5, order_ids=cancelled
+                )
+                if not cleared:
+                    alp.cancel_symbol_exit_orders(sym, mode)  # second sweep
+                    import time as _t; _t.sleep(1.5)
+                    logger.warning(
+                        "T1 partial exit: %s OCO cancel still settling — proceeding [%s]",
+                        sym, mode,
+                    )
+        except Exception as exc:
+            logger.warning("T1 partial exit: OCO cancel failed for %s: %s — proceeding", sym, exc)
+
         # Sell half
         try:
             alp.place_market_sell(sym, sell_qty, mode)
@@ -569,8 +588,9 @@ def _check_t1_partial_exit(
             logger.error("T1 partial exit: sell failed for %s: %s", sym, exc)
             continue
 
-        # Move OCO for the remaining half: stop = BE, target = T2
+        # Place fresh OCO for the remaining half: stop = BE, target = T2
         if remain_qty > 0:
+            import time as _t; _t.sleep(1.0)   # let the market sell settle before placing exits
             try:
                 alp.replace_oca_exit(sym, remain_qty, be_stop, exit_tgt, mode)
             except Exception as exc:
