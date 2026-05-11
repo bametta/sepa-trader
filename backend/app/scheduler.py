@@ -94,8 +94,12 @@ async def _monitor_watchdog():
         if now_et.weekday() > 4:
             logger.debug("Watchdog: weekend — skipping.")
             return
-        if not (9 <= now_et.hour < 16):
-            logger.debug("Watchdog: outside market hours (%s ET) — skipping.", now_et.strftime("%H:%M"))
+        # Market opens at 9:30 ET — don't fire before then.
+        # Firing at 9:00 would burn monitor_last_run on a closed market,
+        # delaying the first real cycle to 9:30 and wasting the Apex sync.
+        market_open_et = now_et.hour > 9 or (now_et.hour == 9 and now_et.minute >= 30)
+        if not (market_open_et and now_et.hour < 16):
+            logger.debug("Watchdog: outside trading hours (%s ET) — skipping.", now_et.strftime("%H:%M"))
             return
 
         interval = int(merged.get("monitor_interval_minutes", "30") or "30")
