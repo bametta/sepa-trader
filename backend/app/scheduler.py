@@ -137,6 +137,48 @@ async def _monitor_watchdog():
     )
 
 
+async def _market_open_position_sync():
+    """
+    Fires every weekday at 9:31 ET — one minute after the market opens.
+
+    Runs the Apex stop-management cycle (T1 partial exit, EMA20 trailing
+    stops, exit guard, time stops) for ALL open positions immediately at
+    open, rather than waiting up to monitor_interval_minutes for the next
+    regular monitor tick.
+
+    This is intentionally stop-management ONLY (no slot fills, no signal
+    evaluation) so it cannot interfere with Monday's run_monday_open at 9:35.
+    """
+    db = SessionLocal()
+    admin_uid = None
+    try:
+        row = db.execute(
+            text("SELECT id FROM users WHERE role = 'admin' ORDER BY id LIMIT 1")
+        ).fetchone()
+        admin_uid = row[0] if row else None
+    finally:
+        db.close()
+
+    for mode in ("paper", "live"):
+        db = SessionLocal()
+        try:
+            from .trader import run_position_sync
+            result = run_position_sync(db, mode=mode, user_id=admin_uid)
+            logger.info(
+                "Market-open position sync [%s]: %s",
+                mode, result,
+            )
+        except Exception as exc:
+            logger.error("Market-open position sync [%s] failed: %s", mode, exc)
+            try:
+                from . import telegram_alerts as tg
+                tg.alert_system_error_sync(f"Market-open position sync [{mode}]", exc)
+            except Exception:
+                pass
+        finally:
+            db.close()
+
+
 async def _monday_open_job():
     """
     Fires once on Monday at 9:35 ET.
@@ -776,6 +818,18 @@ def start_scheduler():
         _monitor_watchdog,
         CronTrigger(minute="*"),
         id="sepa_monitor",
+        replace_existing=True,
+    )
+
+    # Mon–Fri 9:31 AM ET — Apex market-open position sync
+    # Runs stop-management only (T1 partial exits, EMA20 trailing, exit guard,
+    # time stops) immediately at open so existing positions don't wait up to
+    # monitor_interval_minutes for their first Apex cycle of the day.
+    # Fires 4 minutes BEFORE Monday open (9:35) so it never races with new buys.
+    scheduler.add_job(
+        _market_open_position_sync,
+        CronTrigger(day_of_week="mon-fri", hour=9, minute=31, timezone="America/New_York"),
+        id="market_open_position_sync",
         replace_existing=True,
     )
 

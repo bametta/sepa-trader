@@ -1236,6 +1236,84 @@ def _reconcile_partial_fills(db: Session, positions, mode: str) -> None:
             logger.warning("Partial-fill reconcile failed for %s: %s", sym, exc)
 
 
+# ── Market-open position sync (Apex) ─────────────────────────────────────────
+
+def run_position_sync(db: Session, mode: str, user_id: int | None = None) -> dict:
+    """
+    Lightweight stop-management cycle that runs at market open (9:31 ET) every
+    trading day — independently of the configurable monitor interval.
+
+    Runs ONLY the stop-management steps (T1 partial exit → trailing stops →
+    exit guard → time stops). Does NOT do signal evaluation, slot fills, or
+    post-close buys — those remain in the full monitor cycle to avoid
+    interfering with Monday's run_monday_open at 9:35 ET.
+
+    The purpose is to ensure existing positions have up-to-date Apex exits
+    from the very first print, not up to 30 minutes later when the regular
+    monitor interval first fires.
+    """
+    try:
+        clock = alp.get_clock(mode)
+        if not clock.is_open:
+            logger.info("Position sync [%s]: market not open — skipping.", mode)
+            return {"status": "skipped", "reason": "market_closed"}
+    except Exception as exc:
+        logger.warning("Position sync [%s]: clock check failed (%s) — skipping.", mode, exc)
+        return {"status": "skipped", "reason": str(exc)}
+
+    try:
+        positions = alp.get_positions_for_user(db, user_id, mode)
+    except Exception as exc:
+        logger.error("Position sync [%s]: cannot fetch positions — %s", mode, exc)
+        return {"status": "error", "error": str(exc)}
+
+    if not positions:
+        logger.info("Position sync [%s]: no open positions — nothing to sync.", mode)
+        return {"status": "ok", "positions": 0}
+
+    logger.info(
+        "Position sync [%s]: syncing stop-management for %d open position(s) at market open.",
+        mode, len(positions),
+    )
+
+    try:
+        _reconcile_partial_fills(db, positions, mode)
+    except Exception as exc:
+        logger.warning("Position sync [%s]: reconcile failed — %s", mode, exc)
+
+    try:
+        open_orders = alp.get_open_orders_by_symbol_for_user(db, user_id, mode)
+
+        _check_t1_partial_exit(db, positions, open_orders, mode)
+
+        # Re-fetch after potential partial sell
+        positions   = alp.get_positions_for_user(db, user_id, mode)
+        open_orders = alp.get_open_orders_by_symbol_for_user(db, user_id, mode)
+
+        _adjust_trailing_stops(db, positions, open_orders, mode)
+
+        open_orders = alp.get_open_orders_by_symbol_for_user(db, user_id, mode)
+
+        _ensure_exit_orders(db, positions, open_orders, mode, user_id=user_id)
+
+    except Exception as exc:
+        logger.error("Position sync [%s]: stop-management failed — %s", mode, exc)
+        try:
+            from . import telegram_alerts as tg
+            tg.alert_system_error_sync(f"Market-open position sync [{mode}]", exc)
+        except Exception:
+            pass
+        return {"status": "error", "error": str(exc)}
+
+    try:
+        _check_time_stops(db, positions, mode)
+    except Exception as exc:
+        logger.error("Position sync [%s]: time-stop check failed — %s", mode, exc)
+
+    logger.info("Position sync [%s]: done.", mode)
+    return {"status": "ok", "positions": len(positions)}
+
+
 # ── Main monitor ──────────────────────────────────────────────────────────────
 
 async def run_monitor(db: Session, user_id: int | None = None, mode: str | None = None):
