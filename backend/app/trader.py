@@ -200,6 +200,16 @@ def _derive_fresh_plan(
         chosen_stop = fallback
 
     chosen_stop = max(stop_floor, min(chosen_stop, stop_ceiling))
+
+    # Entry-price floor: if the position is meaningfully in profit (>3% above
+    # entry), never place a stop below the purchase price.  A pre-market runner
+    # should at minimum exit at breakeven, not at a structural level that was
+    # valid at the original entry but is now a loss relative to cost basis.
+    # Only enforced when the stock is clearly up — flat/losing positions keep
+    # their structural stop so the trade has room to work.
+    if entry_price > 0 and px_now > entry_price * 1.03:
+        chosen_stop = max(chosen_stop, round(entry_price, 2))
+
     target = round(px_now + (px_now - chosen_stop) * rr, 2)
 
     # Persist so we don't re-derive every monitor cycle
