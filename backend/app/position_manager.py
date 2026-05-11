@@ -586,6 +586,73 @@ def run_monday_open(db: Session, mode: str | None = None):
                 sym, _fe_exc,
             )
 
+        # ── Live price deviation check ─────────────────────────────────────
+        # Plan entry was computed Thu/Fri. By Monday open the stock may have
+        # gapped significantly. Rules:
+        #
+        #   Gapped UP > max_dev  → skip for ALL types (chasing an extended
+        #                          move / stock has left the setup zone)
+        #   Gapped DOWN > max_dev → skip Minervini & RS (breakout invalidated)
+        #                           allow Pullback (deeper pullback = better entry)
+        #   Within range          → use live price for sizing + order so we
+        #                           don't anchor to a stale number
+        #
+        # Threshold is configurable via entry_max_deviation_pct (default 5%).
+        try:
+            from .tv_analyzer import analyze as _tv_analyze
+            _max_dev = float(get_setting(db, "entry_max_deviation_pct", "5.0") or "5.0")
+            _live_tech  = _tv_analyze(sym, db=db) or {}
+            _live_price = float(_live_tech.get("price") or 0)
+            if _live_price > 0 and entry > 0:
+                _dev_pct = (_live_price - entry) / entry * 100
+                if _dev_pct > _max_dev:
+                    logger.info(
+                        "Monday open: skipping %s — gapped UP %.1f%% above plan $%.2f "
+                        "(live=$%.2f, threshold=%.1f%%) [%s]",
+                        sym, _dev_pct, entry, _live_price, _max_dev, mode,
+                    )
+                    continue
+                elif _dev_pct < -_max_dev:
+                    if stype in ("minervini", "both", "rs_momentum"):
+                        logger.info(
+                            "Monday open: skipping %s — gapped DOWN %.1f%% below plan $%.2f "
+                            "(live=$%.2f) — breakout thesis invalidated [%s]",
+                            sym, abs(_dev_pct), entry, _live_price, mode,
+                        )
+                        continue
+                    # Pullback: a deeper pullback is a better entry — proceed at live price
+                    logger.info(
+                        "Monday open: %s gapped DOWN %.1f%% — Pullback, using live price $%.2f [%s]",
+                        sym, abs(_dev_pct), _live_price, mode,
+                    )
+                # Use live price for sizing and order placement
+                if abs(_dev_pct) > 0.1:
+                    logger.info(
+                        "Monday open: %s plan=$%.2f live=$%.2f (drift=%.1f%%) — using live price [%s]",
+                        sym, entry, _live_price, _dev_pct, mode,
+                    )
+                entry = _live_price
+                # Persist so exit guard and UI read a consistent entry price
+                try:
+                    db.execute(
+                        text("""
+                            UPDATE weekly_plan SET entry_price = :e
+                            WHERE symbol = :sym AND mode = :mode
+                              AND week_start = (
+                                  SELECT MAX(week_start) FROM weekly_plan WHERE mode = :mode
+                              )
+                        """),
+                        {"e": entry, "sym": sym, "mode": mode},
+                    )
+                    db.commit()
+                except Exception as _pe:
+                    logger.warning("Monday open: could not persist live entry for %s: %s", sym, _pe)
+        except Exception as _dev_exc:
+            logger.warning(
+                "Monday open: live price check failed for %s (%s) — using plan entry $%.2f",
+                sym, _dev_exc, entry,
+            )
+
         qty = _size_qty(portfolio, entry, stop, risk_pct, stop_pct)
         # Settlement-aware: cap by settled cash net of running spend
         max_pos_shares = int(portfolio * max_position_pct / 100 / entry) if entry > 0 else 0
@@ -1328,10 +1395,31 @@ def fill_open_slots(
                 continue
 
         # RS momentum picks are already in Stage 2 by screener definition —
-        # skip SEPA signal confirmation and buy at current price.
+        # skip SEPA signal confirmation but still fetch the live price so
+        # sizing and order placement are anchored to the current market, not
+        # the stale screener entry.  Also apply the deviation guard so a pick
+        # that has run too far or gapped down is skipped just like Minervini.
         if stype == "rs_momentum":
-            price = entry
             signal = "RS_MOMENTUM"
+            try:
+                from .tv_analyzer import analyze as _tv_analyze
+                _rs_tech    = _tv_analyze(sym, db=db) or {}
+                _rs_live_px = float(_rs_tech.get("price") or 0)
+            except Exception:
+                _rs_live_px = 0.0
+            price = _rs_live_px if _rs_live_px > 0 else entry
+
+            # Deviation guard (same thresholds as Monday open)
+            if price > 0 and entry > 0:
+                _rs_max_dev = float(get_setting(db, "entry_max_deviation_pct", "5.0") or "5.0")
+                _rs_dev_pct = (price - entry) / entry * 100
+                if abs(_rs_dev_pct) > _rs_max_dev:
+                    logger.info(
+                        "fill_open_slots: skipping RS %s — %.1f%% drift from plan "
+                        "(live=$%.2f plan=$%.2f threshold=%.1f%%) [%s]",
+                        sym, _rs_dev_pct, price, entry, _rs_max_dev, mode,
+                    )
+                    continue
         else:
             # Confirm current SEPA signal before buying stale screener picks
             result = analyze(sym, db=db)
