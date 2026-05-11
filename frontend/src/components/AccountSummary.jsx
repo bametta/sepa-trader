@@ -9,7 +9,7 @@ function fmt(n, sign = false) {
   return `${prefix}$${Math.abs(n).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
 }
 
-function AccountCard({ acct, onModeChange, totalDeposited, onDepositSaved }) {
+function AccountCard({ acct, onModeChange, onDepositSaved }) {
   const isProfit      = acct.day_pnl >= 0
   const plColor       = isProfit ? 'text-emerald-400' : 'text-red-400'
   const totalPlColor  = (acct.unrealized_pl ?? 0) >= 0 ? 'text-emerald-400' : 'text-red-400'
@@ -18,9 +18,10 @@ function AccountCard({ acct, onModeChange, totalDeposited, onDepositSaved }) {
     ? 'shadow-[0_0_16px_rgba(16,185,129,0.08)]'
     : 'shadow-[0_0_16px_rgba(239,68,68,0.08)]'
 
-  const netPnl        = totalDeposited > 0 ? (acct.portfolio_value - totalDeposited) : null
-  const netPnlColor   = netPnl == null ? 'text-slate-400' : netPnl >= 0 ? 'text-emerald-400' : 'text-red-400'
-  const netPnlPct     = totalDeposited > 0 ? ((acct.portfolio_value / totalDeposited - 1) * 100) : null
+  const totalDeposited = acct.total_deposited ?? 0
+  const netPnl         = totalDeposited > 0 ? (acct.portfolio_value - totalDeposited) : null
+  const netPnlColor    = netPnl == null ? 'text-slate-400' : netPnl >= 0 ? 'text-emerald-400' : 'text-red-400'
+  const netPnlPct      = totalDeposited > 0 ? ((acct.portfolio_value / totalDeposited - 1) * 100) : null
 
   const [editing, setEditing]   = useState(false)
   const [inputVal, setInputVal] = useState('')
@@ -38,7 +39,7 @@ function AccountCard({ acct, onModeChange, totalDeposited, onDepositSaved }) {
     if (isNaN(amount) || amount < 0) { setEditing(false); return }
     setSaving(true)
     try {
-      await updateTotalDeposited(amount)
+      await updateTotalDeposited(amount, acct.deposit_key)
       onDepositSaved?.()
     } catch (e) { /* silent */ }
     setSaving(false)
@@ -210,7 +211,6 @@ export default function AccountSummary({ onModeChange, refetchInterval = 5000 })
   }
 
   const accounts        = (isPaper ? data?.paper : data?.live) ?? []
-  const totalDeposited  = data?.total_deposited ?? 0
   const lastSync        = dataUpdatedAt ? new Date(dataUpdatedAt).toLocaleTimeString() : null
   const qc              = useQueryClient()
   const liveStyle  = !isPaper
@@ -254,7 +254,6 @@ export default function AccountSummary({ onModeChange, refetchInterval = 5000 })
                 key={acct.name}
                 acct={acct}
                 onModeChange={acct.name === 'Main' ? onModeChange : null}
-                totalDeposited={acct.name === 'Main' ? totalDeposited : 0}
                 onDepositSaved={() => qc.invalidateQueries('accounts-overview')}
               />
             ))}

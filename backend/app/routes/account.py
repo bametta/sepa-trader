@@ -75,9 +75,14 @@ def _fetch_account_data(client, name: str, mode: str) -> dict | None:
                 logger.warning("_fetch_account_data(%s, %s): positions fallback failed: %s", name, mode, pos_exc)
                 total_pl = 0.0
 
+        # Build a stable deposit key: "paper_main", "live_main", "live_dual_momentum" etc.
+        slug = name.lower().replace(" ", "_")
+        deposit_key = f"total_deposited_{mode}_{slug}"
+
         return {
             "name":              name,
             "mode":              mode,
+            "deposit_key":       deposit_key,
             "portfolio_value":   _sf(acct.portfolio_value, 0.0),
             "cash":              _sf(acct.cash, 0.0),
             "buying_power":      _sf(acct.buying_power, 0.0),
@@ -125,8 +130,7 @@ def accounts_overview(
         "dual_momentum": "Dual Momentum",
     }
 
-    total_deposited = float(user_settings.get("total_deposited") or 0)
-    result = {"paper": [], "live": [], "total_deposited": total_deposited}
+    result = {"paper": [], "live": []}
 
     for mode in ("paper", "live"):
         # ── Main account ──────────────────────────────────────────────────────
@@ -134,6 +138,7 @@ def accounts_overview(
             main_client = _resolve_alpaca_client(user_settings, mode, is_admin)
             data = _fetch_account_data(main_client, "Main", mode)
             if data:
+                data["total_deposited"] = float(user_settings.get(data["deposit_key"]) or 0)
                 result[mode].append(data)
         except HTTPException:
             pass  # credentials not configured for this mode
@@ -162,6 +167,7 @@ def accounts_overview(
                 label  = STRATEGY_LABELS.get(strat_name, strat_name.replace("_", " ").title())
                 data   = _fetch_account_data(client, label, mode)
                 if data:
+                    data["total_deposited"] = float(user_settings.get(data["deposit_key"]) or 0)
                     result[mode].append(data)
             except Exception as exc:
                 logger.warning("accounts_overview: strategy %s [%s]: %s", strat_name, mode, exc)
@@ -198,11 +204,14 @@ def update_total_deposited(
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """Save the user's total deposited capital for net P&L calculation."""
+    """Save deposited capital for a specific account (keyed by deposit_key)."""
     from ..database import set_user_setting
-    amount = body.get("total_deposited")
+    amount      = body.get("total_deposited")
+    deposit_key = body.get("deposit_key", "total_deposited_paper_main")
     if amount is None or not isinstance(amount, (int, float)) or amount < 0:
-        from fastapi import HTTPException
         raise HTTPException(400, "total_deposited must be a non-negative number")
-    set_user_setting(db, "total_deposited", str(float(amount)), current_user["id"])
-    return {"total_deposited": float(amount)}
+    # Validate key format to prevent arbitrary setting writes
+    if not deposit_key.startswith("total_deposited_"):
+        raise HTTPException(400, "invalid deposit_key")
+    set_user_setting(db, deposit_key, str(float(amount)), current_user["id"])
+    return {"deposit_key": deposit_key, "total_deposited": float(amount)}
