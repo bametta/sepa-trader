@@ -52,7 +52,8 @@ export default function PositionCard({ pos }) {
     const s = parseFloat(stop), t = parseFloat(target)
     if (!s || !t || s <= 0 || t <= 0) { setExitMsg({ type: 'error', text: 'Enter valid stop and target prices.' }); return null }
     if (t <= s)                        { setExitMsg({ type: 'error', text: 'Target must be above stop.' }); return null }
-    if (s >= pos.entry_price)          { setExitMsg({ type: 'error', text: 'Stop must be below entry.' }); return null }
+    const livePrice = pos.current_price || pos.entry_price
+    if (s >= livePrice)                { setExitMsg({ type: 'error', text: 'Stop must be below current price.' }); return null }
     return { s, t }
   }
 
