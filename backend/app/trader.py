@@ -711,8 +711,16 @@ def _check_time_stops(
 
 # ── Exit guard ────────────────────────────────────────────────────────────────
 
-# Tolerance for considering stop/target "changed" — avoids churn on tiny rounding diffs
-_PRICE_CHANGE_THRESHOLD = 0.02   # $0.02
+# Minimum relative move before an OCO is cancelled and replaced.
+# Flat-dollar thresholds cause constant churn at 1-min intervals because
+# EMA20/EMA50 drift a few cents every tick.  0.5% means a $50 stop must
+# move at least $0.25 before we touch the bracket — eliminating noise
+# cancellations that were eating 10s timeouts per position per cycle.
+def _price_changed(current: float, plan: float) -> bool:
+    """Return True only when prices differ by > 0.5% — avoids OCO churn."""
+    if current is None or current <= 0 or plan <= 0:
+        return True
+    return abs(current - plan) / max(current, plan) > 0.005
 
 
 def _ensure_exit_orders(
@@ -955,8 +963,8 @@ def _ensure_exit_orders(
                 current_stop = stop
 
             target_ok = (current_target is not None
-                         and abs(current_target - target) <= _PRICE_CHANGE_THRESHOLD)
-            stop_ok   = abs(current_stop - stop) <= _PRICE_CHANGE_THRESHOLD
+                         and not _price_changed(current_target, target))
+            stop_ok   = not _price_changed(current_stop, stop)
             qty_ok    = (oco_qty == qty)
 
             if qty_ok and stop_ok and target_ok:
@@ -985,8 +993,8 @@ def _ensure_exit_orders(
             prices_match = (
                 current_stop is not None
                 and current_target is not None
-                and abs(current_stop - stop) <= _PRICE_CHANGE_THRESHOLD
-                and abs(current_target - target) <= _PRICE_CHANGE_THRESHOLD
+                and not _price_changed(current_stop, stop)
+                and not _price_changed(current_target, target)
             )
             if (has_stop_leg and has_limit_leg
                     and stop_qty == qty and limit_qty == qty
@@ -1000,7 +1008,7 @@ def _ensure_exit_orders(
         # pledged by a prior order — leaving the position with a target
         # leg and no stop. Cancelling first eliminates the race.
         cancelled = alp.cancel_symbol_exit_orders(sym, mode)
-        if cancelled and not alp.wait_for_orders_cancelled(sym, mode, timeout=10.0, poll_interval=0.4):
+        if cancelled and not alp.wait_for_orders_cancelled(sym, mode, timeout=10.0, poll_interval=0.5, order_ids=cancelled):
             logger.error(
                 "Exit guard: timed out cancelling %s sells — skipping placement [%s]",
                 sym, mode,

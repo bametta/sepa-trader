@@ -504,24 +504,57 @@ def wait_for_orders_cancelled(
     symbol: str,
     mode: str = "paper",
     timeout: float = 15.0,
-    poll_interval: float = 0.4,
+    poll_interval: float = 0.5,
+    order_ids: list | None = None,
 ) -> bool:
     """
-    Poll until no open sell orders remain for a symbol, or timeout elapses.
+    Poll until no active sell orders remain for a symbol, or timeout elapses.
     Returns True if orders are cleared, False if timeout hit.
-    Used after cancel_symbol_exit_orders() to ensure Alpaca has fully
-    processed the cancellation before placing a replacement OCO.
+
+    When order_ids is provided (the IDs returned by cancel_symbol_exit_orders),
+    each order is checked individually via get_order_by_id and considered
+    cleared once it reaches any terminal state — including pending_cancel.
+    This avoids the 10-second timeout that previously occurred because Alpaca
+    transitions cancelled orders through pending_cancel before fully removing
+    them from the open-order list, and pending_cancel orders were still being
+    counted as blocking the placement of the replacement OCO.
+
+    Falls back to scanning the open-order list when no IDs are provided.
     """
+    _TERMINAL = frozenset({
+        "cancelled", "pending_cancel", "expired",
+        "filled", "done_for_day", "stopped", "rejected",
+    })
+    client  = get_client(mode)
     elapsed = 0.0
+
     while elapsed < timeout:
-        open_orders   = get_open_orders_by_symbol(mode)
-        symbol_orders = open_orders.get(symbol, [])
-        sell_orders   = [
-            o for o in symbol_orders
-            if 'sell' in str(getattr(o, 'side', '') or '').lower()
-        ]
-        if not sell_orders:
-            return True
+        if order_ids:
+            # Fast path: check each cancelled order's current status directly.
+            # pending_cancel is safe to treat as done — order will never fill.
+            all_terminal = True
+            for oid in order_ids:
+                try:
+                    o      = client.get_order_by_id(oid)
+                    status = str(getattr(o, 'status', '') or '').lower()
+                    if status not in _TERMINAL:
+                        all_terminal = False
+                        break
+                except Exception:
+                    pass  # order not found → already gone
+            if all_terminal:
+                return True
+        else:
+            # Fallback: scan open sell orders for the symbol
+            open_orders   = get_open_orders_by_symbol(mode)
+            symbol_orders = open_orders.get(symbol, [])
+            sell_orders   = [
+                o for o in symbol_orders
+                if 'sell' in str(getattr(o, 'side', '') or '').lower()
+            ]
+            if not sell_orders:
+                return True
+
         time.sleep(poll_interval)
         elapsed += poll_interval
 
@@ -549,7 +582,7 @@ def replace_oca_exit(
     """
     cancelled = cancel_symbol_exit_orders(symbol, mode)
     if cancelled:
-        cleared = wait_for_orders_cancelled(symbol, mode, timeout=6.0, poll_interval=0.4)
+        cleared = wait_for_orders_cancelled(symbol, mode, timeout=6.0, poll_interval=0.5, order_ids=cancelled)
         if not cleared:
             logger.warning(
                 "replace_oca_exit: proceeding despite timeout — "
