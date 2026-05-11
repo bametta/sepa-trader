@@ -465,7 +465,8 @@ def _adjust_trailing_stops(
                     SET stop_price = :stop
                     WHERE symbol = :sym AND mode = :mode
                       AND week_start = (
-                          SELECT MAX(week_start) FROM weekly_plan WHERE mode = :mode
+                          SELECT MAX(week_start) FROM weekly_plan
+                          WHERE symbol = :sym AND mode = :mode
                       )
                 """),
                 {"stop": new_stop, "sym": sym, "mode": mode},
@@ -586,8 +587,11 @@ def _check_t1_partial_exit(
                         stop_price    = :be,
                         target1       = :t2
                     WHERE symbol = :sym AND mode = :mode
+                      AND status = 'EXECUTED'
                       AND week_start = (
-                          SELECT MAX(week_start) FROM weekly_plan WHERE mode = :mode
+                          SELECT MAX(week_start) FROM weekly_plan
+                          WHERE symbol = :sym AND mode = :mode
+                            AND status = 'EXECUTED'
                       )
                 """),
                 {"orig": orig_stop, "be": be_stop, "t2": exit_tgt,
@@ -833,41 +837,74 @@ def _ensure_exit_orders(
         except Exception:
             t1_taken = False
 
-        # ── Re-analyze and synthesize a fresh plan ────────────────────────
-        # Always re-derive from current price action when placing a fresh OCO,
-        # UNLESS T1 has been taken (BE stop must be preserved).
+        # ── Refresh exits from current price action ───────────────────────
+        # Screener plans are generated Thu/Fri. By the time an OCO needs to be
+        # placed (Monday open, mid-week after a close, etc.) the stock may have
+        # moved and EMA levels shifted.  Strategy:
         #
-        # Why: screener plans are generated Thursday/Friday. By Monday open,
-        # a pre-market runner may have moved 5%+ and the stale stop/target
-        # would place a premature or mis-sized OCO.
-        #
-        # Guardrail: only move the stop HIGHER — never back off a trailing
-        # stop that has already ratcheted above the fresh structural level.
+        #   Plan EXISTS  → _compute_fresh_exits (no DB write), UPDATE if changed.
+        #                  Ratchet guard: stop only moves higher, never back off.
+        #                  Entry floor: if position >3% above entry, stop ≥ entry.
+        #   No plan      → _derive_fresh_plan (INSERT new row).
+        #   t1_taken     → skip entirely; breakeven stop must be preserved.
         if not t1_taken:
             entry_price   = float(getattr(pos, "avg_entry_price", 0) or 0)
             current_price = float(getattr(pos, "current_price", 0) or entry_price)
             if entry_price <= 0 and current_price <= 0:
                 logger.warning("Exit guard: %s no anchor price — cannot derive plan [%s]", sym, mode)
                 continue
-            fresh_stop, fresh_target = _derive_fresh_plan(
-                db, sym, mode, entry_price, current_price, user_id=user_id
-            )
-            if fresh_stop > 0 and fresh_target > 0:
-                # Ratchet only — never back off a stop that's already higher
-                new_stop = max(fresh_stop, stop) if stop > 0 else fresh_stop
-                if new_stop != stop or fresh_target != target:
-                    logger.info(
-                        "Exit guard: %s refreshed exits — stop $%.2f→$%.2f target $%.2f→$%.2f [%s]",
-                        sym, stop, new_stop, target, fresh_target, mode,
-                    )
-                stop, target = new_stop, fresh_target
-            elif stop <= 0 or target <= 0:
-                # No fresh plan AND no existing plan — cannot place OCO
-                logger.warning(
-                    "Exit guard: %s plan derivation returned invalid prices "
-                    "(stop=%.2f target=%.2f) — skipping [%s]", sym, fresh_stop, fresh_target, mode,
+
+            if stop > 0 and target > 0:
+                # Plan exists — refresh without inserting a new DB row.
+                fresh_stop, fresh_target, _basis = _compute_fresh_exits(db, sym, current_price)
+                if fresh_stop > 0 and fresh_target > 0:
+                    # Entry-price floor: position >3% in profit → stop ≥ purchase price
+                    if entry_price > 0 and current_price > entry_price * 1.03:
+                        if fresh_stop < entry_price:
+                            fresh_stop = round(entry_price, 2)
+                            try:
+                                _rr = float(get_setting(db, "default_rr", "2.5") or "2.5")
+                            except (TypeError, ValueError):
+                                _rr = 2.5
+                            fresh_target = round(current_price + (current_price - fresh_stop) * _rr, 2)
+                    # Ratchet: never back off a stop that already moved higher
+                    new_stop = max(fresh_stop, stop)
+                    if new_stop != stop or abs(fresh_target - target) > 0.01:
+                        logger.info(
+                            "Exit guard: %s refreshed exits — stop $%.2f→$%.2f "
+                            "target $%.2f→$%.2f [%s]",
+                            sym, stop, new_stop, target, fresh_target, mode,
+                        )
+                        try:
+                            db.execute(
+                                text("""
+                                    UPDATE weekly_plan
+                                    SET stop_price = :s, target1 = :t
+                                    WHERE symbol = :sym AND mode = :mode
+                                      AND week_start = (
+                                          SELECT MAX(week_start) FROM weekly_plan
+                                          WHERE symbol = :sym AND mode = :mode
+                                      )
+                                """),
+                                {"s": new_stop, "t": fresh_target, "sym": sym, "mode": mode},
+                            )
+                            db.commit()
+                        except Exception as _ue:
+                            logger.warning(
+                                "Exit guard: could not persist refreshed exits for %s: %s", sym, _ue
+                            )
+                    stop, target = new_stop, fresh_target
+            else:
+                # No plan at all — derive from scratch and INSERT a new row
+                stop, target = _derive_fresh_plan(
+                    db, sym, mode, entry_price, current_price, user_id=user_id
                 )
-                continue
+                if stop <= 0 or target <= 0:
+                    logger.warning(
+                        "Exit guard: %s plan derivation returned invalid prices "
+                        "(stop=%.2f target=%.2f) — skipping [%s]", sym, stop, target, mode,
+                    )
+                    continue
 
         # ── Inspect current coverage ─────────────────────────────────────
         # Alpaca's status=open only returns the "new" (working) leg of an OCO.

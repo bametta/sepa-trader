@@ -308,11 +308,25 @@ def _place_entry(
             if live_price and live_price >= entry:
                 logger.warning(
                     "_place_entry %s: current price $%.2f already past stop entry $%.2f "
-                    "— stop-limit would be rejected; falling back to limit buy at $%.2f [%s]",
+                    "— stop-limit would be rejected; falling back to limit bracket at $%.2f [%s]",
                     sym, live_price, entry, limit_px, mode,
                 )
-                alp.place_limit_buy(sym, qty, limit_px, mode)
-                return f"limit buy [stop already passed] (lim=${limit_px:.2f})"
+                # Use limit bracket (not plain limit buy) so stop + target are
+                # attached immediately — position is never left naked.
+                if has_exits:
+                    try:
+                        alp.place_limit_bracket_buy(sym, qty, entry, stop, target, slippage_pct, mode)
+                        return f"limit bracket [stop-limit passed] (lim=${limit_px:.2f} stop=${stop:.2f} tgt=${target:.2f})"
+                    except Exception as _lb_exc:
+                        logger.error(
+                            "_place_entry %s: limit bracket fallback failed (%s) — market bracket last resort [%s]",
+                            sym, _lb_exc, mode,
+                        )
+                        alp.place_bracket_buy(sym, qty, stop, target, mode)
+                        return f"market bracket [stop-limit→bracket fallback] (stop=${stop:.2f} tgt=${target:.2f})"
+                else:
+                    alp.place_limit_buy(sym, qty, limit_px, mode)
+                    return f"limit buy [stop already passed, no exits defined] (lim=${limit_px:.2f})"
         except Exception as exc:
             logger.debug("_place_entry %s: price pre-check failed (%s) — proceeding with stop-limit", sym, exc)
 
