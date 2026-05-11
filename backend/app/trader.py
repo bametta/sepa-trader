@@ -72,12 +72,13 @@ def _effective_max_positions(db: Session, mode: str) -> int:
     return configured
 
 
-def _get_weekly_plan_exits(db: Session, symbol: str, mode: str) -> tuple[float, float]:
-    """Return (stop_price, target) — most recent plan row for this symbol+mode.
-    Single-OCO model: target2 column still exists in DB but is no longer read."""
+def _get_weekly_plan_exits(db: Session, symbol: str, mode: str) -> tuple[float, float, float]:
+    """Return (stop_price, target1, target2) — most recent EXECUTED plan row.
+    target2 is used as the OCO target when t1 hasn't been taken yet, so the
+    software-managed T1 partial exit can fire before Alpaca's OCO does."""
     row = db.execute(
         text("""
-            SELECT stop_price, target1
+            SELECT stop_price, target1, target2
             FROM weekly_plan
             WHERE symbol = :sym
               AND mode = :mode
@@ -88,8 +89,8 @@ def _get_weekly_plan_exits(db: Session, symbol: str, mode: str) -> tuple[float, 
         {"sym": symbol, "mode": mode},
     ).fetchone()
     if not row:
-        return 0.0, 0.0
-    return float(row[0] or 0), float(row[1] or 0)
+        return 0.0, 0.0, 0.0
+    return float(row[0] or 0), float(row[1] or 0), float(row[2] or 0)
 
 
 def _compute_fresh_exits(db: Session, symbol: str, current_price: float) -> tuple[float, float, str]:
@@ -807,7 +808,7 @@ def _ensure_exit_orders(
             )
             continue
 
-        stop, target = _get_weekly_plan_exits(db, sym, mode)
+        stop, t1, t2 = _get_weekly_plan_exits(db, sym, mode)
         sym_orders = open_orders_by_symbol.get(sym, [])
 
         # ── Position-size mismatch alert ─────────────────────────────────
@@ -877,7 +878,7 @@ def _ensure_exit_orders(
             t1_taken = False
 
         # ── Derive exits only when the plan is missing ───────────────────
-        # When a plan already exists (stop > 0, target > 0), trust the DB
+        # When a plan already exists (stop > 0, t1 > 0), trust the DB
         # values — they are maintained by _adjust_trailing_stops (trailing
         # ratchet) and run_monday_open (fresh open prices).
         #
@@ -888,21 +889,41 @@ def _ensure_exit_orders(
         # Fresh exits are only derived here when there is genuinely NO plan
         # (e.g. position entered manually, or outside the screener flow).
         # t1_taken positions are always skipped — BE stop must be preserved.
-        if not t1_taken and (stop <= 0 or target <= 0):
+        if not t1_taken and (stop <= 0 or t1 <= 0):
             entry_price   = float(getattr(pos, "avg_entry_price", 0) or 0)
             current_price = float(getattr(pos, "current_price", 0) or entry_price)
             if entry_price <= 0 and current_price <= 0:
                 logger.warning("Exit guard: %s no anchor price — cannot derive plan [%s]", sym, mode)
                 continue
-            stop, target = _derive_fresh_plan(
+            stop, t1 = _derive_fresh_plan(
                 db, sym, mode, entry_price, current_price, user_id=user_id
             )
-            if stop <= 0 or target <= 0:
+            t2 = 0.0   # no T2 on freshly derived plans
+            if stop <= 0 or t1 <= 0:
                 logger.warning(
                     "Exit guard: %s plan derivation returned invalid prices "
-                    "(stop=%.2f target=%.2f) — skipping [%s]", sym, stop, target, mode,
+                    "(stop=%.2f t1=%.2f) — skipping [%s]", sym, stop, t1, mode,
                 )
                 continue
+
+        # ── Resolve the OCO target price ─────────────────────────────────
+        # Key design decision: the OCO bracket targets T2 (not T1) so that
+        # the software-managed T1 partial exit can fire via the monitor cycle
+        # before Alpaca's OCO does. T1 is detected by price comparison each
+        # cycle; the OCO only fires if price blows through T1 all the way to
+        # T2 without the monitor catching it — in that case a full exit at T2
+        # is still a profitable outcome.
+        #
+        # After t1 is taken, the remaining half runs with stop=BE and the
+        # OCO target reverts to t1 (now repurposed as "remaining target").
+        if t1_taken:
+            # t1 column was overwritten with t2 value after the partial exit
+            oco_target = t1
+        elif t2 > 0:
+            oco_target = t2
+        else:
+            # No T2 set — fall back to T1 (old behaviour, no partial exit)
+            oco_target = t1
 
         # ── Inspect current coverage ─────────────────────────────────────
         # Alpaca's status=open only returns the "new" (working) leg of an OCO.
@@ -949,7 +970,7 @@ def _ensure_exit_orders(
                 current_stop = stop
 
             target_ok = (current_target is not None
-                         and not _price_changed(current_target, target))
+                         and not _price_changed(current_target, oco_target))
             stop_ok   = not _price_changed(current_stop, stop)
             qty_ok    = (oco_qty == qty)
 
@@ -980,7 +1001,7 @@ def _ensure_exit_orders(
                 current_stop is not None
                 and current_target is not None
                 and not _price_changed(current_stop, stop)
-                and not _price_changed(current_target, target)
+                and not _price_changed(current_target, oco_target)
             )
             if (has_stop_leg and has_limit_leg
                     and stop_qty == qty and limit_qty == qty
@@ -1017,10 +1038,10 @@ def _ensure_exit_orders(
                 )
 
         try:
-            parent = alp.place_oca_exit(sym, qty, stop, target, mode)
+            parent = alp.place_oca_exit(sym, qty, stop, oco_target, mode)
             logger.info(
-                "Exit guard: placed OCO for %s qty=%d stop=$%.2f target=$%.2f [%s]",
-                sym, qty, stop, target, mode,
+                "Exit guard: placed OCO for %s qty=%d stop=$%.2f target=$%.2f [%s] (T1=$%.2f)",
+                sym, qty, stop, oco_target, mode, t1,
             )
 
             # Verify the parent order's legs directly — Alpaca's OCO holds
@@ -1643,7 +1664,7 @@ async def run_monitor(db: Session, user_id: int | None = None, mode: str | None 
 
                 if signal == "BREAKOUT" and result.get("price"):
                     price               = result["price"]
-                    stop, target = _get_weekly_plan_exits(db, sym, mode)
+                    stop, _t1, _t2 = _get_weekly_plan_exits(db, sym, mode)
                     qty                 = _size_position(portfolio, price, risk_pct, stop_pct, stop_price=stop)
 
                     # Apply min_cash_pct buffer — risk-based sizing alone doesn't
