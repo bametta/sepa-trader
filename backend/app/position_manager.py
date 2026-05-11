@@ -231,6 +231,7 @@ def _place_entry(
     screener_type: str = "minervini",
     target2: float = 0.0,  # kept for caller compat — ignored (single-OCO model)
     user_id: int | None = None,
+    committed: float = 0.0,  # dollars already earmarked by earlier orders this cycle
 ) -> str:
     """
     Submit the entry buy using the user-configured order type.
@@ -257,17 +258,26 @@ def _place_entry(
     # cycle) can push the actual debit above settled cash and quietly draw
     # margin. Refetch cash now and abort if worst-case cost exceeds it.
     # Limit/stop-limit: worst case is the limit cap. Market: assume +1% slip.
+    #
+    # CRITICAL: stop-limit orders do NOT reduce acct.cash until triggered.
+    # Without `committed`, every order in the same cycle sees the full cash
+    # balance and passes the guard — all orders fill simultaneously at open
+    # and the account is drawn into margin. The caller must pass the running
+    # dollar total of orders already submitted this cycle so we can subtract
+    # it from live_cash before comparing.
     try:
         slip = max(slippage_pct, 1.0) if order_type == "market" else slippage_pct
         worst_px   = entry * (1 + slip / 100)
         worst_cost = qty * worst_px
         live_acct  = alp.get_account_for_user(db, user_id or _resolve_admin_uid(db), mode)
         live_cash  = float(getattr(live_acct, "cash", 0) or 0)
-        if worst_cost > live_cash:
+        available_cash = live_cash - committed   # subtract already-earmarked funds
+        if worst_cost > available_cash:
             msg = (
                 f"pre-submit cash guard: worst-case ${worst_cost:.2f} "
-                f"> settled cash ${live_cash:.2f} — refusing to submit "
-                f"(would draw margin)"
+                f"> available cash ${available_cash:.2f} "
+                f"(settled=${live_cash:.2f} committed=${committed:.2f}) "
+                f"— refusing to submit (would draw margin)"
             )
             logger.warning("_place_entry %s [%s]: %s", sym, mode, msg)
             raise RuntimeError(msg)
@@ -691,7 +701,7 @@ def run_monday_open(db: Session, mode: str | None = None):
             continue
 
         try:
-            order_desc   = _place_entry(db, sym, qty, entry, stop, target, "MONDAY_OPEN", mode, stype, target2=target2, user_id=admin_uid)
+            order_desc   = _place_entry(db, sym, qty, entry, stop, target, "MONDAY_OPEN", mode, stype, target2=target2, user_id=admin_uid, committed=committed)
             order_placed = True
             logger.info("Monday open: %s qty=%.0f — %s", sym, qty, order_desc)
 
@@ -1510,7 +1520,7 @@ def fill_open_slots(
 
         order_placed = False
         try:
-            order_desc = _place_entry(db, sym, qty, price, stop, target, f"FILL_{signal}", mode, stype, target2=target2, user_id=user_id)
+            order_desc = _place_entry(db, sym, qty, price, stop, target, f"FILL_{signal}", mode, stype, target2=target2, user_id=user_id, committed=committed)
             order_placed = True
             logger.info(
                 "fill_open_slots [%s]: opened %s qty=%.0f signal=%s — %s",
