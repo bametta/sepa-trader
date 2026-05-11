@@ -81,6 +81,7 @@ def _get_weekly_plan_exits(db: Session, symbol: str, mode: str) -> tuple[float, 
             FROM weekly_plan
             WHERE symbol = :sym
               AND mode = :mode
+              AND status = 'EXECUTED'
             ORDER BY week_start DESC
             LIMIT 1
         """),
@@ -374,6 +375,7 @@ def _get_plan_stop_for_trailing(
             SELECT stop_price, target1, original_stop, t1_taken
             FROM weekly_plan
             WHERE symbol = :sym AND mode = :mode
+              AND status = 'EXECUTED'
             ORDER BY week_start DESC LIMIT 1
         """),
         {"sym": symbol, "mode": mode},
@@ -527,6 +529,7 @@ def _check_t1_partial_exit(
                     SELECT target1, target2, entry_price, stop_price, t1_taken
                     FROM weekly_plan
                     WHERE symbol = :sym AND mode = :mode
+                      AND status = 'EXECUTED'
                     ORDER BY week_start DESC LIMIT 1
                 """),
                 {"sym": sym, "mode": mode},
@@ -829,6 +832,7 @@ def _ensure_exit_orders(
                 text("""
                     SELECT t1_taken FROM weekly_plan
                     WHERE symbol = :sym AND mode = :mode
+                      AND status = 'EXECUTED'
                     ORDER BY week_start DESC LIMIT 1
                 """),
                 {"sym": sym, "mode": mode},
