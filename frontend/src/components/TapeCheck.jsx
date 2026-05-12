@@ -7,7 +7,7 @@
  */
 import { useState } from 'react'
 import { useQuery, useQueryClient } from 'react-query'
-import { fetchTapeCheck, refreshTapeCheck } from '../api/client'
+import { fetchTapeCheck, refreshTapeCheck, fetchSettings, updateSetting } from '../api/client'
 
 const CONDITION_META = {
   favorable:   { label: 'Favorable',   icon: '✓', bg: 'bg-emerald-500/10 border-emerald-500/30', badge: 'bg-emerald-500/20 text-emerald-300', dot: 'bg-emerald-400' },
@@ -28,14 +28,18 @@ function SignalRow({ label, value, sub }) {
 }
 
 export default function TapeCheck({ compact = false }) {
-  const qc                    = useQueryClient()
+  const qc                      = useQueryClient()
   const [expanded, setExpanded] = useState(false)
   const [refreshing, setRefreshing] = useState(false)
+  const [toggling, setToggling] = useState(false)
 
   const { data, isLoading, isError } = useQuery('tapeCheck', fetchTapeCheck, {
-    staleTime: 5 * 60 * 1000,   // 5 min client-side freshness
+    staleTime: 5 * 60 * 1000,
     retry: 1,
   })
+
+  const { data: settings } = useQuery('settings', fetchSettings, { staleTime: 10000 })
+  const blocked = settings?.block_new_entries === 'true'
 
   async function handleRefresh() {
     setRefreshing(true)
@@ -44,6 +48,16 @@ export default function TapeCheck({ compact = false }) {
       qc.invalidateQueries('tapeCheck')
     } finally {
       setRefreshing(false)
+    }
+  }
+
+  async function toggleBlock() {
+    setToggling(true)
+    try {
+      await updateSetting('block_new_entries', blocked ? 'false' : 'true')
+      qc.invalidateQueries('settings')
+    } finally {
+      setToggling(false)
     }
   }
 
@@ -93,6 +107,22 @@ export default function TapeCheck({ compact = false }) {
           {data.cached && (
             <span className="text-xs text-slate-600">cached</span>
           )}
+
+          {/* Manual kill-switch */}
+          <button
+            onClick={toggleBlock}
+            disabled={toggling}
+            title={blocked ? 'New entries blocked — click to re-enable' : 'Block all new entries'}
+            className={`flex items-center gap-1.5 text-xs px-2 py-0.5 rounded-md border transition-all disabled:opacity-50 ${
+              blocked
+                ? 'bg-red-500/20 border-red-500/40 text-red-300 font-semibold'
+                : 'bg-white/[0.04] border-white/10 text-slate-500 hover:text-slate-300 hover:border-white/20'
+            }`}
+          >
+            <span className={`w-1.5 h-1.5 rounded-full ${blocked ? 'bg-red-400 animate-pulse' : 'bg-slate-600'}`} />
+            {toggling ? '…' : blocked ? 'Entries Blocked' : 'Block Entries'}
+          </button>
+
           <button
             onClick={handleRefresh}
             disabled={refreshing}

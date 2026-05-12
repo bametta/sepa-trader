@@ -81,6 +81,7 @@ EDITABLE_KEYS = {
     "time_stop_max_gain_pct",   # close if unrealized < this % after N days
     "min_position_dollars",     # minimum notional for sub-economic order guard
     "entry_max_deviation_pct",  # max % drift from plan entry before skipping buy
+    "block_new_entries",        # manual kill-switch: "true" blocks all new buys
 }
 
 
