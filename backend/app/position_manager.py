@@ -129,6 +129,26 @@ def _gate(
     except Exception as _cb_exc:
         logger.debug("Pre-trade gate: circuit-breaker check failed (%s) — proceeding", _cb_exc)
 
+    # ── Hard tape block: unfavorable market = no new entries ─────────────
+    # When the broad market is in an unfavorable condition (crashing tape,
+    # elevated VIX, poor breadth) we stop all new buys immediately.
+    # This prevents the system from redeploying cash from stop-outs right
+    # back into more falling stocks on a red-tape day.
+    # Fails open (missing cache = no block) so a stale/missing tape reading
+    # never prevents legitimate entries on a normal day.
+    try:
+        from .trader import _get_tape_context
+        effective_uid = user_id or _resolve_admin_uid(db)
+        tape = _get_tape_context(db, effective_uid)
+        if tape and tape.get("condition", "").lower() == "unfavorable":
+            logger.warning(
+                "Pre-trade gate: tape=UNFAVORABLE — hard blocking %s [%s] "
+                "(no new entries on crash days)", symbol, mode,
+            )
+            return False
+    except Exception as _tape_exc:
+        logger.debug("Pre-trade gate: tape hard-block check failed (%s) — proceeding", _tape_exc)
+
     try:
         from .claude_analyst import pre_trade_analysis, log_pre_trade, get_stored_weekly_plan_analysis
         from .trader import _get_tape_context

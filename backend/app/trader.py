@@ -1207,6 +1207,29 @@ def _gate(
     user_id: int = None,
 ) -> bool:
     """Pre-trade AI gate. Returns True if order should proceed. Fails closed."""
+    # ── Hard tape block: unfavorable market = no new entries ─────────────
+    try:
+        if user_id is None:
+            try:
+                row = db.execute(text("SELECT id FROM users WHERE role='admin' ORDER BY id LIMIT 1")).fetchone()
+                if row:
+                    _uid_for_tape = row[0]
+                else:
+                    _uid_for_tape = None
+            except Exception:
+                _uid_for_tape = None
+        else:
+            _uid_for_tape = user_id
+        tape = _get_tape_context(db, _uid_for_tape)
+        if tape and tape.get("condition", "").lower() == "unfavorable":
+            logger.warning(
+                "Pre-trade gate: tape=UNFAVORABLE — hard blocking %s [%s] "
+                "(no new entries on crash days)", symbol, mode,
+            )
+            return False
+    except Exception as _tape_exc:
+        logger.debug("Pre-trade gate: tape hard-block check failed (%s) — proceeding", _tape_exc)
+
     try:
         from .claude_analyst import pre_trade_analysis, log_pre_trade, get_stored_weekly_plan_analysis
         # Internal callers (Monday open, slot refill, post-close, TV) don't
