@@ -117,14 +117,16 @@ def _gate(
     """
     # ── Manual kill-switch: block_new_entries ────────────────────────────
     try:
-        if (get_setting(db, "block_new_entries", "false") or "false").lower() == "true":
+        from .database import get_user_setting
+        _uid = user_id or _resolve_admin_uid(db)
+        if (get_user_setting(db, "block_new_entries", "false", user_id=_uid) or "false").lower() == "true":
             logger.warning(
                 "Pre-trade gate: block_new_entries=true — hard blocking %s [%s]",
                 symbol, mode,
             )
             return False
     except Exception as _bne_exc:
-        logger.debug("Pre-trade gate: block_new_entries check failed (%s) — proceeding", _bne_exc)
+        logger.warning("Pre-trade gate: block_new_entries check failed (%s) — proceeding", _bne_exc)
 
     # ── Apex Pillar 5: daily drawdown circuit breaker ─────────────────────
     try:

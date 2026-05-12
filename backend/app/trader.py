@@ -1209,14 +1209,22 @@ def _gate(
     """Pre-trade AI gate. Returns True if order should proceed. Fails closed."""
     # ── Manual kill-switch: block_new_entries ────────────────────────────
     try:
-        if (get_setting(db, "block_new_entries", "false") or "false").lower() == "true":
+        from .database import get_user_setting
+        _uid_bne = user_id
+        if _uid_bne is None:
+            try:
+                _r = db.execute(text("SELECT id FROM users WHERE role='admin' ORDER BY id LIMIT 1")).fetchone()
+                _uid_bne = _r[0] if _r else None
+            except Exception:
+                pass
+        if (get_user_setting(db, "block_new_entries", "false", user_id=_uid_bne) or "false").lower() == "true":
             logger.warning(
                 "Pre-trade gate: block_new_entries=true — hard blocking %s [%s]",
                 symbol, mode,
             )
             return False
     except Exception as _bne_exc:
-        logger.debug("Pre-trade gate: block_new_entries check failed (%s) — proceeding", _bne_exc)
+        logger.warning("Pre-trade gate: block_new_entries check failed (%s) — proceeding", _bne_exc)
 
     # ── Hard tape block: unfavorable market = no new entries ─────────────
     try:
