@@ -907,6 +907,42 @@ def _ensure_exit_orders(
                 )
                 continue
 
+        # ── Backfill T2 when plan predates the T2 feature ────────────────
+        # Positions entered before T2 was added to the screener/plan have
+        # target2 = NULL.  Derive it now as 1.5× the T1 distance from entry
+        # and persist it so this only runs once per position.
+        if not t1_taken and t2 <= 0 and stop > 0 and t1 > 0:
+            entry_px = float(getattr(pos, "avg_entry_price", 0) or 0)
+            if entry_px > 0:
+                t1_dist = t1 - entry_px
+                if t1_dist > 0:
+                    t2 = round(entry_px + t1_dist * 1.5, 2)
+                    try:
+                        db.execute(
+                            text("""
+                                UPDATE weekly_plan
+                                SET target2 = :t2
+                                WHERE symbol = :sym AND mode = :mode
+                                  AND status = 'EXECUTED'
+                                  AND (target2 IS NULL OR target2 = 0)
+                                  AND week_start = (
+                                      SELECT MAX(week_start) FROM weekly_plan
+                                      WHERE symbol = :sym AND mode = :mode
+                                        AND status = 'EXECUTED'
+                                  )
+                            """),
+                            {"t2": t2, "sym": sym, "mode": mode},
+                        )
+                        db.commit()
+                        logger.info(
+                            "Exit guard: %s backfilled T2=$%.2f (1.5× T1 dist from entry $%.2f) [%s]",
+                            sym, t2, entry_px, mode,
+                        )
+                    except Exception as _bf_exc:
+                        logger.warning(
+                            "Exit guard: %s T2 backfill failed: %s [%s]", sym, _bf_exc, mode
+                        )
+
         # ── Resolve the OCO target price ─────────────────────────────────
         # Key design decision: the OCO bracket targets T2 (not T1) so that
         # the software-managed T1 partial exit can fire via the monitor cycle
