@@ -1072,15 +1072,60 @@ def _ensure_exit_orders(
         except Exception as exc:
             exc_str = str(exc)
             # Pledged-qty race (40310000): the cancelled OCO's held leg hasn't
-            # fully released its qty reservation yet.  The OLD OCO is still
-            # active so the position remains protected — this is not a naked
-            # position.  Log and let the next cycle retry.
+            # fully released its qty reservation yet.
+            #
+            # IMPORTANT: the cancel DID go through — the old OCO is GONE.
+            # "position protected, retrying next cycle" is WRONG here because
+            # we could be naked for up to 30 minutes. Instead: wait 3s for the
+            # reservation to clear, then retry placement once. If the retry also
+            # fails, place a stop-market as emergency protection.
             if "40310000" in exc_str or "insufficient qty" in exc_str.lower():
                 logger.warning(
-                    "Exit guard: %s OCO blocked — old OCO still settling "
-                    "(position protected, retrying next cycle) [%s]",
+                    "Exit guard: %s OCO blocked (40310000 qty race) — waiting 3s and retrying [%s]",
                     sym, mode,
                 )
+                import time as _t; _t.sleep(3.0)
+                try:
+                    parent = alp.place_oca_exit(sym, qty, stop, oco_target, mode)
+                    logger.info(
+                        "Exit guard: %s OCO retry succeeded — qty=%d stop=$%.2f target=$%.2f [%s]",
+                        sym, qty, stop, oco_target, mode,
+                    )
+                except Exception as retry_exc:
+                    # Retry also failed — place stop-market as emergency protection
+                    logger.error(
+                        "Exit guard: %s OCO retry failed (%s) — placing emergency stop-market [%s]",
+                        sym, retry_exc, mode,
+                    )
+                    try:
+                        alp.place_stop_loss_sell(sym, qty, stop, mode)
+                        logger.info(
+                            "Exit guard: %s emergency stop-market placed at $%.2f [%s]",
+                            sym, stop, mode,
+                        )
+                        try:
+                            tg.alert_system_error_sync(
+                                f"⚠️ OCO RETRY FAILED [{mode}] {sym}\n"
+                                f"OCO qty race persisted after retry. Emergency stop-market "
+                                f"placed at ${stop:.2f}. OCO will be set on next cycle.",
+                                retry_exc,
+                            )
+                        except Exception:
+                            pass
+                    except Exception as stop_exc:
+                        logger.error(
+                            "Exit guard: %s emergency stop-market also failed: %s [%s]",
+                            sym, stop_exc, mode,
+                        )
+                        try:
+                            tg.alert_system_error_sync(
+                                f"🚨 NAKED POSITION [{mode}] {sym}\n"
+                                f"OCO + emergency stop both failed after 40310000 race.\n"
+                                f"Position is UNPROTECTED. Intervene manually.",
+                                stop_exc,
+                            )
+                        except Exception:
+                            pass
                 continue
             # PDT (pattern day trading) protection blocks OCO orders — and even
             # plain stop orders — placed the same day as a buy in margin accounts
