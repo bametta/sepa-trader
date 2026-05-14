@@ -141,6 +141,59 @@ async def _monitor_watchdog():
     )
 
 
+async def _premarket_exit_refresh():
+    """
+    Fires at 9:28 ET Mon–Fri.
+    Refreshes all OCO exit orders for both paper and live before the market
+    opens. This ensures OCO targets reflect the current plan (T2, not T1)
+    so the software-managed T1 partial exit can work correctly on the open.
+    Without this, an OCO placed before the T2-targeting code change fires at
+    T1 price the instant the market opens — selling the full position before
+    the first monitor cycle has a chance to replace it.
+    """
+    db = SessionLocal()
+    try:
+        admin_row = db.execute(
+            text("SELECT id FROM users WHERE role = 'admin' ORDER BY id LIMIT 1")
+        ).fetchone()
+        if not admin_row:
+            return
+        admin_uid = admin_row[0]
+    finally:
+        db.close()
+
+    for mode in ("paper", "live"):
+        db = SessionLocal()
+        try:
+            from . import alpaca_client as alp
+            from .trader import _ensure_exit_orders
+            from .database import get_all_user_settings as _gaus
+
+            merged = _gaus(db, admin_uid)
+            # Only refresh if auto_execute is on for this mode
+            auto_key = "live_auto_execute" if mode == "live" else "paper_auto_execute"
+            if merged.get(auto_key, "true") != "true":
+                continue
+
+            positions    = alp.get_positions_for_user(db, admin_uid, mode)
+            open_orders  = alp.get_open_orders_by_symbol_for_user(db, admin_uid, mode)
+
+            if not positions:
+                continue
+
+            logger.info(
+                "Pre-market OCO refresh [%s]: checking %d position(s)",
+                mode, len(positions),
+            )
+            _ensure_exit_orders(db, positions, open_orders, mode, user_id=admin_uid)
+            logger.info("Pre-market OCO refresh [%s]: done", mode)
+
+        except Exception as exc:
+            logger.error("Pre-market OCO refresh [%s] failed: %s", mode, exc)
+        finally:
+            db.close()
+
+
 async def _monday_open_job():
     """
     Fires once on Monday at 9:35 ET.
@@ -780,6 +833,16 @@ def start_scheduler():
         _monitor_watchdog,
         CronTrigger(minute="*"),
         id="sepa_monitor",
+        replace_existing=True,
+    )
+
+    # Mon–Fri 9:28 AM ET — refresh all OCO exit orders before the market opens.
+    # Ensures OCO targets reflect the current plan (T2, not T1) so the
+    # software-managed T1 partial exit works correctly from the first tick.
+    scheduler.add_job(
+        _premarket_exit_refresh,
+        CronTrigger(day_of_week="mon-fri", hour=9, minute=28, timezone="America/New_York"),
+        id="premarket_exit_refresh",
         replace_existing=True,
     )
 
