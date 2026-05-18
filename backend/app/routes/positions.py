@@ -35,6 +35,7 @@ def _resolve_alpaca_client(user_settings: dict, mode: str, is_admin: bool = Fals
 
 @router.get("")
 def positions(current_user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
+    from datetime import datetime, timezone
     user_settings = get_all_user_settings(db, current_user["id"])
     mode   = user_settings.get("trading_mode", "paper")
     client = _resolve_alpaca_client(user_settings, mode, is_admin=current_user["role"] == "admin")
@@ -68,6 +69,39 @@ def positions(current_user: dict = Depends(get_current_user), db: Session = Depe
         for r in plan_rows
     }
 
+    # Batch-fetch the most recent BUY timestamp for each held symbol so we
+    # can show "days held" without a per-position query.
+    buy_rows = db.execute(
+        text("""
+            SELECT DISTINCT ON (symbol)
+                symbol, created_at
+            FROM trade_log
+            WHERE symbol = ANY(:syms)
+              AND mode   = :mode
+              AND action = 'BUY'
+            ORDER BY symbol, created_at DESC
+        """),
+        {"syms": symbols, "mode": mode},
+    ).fetchall()
+
+    now_utc = datetime.now(timezone.utc)
+    buy_map: dict[str, int] = {}
+    for sym, created_at in buy_rows:
+        if created_at is None:
+            continue
+        if created_at.tzinfo is None:
+            created_at = created_at.replace(tzinfo=timezone.utc)
+        cal_days     = (now_utc - created_at).days
+        trading_days = int(cal_days * 5 / 7)   # same approximation as _check_time_stops
+        buy_map[sym] = max(trading_days, 0)
+
+    # Pull time-stop threshold so the UI can colour the counter correctly
+    from ..database import get_setting as _gs
+    try:
+        time_stop_days = int(_gs(db, "time_stop_days", "10") or "10")
+    except (TypeError, ValueError):
+        time_stop_days = 10
+
     out = []
     for p in raw:
         signal_data = analyze(p.symbol)
@@ -91,6 +125,8 @@ def positions(current_user: dict = Depends(get_current_user), db: Session = Depe
             "target2":         plan.get("target2"),
             "plan_week":       plan.get("plan_week"),
             "mode":            mode,
+            "days_held":       buy_map.get(p.symbol),   # trading days since BUY fill
+            "time_stop_days":  time_stop_days if time_stop_days > 0 else None,
         })
     return out
 

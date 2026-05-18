@@ -30,6 +30,19 @@ export default function PositionCard({ pos }) {
   const breakout      = pos.signal === 'BREAKOUT'
   const hasPlanLevels = pos.stop_price || pos.target1
 
+  // Days-held counter — colours based on proximity to the time-stop limit
+  const daysHeld     = pos.days_held   // trading days, may be null if no BUY in trade_log
+  const tsLimit      = pos.time_stop_days  // null when feature is disabled
+  const daysColor    = (() => {
+    if (daysHeld == null) return null
+    if (tsLimit == null)  return 'text-slate-500 border-slate-600/40 bg-slate-800/40'
+    const ratio = daysHeld / tsLimit
+    if (ratio >= 1)    return 'text-red-400   border-red-500/50   bg-red-500/10   animate-pulse'
+    if (ratio >= 0.75) return 'text-amber-400 border-amber-500/40 bg-amber-500/10'
+    if (ratio >= 0.5)  return 'text-yellow-400 border-yellow-500/30 bg-yellow-500/8'
+    return 'text-slate-500 border-slate-600/40 bg-slate-800/40'
+  })()
+
   const isHistoricalPlan = (() => {
     if (!pos.plan_week) return false
     const planDate = new Date(pos.plan_week)
@@ -109,7 +122,20 @@ export default function PositionCard({ pos }) {
       {/* Header */}
       <div className="flex items-start justify-between gap-2">
         <div>
-          <div className="text-xl font-bold text-slate-100 tracking-tight num">{pos.symbol}</div>
+          <div className="flex items-center gap-2">
+            <div className="text-xl font-bold text-slate-100 tracking-tight num">{pos.symbol}</div>
+            {daysHeld != null && (
+              <span
+                title={tsLimit
+                  ? `Held ${daysHeld} of ${tsLimit} trading days — time stop at ${tsLimit}d`
+                  : `Held ${daysHeld} trading day${daysHeld !== 1 ? 's' : ''}`}
+                className={`text-[10px] font-semibold px-1.5 py-0.5 rounded border leading-none num ${daysColor}`}
+              >
+                {daysHeld}d
+                {tsLimit && <span className="opacity-50">/{tsLimit}</span>}
+              </span>
+            )}
+          </div>
           <div className="text-xs text-slate-500 mt-0.5 num">{pos.qty} sh @ {usd(pos.entry_price)}</div>
         </div>
         <SignalBadge signal={pos.signal} />
