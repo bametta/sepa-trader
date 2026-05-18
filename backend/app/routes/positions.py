@@ -95,10 +95,10 @@ def positions(current_user: dict = Depends(get_current_user), db: Session = Depe
         trading_days = int(cal_days * 5 / 7)   # same approximation as _check_time_stops
         buy_map[sym] = max(trading_days, 0)
 
-    # Pull time-stop threshold so the UI can colour the counter correctly
-    from ..database import get_setting as _gs
+    # Pull time-stop threshold from user_settings (already fetched above) so
+    # the UI colour ramp reflects whatever the user has set in Settings.
     try:
-        time_stop_days = int(_gs(db, "time_stop_days", "10") or "10")
+        time_stop_days = int(user_settings.get("time_stop_days", "10") or "10")
     except (TypeError, ValueError):
         time_stop_days = 10
 
