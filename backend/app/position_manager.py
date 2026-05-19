@@ -262,7 +262,7 @@ def _place_entry(
     trigger: str,
     mode: str,
     screener_type: str = "minervini",
-    target2: float = 0.0,  # kept for caller compat — ignored (single-OCO model)
+    target2: float = 0.0,
     user_id: int | None = None,
     committed: float = 0.0,  # dollars already earmarked by earlier orders this cycle
 ) -> str:
@@ -270,10 +270,10 @@ def _place_entry(
     Submit the entry buy using the user-configured order type.
     Returns a short description string for logging.
 
-    Single-OCO model: one stop and one target per position. The split T1/T2
-    logic was removed because Alpaca paper silently dropped sibling stop legs
-    when stacking multiple OCOs on the same symbol. `target2` is accepted for
-    caller compatibility but no longer used.
+    Single-OCO model: one stop and one target per position.
+    The bracket exit target uses T2 when available (matching _ensure_exit_orders),
+    so the very first OCO is already correct and the monitor never needs to
+    cancel-replace it on the next cycle just to switch T1→T2.
 
     Settings are split by screener source:
       mv_entry_order_type / mv_entry_slippage_pct  — Minervini/breakout picks
@@ -323,16 +323,22 @@ def _place_entry(
 
     has_exits = stop > 0 and target > 0
 
+    # Use T2 as the bracket exit target when available — matches what
+    # _ensure_exit_orders will set on its first cycle, avoiding the
+    # immediate cancel-replace churn (e.g. MTCH: bracket at T1 $39.07
+    # canceled 2 min later and replaced at T2 $41.30).
+    oco_target = target2 if target2 > 0 else target
+
     if order_type == "limit":
         limit_px = round(entry * (1 + slippage_pct / 100), 2)
         if has_exits:
             try:
-                alp.place_limit_bracket_buy(sym, qty, entry, stop, target, slippage_pct, mode)
-                return f"limit bracket (lim=${limit_px} stop=${stop:.2f} tgt=${target:.2f})"
+                alp.place_limit_bracket_buy(sym, qty, entry, stop, oco_target, slippage_pct, mode)
+                return f"limit bracket (lim=${limit_px} stop=${stop:.2f} tgt=${oco_target:.2f})"
             except Exception as exc:
                 logger.error("_place_entry: limit bracket FAILED for %s: %s — market bracket fallback", sym, exc)
-                alp.place_bracket_buy(sym, qty, stop, target, mode)
-                return f"market bracket [limit fallback] (stop=${stop:.2f} tgt=${target:.2f})"
+                alp.place_bracket_buy(sym, qty, stop, oco_target, mode)
+                return f"market bracket [limit fallback] (stop=${stop:.2f} tgt=${oco_target:.2f})"
         else:
             alp.place_limit_buy(sym, qty, limit_px, mode)
             return f"limit buy (lim=${limit_px})"
@@ -358,15 +364,15 @@ def _place_entry(
                 # attached immediately — position is never left naked.
                 if has_exits:
                     try:
-                        alp.place_limit_bracket_buy(sym, qty, entry, stop, target, slippage_pct, mode)
-                        return f"limit bracket [stop-limit passed] (lim=${limit_px:.2f} stop=${stop:.2f} tgt=${target:.2f})"
+                        alp.place_limit_bracket_buy(sym, qty, entry, stop, oco_target, slippage_pct, mode)
+                        return f"limit bracket [stop-limit passed] (lim=${limit_px:.2f} stop=${stop:.2f} tgt=${oco_target:.2f})"
                     except Exception as _lb_exc:
                         logger.error(
                             "_place_entry %s: limit bracket fallback failed (%s) — market bracket last resort [%s]",
                             sym, _lb_exc, mode,
                         )
-                        alp.place_bracket_buy(sym, qty, stop, target, mode)
-                        return f"market bracket [stop-limit→bracket fallback] (stop=${stop:.2f} tgt=${target:.2f})"
+                        alp.place_bracket_buy(sym, qty, stop, oco_target, mode)
+                        return f"market bracket [stop-limit→bracket fallback] (stop=${stop:.2f} tgt=${oco_target:.2f})"
                 else:
                     alp.place_limit_buy(sym, qty, limit_px, mode)
                     return f"limit buy [stop already passed, no exits defined] (lim=${limit_px:.2f})"
@@ -396,8 +402,8 @@ def _place_entry(
     else:  # "market" or unrecognised
         if has_exits:
             try:
-                alp.place_bracket_buy(sym, qty, stop, target, mode)
-                return f"market bracket (stop=${stop:.2f} tgt=${target:.2f})"
+                alp.place_bracket_buy(sym, qty, stop, oco_target, mode)
+                return f"market bracket (stop=${stop:.2f} tgt=${oco_target:.2f})"
             except Exception as exc:
                 logger.error("_place_entry: market bracket FAILED for %s: %s — plain market buy", sym, exc)
                 alp.place_market_buy(sym, qty, mode)
