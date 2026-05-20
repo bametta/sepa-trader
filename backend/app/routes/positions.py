@@ -102,6 +102,47 @@ def positions(current_user: dict = Depends(get_current_user), db: Session = Depe
     except (TypeError, ValueError):
         time_stop_days = 10
 
+    # Silently reconcile weekly_plan.position_size to the actual fill quantity.
+    # The screener estimates position_size at scan time; by entry time prices and
+    # portfolio values may differ enough (30-50%) to make the estimate stale.
+    # Keeping it stale triggers false "double entry" alerts in the monitor.
+    # We only update rows where the delta is significant (>10% off) so small
+    # natural drift doesn't create unnecessary DB writes every fetch.
+    for p in raw:
+        actual_qty = int(float(p.qty or 0))
+        if actual_qty <= 0:
+            continue
+        try:
+            stale_row = db.execute(
+                text("""
+                    SELECT position_size FROM weekly_plan
+                    WHERE symbol = :sym AND mode = :mode
+                      AND status = 'EXECUTED'
+                    ORDER BY week_start DESC LIMIT 1
+                """),
+                {"sym": p.symbol, "mode": mode},
+            ).fetchone()
+            if stale_row and stale_row[0]:
+                planned = int(float(stale_row[0]))
+                if planned > 0 and abs(actual_qty - planned) / planned > 0.1:
+                    db.execute(
+                        text("""
+                            UPDATE weekly_plan
+                            SET position_size = :qty
+                            WHERE symbol = :sym AND mode = :mode
+                              AND status = 'EXECUTED'
+                              AND week_start = (
+                                  SELECT MAX(week_start) FROM weekly_plan
+                                  WHERE symbol = :sym AND mode = :mode
+                                    AND status = 'EXECUTED'
+                              )
+                        """),
+                        {"qty": actual_qty, "sym": p.symbol, "mode": mode},
+                    )
+                    db.commit()
+        except Exception:
+            pass  # non-critical — monitor will retry next cycle
+
     out = []
     for p in raw:
         signal_data = analyze(p.symbol)

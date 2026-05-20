@@ -824,39 +824,41 @@ def _ensure_exit_orders(
         stop, t1, t2 = _get_weekly_plan_exits(db, sym, mode)
         sym_orders = open_orders_by_symbol.get(sym, [])
 
-        # ── Position-size mismatch alert ─────────────────────────────────
-        # If the actual position is >20% larger than the plan intended, something
-        # went wrong (e.g. double entry). Alert once per session per symbol so
-        # the monitor doesn't spam. Cleared at market open each day.
+        # ── Duplicate-entry alert ─────────────────────────────────────────
+        # A genuine double entry means two BUY fills in the trade log on the
+        # same calendar day (UTC). plan.position_size is a screener estimate
+        # that can differ from the actual fill by 30-50% (price/portfolio drift
+        # between screener time and entry time) — comparing against it generates
+        # false "SIZE MISMATCH" alerts on perfectly valid positions like SATS.
+        # Instead, count same-day BUY fills; alert only when there are ≥ 2.
         try:
-            planned_qty_row = db.execute(
+            buy_count_row = db.execute(
                 text("""
-                    SELECT position_size FROM weekly_plan
-                    WHERE symbol = :sym AND mode = :mode
-                    ORDER BY week_start DESC LIMIT 1
+                    SELECT COUNT(*) FROM trade_log
+                    WHERE symbol = :sym AND mode = :mode AND action = 'BUY'
+                      AND DATE(created_at AT TIME ZONE 'UTC') = DATE(NOW() AT TIME ZONE 'UTC')
                 """),
                 {"sym": sym, "mode": mode},
             ).fetchone()
-            planned_qty = int(float(planned_qty_row[0] or 0)) if planned_qty_row else 0
-            if planned_qty > 0 and qty > planned_qty * 1.2:
+            same_day_buys = int(buy_count_row[0]) if buy_count_row else 0
+            if same_day_buys >= 2 and (sym, mode) not in _size_mismatch_alerted:
+                _size_mismatch_alerted.add((sym, mode))
                 logger.warning(
-                    "Exit guard: %s position size mismatch — actual=%d planned=%d (%.0f%% over) [%s]",
-                    sym, qty, planned_qty, (qty / planned_qty - 1) * 100, mode,
+                    "Exit guard: %s has %d BUY fills today — possible double entry [%s]",
+                    sym, same_day_buys, mode,
                 )
-                if (sym, mode) not in _size_mismatch_alerted:
-                    _size_mismatch_alerted.add((sym, mode))
-                    try:
-                        tg.alert_system_error_sync(
-                            f"⚠️ SIZE MISMATCH [{mode}] {sym}\n"
-                            f"Position is {qty} shares but plan expected {planned_qty} "
-                            f"({(qty / planned_qty - 1) * 100:.0f}% over). "
-                            f"Possible double entry — review and adjust manually.",
-                            RuntimeError(f"actual={qty} planned={planned_qty}"),
-                        )
-                    except Exception:
-                        pass
+                try:
+                    tg.alert_system_error_sync(
+                        f"⚠️ DOUBLE ENTRY [{mode}] {sym}\n"
+                        f"{same_day_buys} BUY fills recorded today for this symbol. "
+                        f"Current position: {int(qty)} shares. "
+                        f"Review Alpaca order history and reduce if needed.",
+                        RuntimeError(f"same_day_buys={same_day_buys} actual_qty={int(qty)}"),
+                    )
+                except Exception:
+                    pass
         except Exception as _size_exc:
-            logger.debug("Exit guard: size-mismatch check failed for %s: %s", sym, _size_exc)
+            logger.debug("Exit guard: duplicate-entry check failed for %s: %s", sym, _size_exc)
 
         # ── In-flight BUY guard ──────────────────────────────────────────
         # If an entry order is still partially filling, pos.qty may grow.
