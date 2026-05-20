@@ -363,18 +363,20 @@ def _compute_new_stop(
 
 def _get_plan_stop_for_trailing(
     db: Session, symbol: str, mode: str,
-) -> tuple[float, float, float]:
-    """Return (r_ref_stop, target, current_plan_stop) for trailing-stop logic.
+) -> tuple[float, float, float, float, bool]:
+    """Return (r_ref_stop, target1, current_plan_stop, target2, t1_taken).
 
     r_ref_stop      — stop used for R calculation. After a T1 partial exit the
                       plan stop moves to breakeven; we keep the original
                       structural stop so gain_r stays meaningful.
-    target          — current target1 in the plan.
+    target1         — current target1 in the plan.
     current_plan_stop — the live stop_price (may be BE after T1).
+    target2         — target2 in the plan (0 if not set).
+    t1_taken        — whether the T1 partial exit has already fired.
     """
     row = db.execute(
         text("""
-            SELECT stop_price, target1, original_stop, t1_taken
+            SELECT stop_price, target1, original_stop, t1_taken, target2
             FROM weekly_plan
             WHERE symbol = :sym AND mode = :mode
               AND status = 'EXECUTED'
@@ -383,14 +385,15 @@ def _get_plan_stop_for_trailing(
         {"sym": symbol, "mode": mode},
     ).fetchone()
     if not row:
-        return 0.0, 0.0, 0.0
+        return 0.0, 0.0, 0.0, 0.0, False
     current_stop = float(row[0] or 0)
-    target       = float(row[1] or 0)
+    target1      = float(row[1] or 0)
     orig_stop    = float(row[2] or 0)
     t1_taken     = bool(row[3])
+    target2      = float(row[4] or 0)
     # If T1 was already taken, original_stop holds the pre-BE structural level
     r_ref = orig_stop if (t1_taken and orig_stop > 0) else current_stop
-    return r_ref, target, current_stop
+    return r_ref, target1, current_stop, target2, t1_taken
 
 
 def _adjust_trailing_stops(
@@ -412,10 +415,19 @@ def _adjust_trailing_stops(
         if current_price <= entry:
             continue  # red or flat — never touch
 
-        r_ref_stop, target, current_plan_stop = _get_plan_stop_for_trailing(db, sym, mode)
-        if r_ref_stop <= 0 or target <= 0:
+        r_ref_stop, t1, current_plan_stop, t2, t1_taken = _get_plan_stop_for_trailing(db, sym, mode)
+        if r_ref_stop <= 0 or t1 <= 0:
             logger.debug("Trailing stop: %s has no plan exits — skipping.", sym)
             continue
+
+        # Resolve the OCO target — must match _ensure_exit_orders exactly so
+        # trailing-stop updates don't oscillate the OCO back to T1 every cycle.
+        if t1_taken:
+            oco_target = t1   # t1 column holds the remaining target after partial exit
+        elif t2 > 0:
+            oco_target = t2
+        else:
+            oco_target = t1
 
         # Fetch EMA20 for positions at >= 2R gain so we can use structural trailing
         R      = entry - r_ref_stop
@@ -433,10 +445,10 @@ def _adjust_trailing_stops(
         if new_stop is None:
             continue  # gain < 1R
 
-        # Cap the new stop just below the take-profit so Alpaca never rejects
+        # Cap the new stop just below the OCO target so Alpaca never rejects
         # an OCO whose stop sits above its limit.
-        if target > 0:
-            target_cap = round(target * 0.999, 2)
+        if oco_target > 0:
+            target_cap = round(oco_target * 0.999, 2)
             if new_stop >= target_cap:
                 logger.debug(
                     "Trailing stop: %s new=$%.2f would breach target cap $%.2f — clamping.",
@@ -456,12 +468,12 @@ def _adjust_trailing_stops(
 
         logger.info(
             "Trailing stop: %s  gain=%.1fR  price=$%.2f  old=$%.2f → new=$%.2f  "
-            "target=$%.2f [%s]",
-            sym, gain_r, current_price, effective_current, new_stop, target, mode,
+            "oco_target=$%.2f [%s]",
+            sym, gain_r, current_price, effective_current, new_stop, oco_target, mode,
         )
 
         try:
-            alp.replace_oca_exit(sym, qty, new_stop, target, mode)
+            alp.replace_oca_exit(sym, qty, new_stop, oco_target, mode)
 
             db.execute(
                 text("""
