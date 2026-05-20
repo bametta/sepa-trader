@@ -371,6 +371,21 @@ Note: Tape is context only — it does not override position-sizing rules. A CAU
         logger.debug("pre_trade_analysis: insider fetch failed for %s: %s", symbol, _ins_exc)
         insider_block = ""
 
+    # Earnings proximity + volume confirmation
+    try:
+        from .market_checks import (
+            get_earnings_proximity, format_earnings_for_prompt,
+            get_volume_confirmation, format_volume_for_prompt,
+        )
+        _earnings      = get_earnings_proximity(symbol, db)
+        earnings_block = format_earnings_for_prompt(symbol, _earnings)
+        _volume        = get_volume_confirmation(symbol)
+        volume_block   = format_volume_for_prompt(symbol, _volume)
+    except Exception as _mc_exc:
+        logger.debug("pre_trade_analysis: market_checks failed for %s: %s", symbol, _mc_exc)
+        earnings_block = ""
+        volume_block   = ""
+
     # Carry the weekly-plan verdict forward so this gate doesn't contradict it
     stored_block = ""
     if stored_analysis:
@@ -421,7 +436,7 @@ Account tier:    {account_tier}
 3. Trade cost must not exceed buying power. Cost: ${trade_cost:,.2f}, BP: ${buying_power:,.2f}
 4. Single position must not exceed {max_position_pct}% of portfolio. Current: {pct_of_portfolio:.1f}%
 5. Cash after trade must remain >= {min_cash_pct}% of portfolio. After trade: {cash_after_pct:.1f}%
-{news_block}{insider_block}
+{news_block}{insider_block}{earnings_block}{volume_block}
 --- DECISION GUIDANCE ---
 Use PROCEED when all rules pass and no red flags exist.
 Use WARN for borderline cases: R:R within 0.3 of minimum, size near limits, or mild caution signals.
@@ -430,9 +445,16 @@ Use ABORT for clear rule violations OR any of the following fundamental red flag
   • Single insider disposed >$500k in the last 30 days with no apparent 10b5-1 plan
   • Recent earnings miss, guidance cut, FDA rejection, or active SEC/DOJ investigation
   • Material adverse news within the last 7 days that invalidates the technical setup
+  • Earnings ≤5 trading days away — gap risk from the binary event cannot be stopped out of
 Note on insider selling: Routine 10b5-1 plan sales (pre-scheduled, disclosed in filings) are less
 concerning than spontaneous open-market disposals. Weight heavily if multiple officers sell
-simultaneously or if a CEO/CFO liquidates a large portion of their stake with no plan on record."""
+simultaneously or if a CEO/CFO liquidates a large portion of their stake with no plan on record.
+Note on earnings proximity: Use ABORT when earnings are ≤5 trading days away (high risk). Use WARN
+when 6-10 trading days away — position may still be open at the event; flag it so the trader can
+decide whether to size down or set an exit before the announcement.
+Note on volume: Volume confirms conviction. Use WARN (not ABORT alone) when volume is below_avg
+(ratio < 0.8×) — low volume on a breakout suggests weak institutional participation and raises
+the probability of a failed move. Strong volume (≥1.5×) is a positive signal worth noting."""
 
     try:
         text = _call_ai(db, prompt, max_tokens=256, user_id=user_id)
