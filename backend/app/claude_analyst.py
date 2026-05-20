@@ -354,11 +354,22 @@ Note: Tape is context only — it does not override position-sizing rules. A CAU
     min_rr    = 1.2 if is_rs else 2.0
     rs_rr_note = " (RS Momentum strategy uses EMA50 structural stops — minimum is 1.2x)" if is_rs else ""
 
-    symbol_news = _fetch_alpaca_news([symbol], db, user_id, mode=mode).get(symbol, [])
+    # Expand news window to 7 days for gate — insider-related news can lag.
+    # Limit to 5 headlines to stay concise in the prompt.
+    symbol_news = _fetch_alpaca_news([symbol], db, user_id, mode=mode, hours=168, limit=5).get(symbol, [])
     news_block  = (
-        "\n--- RECENT NEWS (last 48h) ---\n" + "\n".join(f"• {h}" for h in symbol_news)
+        "\n--- RECENT NEWS (last 7 days) ---\n" + "\n".join(f"• {h}" for h in symbol_news)
         if symbol_news else ""
     )
+
+    # SEC Form 4 insider activity (last 30 days)
+    try:
+        from .insider_checker import fetch_insider_activity, format_for_prompt as _fmt_insider
+        _insider = fetch_insider_activity(symbol, days=30)
+        insider_block = _fmt_insider(symbol, _insider)
+    except Exception as _ins_exc:
+        logger.debug("pre_trade_analysis: insider fetch failed for %s: %s", symbol, _ins_exc)
+        insider_block = ""
 
     # Carry the weekly-plan verdict forward so this gate doesn't contradict it
     stored_block = ""
@@ -410,11 +421,18 @@ Account tier:    {account_tier}
 3. Trade cost must not exceed buying power. Cost: ${trade_cost:,.2f}, BP: ${buying_power:,.2f}
 4. Single position must not exceed {max_position_pct}% of portfolio. Current: {pct_of_portfolio:.1f}%
 5. Cash after trade must remain >= {min_cash_pct}% of portfolio. After trade: {cash_after_pct:.1f}%
-{news_block}
-Use WARN for borderline cases (R:R within 0.3 of minimum, size near the limit).
-If recent news reveals earnings miss, guidance cut, FDA rejection, or major legal/regulatory risk — use WARN or ABORT even if position sizing rules pass.
-Use ABORT only for clear rule violations.
-Use PROCEED when all rules pass."""
+{news_block}{insider_block}
+--- DECISION GUIDANCE ---
+Use PROCEED when all rules pass and no red flags exist.
+Use WARN for borderline cases: R:R within 0.3 of minimum, size near limits, or mild caution signals.
+Use ABORT for clear rule violations OR any of the following fundamental red flags:
+  • Cluster insider selling: ≥2 distinct directors/officers sold in the last 30 days
+  • Single insider disposed >$500k in the last 30 days with no apparent 10b5-1 plan
+  • Recent earnings miss, guidance cut, FDA rejection, or active SEC/DOJ investigation
+  • Material adverse news within the last 7 days that invalidates the technical setup
+Note on insider selling: Routine 10b5-1 plan sales (pre-scheduled, disclosed in filings) are less
+concerning than spontaneous open-market disposals. Weight heavily if multiple officers sell
+simultaneously or if a CEO/CFO liquidates a large portion of their stake with no plan on record."""
 
     try:
         text = _call_ai(db, prompt, max_tokens=256, user_id=user_id)
