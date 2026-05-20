@@ -812,6 +812,43 @@ def _ensure_exit_orders(
         if qty <= 0:
             continue
 
+        # ── Reconcile plan.position_size to the actual fill quantity ─────
+        # The screener sets position_size at scan time. By entry time, prices
+        # and portfolio values can differ enough (30-50%) to make the estimate
+        # stale. A stale value triggers false "double entry" alerts. Silently
+        # update when the delta exceeds 10% — runs for both paper and live on
+        # every monitor cycle so the data stays current regardless of which
+        # mode the UI was last loaded in.
+        try:
+            ps_row = db.execute(
+                text("""
+                    SELECT position_size FROM weekly_plan
+                    WHERE symbol = :sym AND mode = :mode
+                      AND status = 'EXECUTED'
+                    ORDER BY week_start DESC LIMIT 1
+                """),
+                {"sym": sym, "mode": mode},
+            ).fetchone()
+            if ps_row and ps_row[0]:
+                planned = int(float(ps_row[0]))
+                if planned > 0 and abs(qty - planned) / planned > 0.1:
+                    db.execute(
+                        text("""
+                            UPDATE weekly_plan SET position_size = :qty
+                            WHERE symbol = :sym AND mode = :mode
+                              AND status = 'EXECUTED'
+                              AND week_start = (
+                                  SELECT MAX(week_start) FROM weekly_plan
+                                  WHERE symbol = :sym AND mode = :mode
+                                    AND status = 'EXECUTED'
+                              )
+                        """),
+                        {"qty": qty, "sym": sym, "mode": mode},
+                    )
+                    db.commit()
+        except Exception as _ps_exc:
+            logger.debug("Exit guard: position_size reconcile failed for %s: %s", sym, _ps_exc)
+
         # Skip silently if Alpaca's PDT protection already blocked all exits
         # for this symbol today. The monitor will succeed tomorrow once the
         # buy is no longer a same-day trade. _pdt_blocked is cleared at open.

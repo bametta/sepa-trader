@@ -172,7 +172,8 @@ async def _premarket_exit_refresh():
             merged = _gaus(db, admin_uid)
             # Only refresh if auto_execute is on for this mode
             auto_key = "live_auto_execute" if mode == "live" else "paper_auto_execute"
-            if merged.get(auto_key, "true") != "true":
+            default  = "false" if mode == "live" else "true"   # live is opt-in; paper is opt-out
+            if merged.get(auto_key, default) != "true":
                 continue
 
             positions    = alp.get_positions_for_user(db, admin_uid, mode)
