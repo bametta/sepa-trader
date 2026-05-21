@@ -102,6 +102,19 @@ async def _monitor_watchdog():
             logger.debug("Watchdog: outside trading hours (%s ET) — skipping.", now_et.strftime("%H:%M"))
             return
 
+        # Pre-market OCO refresh fires at 9:28 and calls _ensure_exit_orders
+        # sequentially for every position — it can take 4-6 minutes to finish.
+        # If the watchdog fires at 9:30 while the refresh is still running, both
+        # call _ensure_exit_orders concurrently → OCO cancel/replace race that
+        # leaves positions with wrong targets for one or two cycles.
+        # Block the watchdog for the 9:28–9:37 window so the refresh can
+        # complete cleanly before the regular monitor cycle starts.
+        if now_et.hour == 9 and 28 <= now_et.minute <= 37:
+            logger.debug(
+                "Watchdog: pre-market refresh window (9:28–9:37 ET) — deferring to avoid OCO race."
+            )
+            return
+
         interval = int(merged.get("monitor_interval_minutes", "30") or "30")
 
         last_run_str = get_setting(db, "monitor_last_run", "")

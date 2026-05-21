@@ -459,6 +459,16 @@ def _adjust_trailing_stops(
         live_stop         = _get_current_stop_price(open_orders_by_symbol.get(sym, []))
         effective_current = live_stop if live_stop else current_plan_stop
 
+        # Hard floor: trailing stops only ratchet UP.  EMA20 can drift below
+        # the current stop when the market pulls back; clamp so we never lower
+        # protection that was already in place.
+        if new_stop < current_plan_stop:
+            logger.debug(
+                "Trailing stop: %s computed new=$%.2f < DB stop=$%.2f — clamping to floor.",
+                sym, new_stop, current_plan_stop,
+            )
+            new_stop = current_plan_stop
+
         if new_stop <= effective_current * (1 + _MIN_STOP_IMPROVEMENT_PCT):
             logger.debug(
                 "Trailing stop: %s new=$%.2f vs current=$%.2f — no update needed.",
