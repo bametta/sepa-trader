@@ -476,6 +476,19 @@ def _adjust_trailing_stops(
             )
             continue
 
+        # Target floor: never lower the OCO limit price when updating the stop.
+        # If the DB had T2=0 and fell back to T1, oco_target could be below the
+        # live OCO's existing target (which was correctly placed at T2 earlier).
+        # Preserve the higher value so trailing-stop updates never regress targets.
+        live_target = _get_current_target_price(open_orders_by_symbol.get(sym, []))
+        if live_target and oco_target < live_target and not t1_taken:
+            logger.warning(
+                "Trailing stop: %s computed target $%.2f < live OCO target $%.2f "
+                "— preserving existing target to avoid T2→T1 regression [%s]",
+                sym, oco_target, live_target, mode,
+            )
+            oco_target = live_target
+
         logger.info(
             "Trailing stop: %s  gain=%.1fR  price=$%.2f  old=$%.2f → new=$%.2f  "
             "oco_target=$%.2f [%s]",
@@ -1076,6 +1089,26 @@ def _ensure_exit_orders(
                 logger.debug("Exit guard: %s OCO coverage correct — no action.", sym)
                 continue
 
+            # Target regression guard: if the existing OCO has a HIGHER target
+            # than our computed oco_target (and qty is the same), don't replace.
+            # This fires when _get_plan_stop_for_trailing returned T2=0 and fell
+            # back to T1, causing the system to "correct" a good T2 target down
+            # to T1. The existing OCO is already correct — leave it alone.
+            # (After a T1 partial exit, qty also drops so qty_ok would be False,
+            # making this guard correctly inactive for that case.)
+            if (qty_ok
+                    and current_target is not None
+                    and current_target > oco_target
+                    and _price_changed(current_target, oco_target)):
+                logger.warning(
+                    "Exit guard: %s OCO target would REGRESS $%.2f → $%.2f — "
+                    "preserving existing target to prevent T2→T1 downgrade [%s]",
+                    sym, current_target, oco_target, mode,
+                )
+                # If only the stop needs updating but target would regress,
+                # we can't do a partial OCO update — skip the full replace.
+                continue
+
         else:
             # Legacy two-order path (explicit stop + limit sell orders)
             has_stop_leg = has_limit_leg = False
@@ -1113,23 +1146,25 @@ def _ensure_exit_orders(
         # pledged by a prior order — leaving the position with a target
         # leg and no stop. Cancelling first eliminates the race.
         #
-        # Alpaca paper is slow to cascade-cancel OCO siblings (held leg
-        # can linger >10s after parent is cancelled). Strategy:
-        #   1. Cancel all sell orders (4s wait).
-        #   2. If still not clear: second cancel sweep + 1s grace, then
-        #      proceed anyway.
-        #   3. If placement fails with "insufficient qty" (40310000),
-        #      the OLD OCO is still active → position is protected.
-        #      Log and retry on the next cycle — not a hard failure.
+        # Alpaca is slow to cascade-cancel OCO siblings — the "held" stop leg
+        # can hold its qty reservation for 10-15s after the parent is cancelled.
+        # Strategy:
+        #   1. Cancel all sell orders (10s wait — covers the OCO sibling delay).
+        #   2. If still not clear: second cancel sweep + 2s grace, then proceed.
+        #   3. If placement fails with "insufficient qty" (40310000), wait 6s
+        #      and retry once. If retry fails, place stop-market as emergency.
+        #
+        # Note: an emergency stop-market holds its own qty reservation. The next
+        # monitor cycle will cancel it, wait the full 10s, and place a proper OCO.
         cancelled = alp.cancel_symbol_exit_orders(sym, mode)
         if cancelled:
             cleared = alp.wait_for_orders_cancelled(
-                sym, mode, timeout=4.0, poll_interval=0.5, order_ids=cancelled
+                sym, mode, timeout=10.0, poll_interval=0.5, order_ids=cancelled
             )
             if not cleared:
                 # Second sweep: cancel again to catch any newly-visible siblings
                 alp.cancel_symbol_exit_orders(sym, mode)
-                import time as _t; _t.sleep(1.0)
+                import time as _t; _t.sleep(2.0)
                 logger.warning(
                     "Exit guard: %s cancel still settling — proceeding optimistically [%s]",
                     sym, mode,
@@ -1178,10 +1213,10 @@ def _ensure_exit_orders(
             # fails, place a stop-market as emergency protection.
             if "40310000" in exc_str or "insufficient qty" in exc_str.lower():
                 logger.warning(
-                    "Exit guard: %s OCO blocked (40310000 qty race) — waiting 3s and retrying [%s]",
+                    "Exit guard: %s OCO blocked (40310000 qty race) — waiting 6s and retrying [%s]",
                     sym, mode,
                 )
-                import time as _t; _t.sleep(3.0)
+                import time as _t; _t.sleep(6.0)
                 try:
                     parent = alp.place_oca_exit(sym, qty, stop, oco_target, mode)
                     logger.info(
