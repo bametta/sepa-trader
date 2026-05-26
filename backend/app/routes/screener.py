@@ -183,7 +183,8 @@ def get_plan_for_week(
         text("""
             SELECT week_start, symbol, rank, score, signal,
                    entry_price, stop_price, target1, target2,
-                   position_size, risk_amount, rationale, status, mode, created_at
+                   position_size, risk_amount, rationale, status, mode, created_at,
+                   COALESCE(screener_type, 'minervini') AS screener_type
             FROM weekly_plan
             WHERE week_start = :w
               AND mode = :mode AND user_id = :uid

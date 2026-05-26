@@ -861,6 +861,10 @@ async def _pead_screener_watchdog():
     db = SessionLocal()
     run_key = None
     try:
+        # Check both the master enable toggle (pead_screener_enabled) and the
+        # auto-run schedule toggle (pead_screener_auto_run) — both must be true.
+        if get_setting(db, "pead_screener_enabled",  "true") not in ("true", "1", ""):
+            return
         if get_setting(db, "pead_screener_auto_run", "true") != "true":
             return
 

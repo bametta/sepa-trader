@@ -551,6 +551,7 @@ def _check_t1_partial_exit(
     positions: list,
     open_orders_by_symbol: dict,
     mode: str,
+    user_id: int | None = None,
 ) -> None:
     """Fire a 50% market sell when price >= target1 and t1 hasn't been taken yet.
 
@@ -1678,7 +1679,7 @@ def run_position_sync(db: Session, mode: str, user_id: int | None = None) -> dic
     try:
         open_orders = alp.get_open_orders_by_symbol_for_user(db, user_id, mode)
 
-        _check_t1_partial_exit(db, positions, open_orders, mode)
+        _check_t1_partial_exit(db, positions, open_orders, mode, user_id=user_id)
 
         # Re-fetch after potential partial sell
         positions   = alp.get_positions_for_user(db, user_id, mode)
@@ -1801,7 +1802,7 @@ async def run_monitor(db: Session, user_id: int | None = None, mode: str | None 
                 # Step 1a: T1 partial exit (Apex)
                 # If price >= target1 and position hasn't been halved yet,
                 # sell 50 %, move OCO stop to breakeven, target → T2.
-                _check_t1_partial_exit(db, positions, open_orders_by_symbol, mode)
+                _check_t1_partial_exit(db, positions, open_orders_by_symbol, mode, user_id=user_id)
 
                 # Re-fetch positions after potential partial sell
                 positions             = alp.get_positions_for_user(db, user_id, mode)

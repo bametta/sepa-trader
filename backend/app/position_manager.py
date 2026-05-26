@@ -308,7 +308,13 @@ def _place_entry(
     if screener_type == "pullback":
         order_type   = get_setting(db, "pb_entry_order_type",   "limit")
         slippage_pct = float(get_setting(db, "pb_entry_slippage_pct", "0.5"))
-    else:  # minervini (default)
+    elif screener_type == "pead":
+        # PEAD entries are at or near the current market price (gap-day close).
+        # A stop-limit order would be rejected by Alpaca (stop already triggered).
+        # Use limit order — same as Pullback — to capture at the current level.
+        order_type   = "limit"
+        slippage_pct = float(get_setting(db, "pb_entry_slippage_pct", "0.5"))
+    else:  # minervini / rs_momentum (default — breakout-style stop-limit)
         order_type   = get_setting(db, "mv_entry_order_type",   "stop_limit")
         slippage_pct = float(get_setting(db, "mv_entry_slippage_pct", "1.0"))
 
@@ -535,10 +541,11 @@ def run_monday_open(db: Session, mode: str | None = None):
         logger.debug("Monday open: circuit-breaker check failed (%s) — proceeding", _cb_exc)
 
     admin_uid = _resolve_admin_uid(db)
-    max_pos = _effective_max_positions(db, mode)
-    mv_max  = int(get_setting(db, "mv_max_slots", "3") or "3")
-    pb_max  = int(get_setting(db, "pb_max_slots", "2") or "2")
-    rs_max  = int(get_setting(db, "rs_max_slots", "2") or "2")
+    max_pos   = _effective_max_positions(db, mode)
+    mv_max    = int(get_setting(db, "mv_max_slots",   "3") or "3")
+    pb_max    = int(get_setting(db, "pb_max_slots",   "2") or "2")
+    rs_max    = int(get_setting(db, "rs_max_slots",   "2") or "2")
+    pead_max  = int(get_setting(db, "pead_max_slots", "2") or "2")
 
     try:
         positions = alp.get_positions_for_user(db, admin_uid, mode)
@@ -554,13 +561,16 @@ def run_monday_open(db: Session, mode: str | None = None):
     held_symbols   = {p.symbol for p in positions}
     mv_held, pb_held, rs_held, pead_held = _count_positions_by_type(db, mode, held_symbols)
 
-    mv_slots = min(max(0, mv_max - mv_held), max_pos - total_held)
-    pb_slots = min(max(0, pb_max - pb_held), max_pos - total_held - mv_slots)
-    rs_slots = min(max(0, rs_max - rs_held), max_pos - total_held - mv_slots - pb_slots)
+    mv_slots   = min(max(0, mv_max   - mv_held),   max_pos - total_held)
+    pb_slots   = min(max(0, pb_max   - pb_held),   max_pos - total_held - mv_slots)
+    rs_slots   = min(max(0, rs_max   - rs_held),   max_pos - total_held - mv_slots - pb_slots)
+    pead_slots = min(max(0, pead_max - pead_held), max_pos - total_held - mv_slots - pb_slots - rs_slots)
 
     logger.info(
-        "Monday open [%s]: held=%d (mv=%d pb=%d rs=%d) | slots: mv=%d pb=%d rs=%d | max_pos=%d",
-        mode, total_held, mv_held, pb_held, rs_held, mv_slots, pb_slots, rs_slots, max_pos,
+        "Monday open [%s]: held=%d (mv=%d pb=%d rs=%d pead=%d) | "
+        "slots: mv=%d pb=%d rs=%d pead=%d | max_pos=%d",
+        mode, total_held, mv_held, pb_held, rs_held, pead_held,
+        mv_slots, pb_slots, rs_slots, pead_slots, max_pos,
     )
 
     # Fetch Minervini picks (screener_type = 'minervini' or 'both')
@@ -608,7 +618,22 @@ def run_monday_open(db: Session, mode: str | None = None):
         {"slots": rs_slots, "mode": mode},
     ).fetchall() if rs_slots > 0 else []
 
-    rows = list(mv_rows) + list(pb_rows) + list(rs_rows)
+    # Fetch PEAD picks (screener_type = 'pead')
+    pead_rows = db.execute(
+        text("""
+            SELECT symbol, entry_price, stop_price, target1, target2,
+                   screener_type
+            FROM weekly_plan
+            WHERE week_start = (SELECT MAX(week_start) FROM weekly_plan WHERE mode = :mode)
+              AND mode = :mode AND status = 'PENDING'
+              AND screener_type = 'pead'
+            ORDER BY rank ASC
+            LIMIT :slots
+        """),
+        {"slots": pead_slots, "mode": mode},
+    ).fetchall() if pead_slots > 0 else []
+
+    rows = list(mv_rows) + list(pb_rows) + list(rs_rows) + list(pead_rows)
 
     if not rows:
         logger.info("Monday open: no PENDING picks for mode=%s.", mode)
@@ -644,39 +669,43 @@ def run_monday_open(db: Session, mode: str | None = None):
         # _compute_fresh_exits derives structurally-anchored levels from
         # current EMA20/EMA50, so the bracket placed today reflects where
         # the market actually is — not where it was Thursday evening.
-        try:
-            from .trader import _compute_fresh_exits
-            fresh_stop, fresh_target, basis = _compute_fresh_exits(db, sym, entry)
-            if fresh_stop > 0 and stop > 0 and abs(fresh_stop - stop) / stop > 0.01:
-                logger.info(
-                    "Monday open: %s fresh stop $%.2f→$%.2f (basis=%s)",
-                    sym, stop, fresh_stop, basis,
+        # PEAD exception: the stop IS the gap-day low (structural thesis anchor).
+        # Overwriting it with an EMA-derived stop would invalidate the strategy —
+        # skip fresh-exit derivation entirely for PEAD picks.
+        if stype != "pead":
+            try:
+                from .trader import _compute_fresh_exits
+                fresh_stop, fresh_target, basis = _compute_fresh_exits(db, sym, entry)
+                if fresh_stop > 0 and stop > 0 and abs(fresh_stop - stop) / stop > 0.01:
+                    logger.info(
+                        "Monday open: %s fresh stop $%.2f→$%.2f (basis=%s)",
+                        sym, stop, fresh_stop, basis,
+                    )
+                    stop, target = fresh_stop, fresh_target
+                    # Persist so fill_open_slots and the exit guard see the same values
+                    try:
+                        db.execute(
+                            text("""
+                                UPDATE weekly_plan
+                                SET stop_price = :s, target1 = :t
+                                WHERE symbol = :sym AND mode = :mode
+                                  AND week_start = (
+                                      SELECT MAX(week_start) FROM weekly_plan WHERE mode = :mode
+                                  )
+                            """),
+                            {"s": stop, "t": target, "sym": sym, "mode": mode},
+                        )
+                        db.commit()
+                    except Exception as _upd_exc:
+                        logger.warning(
+                            "Monday open: could not persist fresh exits for %s: %s", sym, _upd_exc,
+                        )
+                        db.rollback()
+            except Exception as _fe_exc:
+                logger.warning(
+                    "Monday open: fresh exits failed for %s (%s) — using screener values",
+                    sym, _fe_exc,
                 )
-                stop, target = fresh_stop, fresh_target
-                # Persist so fill_open_slots and the exit guard see the same values
-                try:
-                    db.execute(
-                        text("""
-                            UPDATE weekly_plan
-                            SET stop_price = :s, target1 = :t
-                            WHERE symbol = :sym AND mode = :mode
-                              AND week_start = (
-                                  SELECT MAX(week_start) FROM weekly_plan WHERE mode = :mode
-                              )
-                        """),
-                        {"s": stop, "t": target, "sym": sym, "mode": mode},
-                    )
-                    db.commit()
-                except Exception as _upd_exc:
-                    logger.warning(
-                        "Monday open: could not persist fresh exits for %s: %s", sym, _upd_exc,
-                    )
-                    db.rollback()
-        except Exception as _fe_exc:
-            logger.warning(
-                "Monday open: fresh exits failed for %s (%s) — using screener values",
-                sym, _fe_exc,
-            )
 
         # ── Live price deviation check ─────────────────────────────────────
         # Plan entry was computed Thu/Fri. By Monday open the stock may have
@@ -705,10 +734,10 @@ def run_monday_open(db: Session, mode: str | None = None):
                     )
                     continue
                 elif _dev_pct < -_max_dev:
-                    if stype in ("minervini", "both", "rs_momentum"):
+                    if stype in ("minervini", "both", "rs_momentum", "pead"):
                         logger.info(
                             "Monday open: skipping %s — gapped DOWN %.1f%% below plan $%.2f "
-                            "(live=$%.2f) — breakout thesis invalidated [%s]",
+                            "(live=$%.2f) — thesis invalidated [%s]",
                             sym, abs(_dev_pct), entry, _live_price, mode,
                         )
                         continue
@@ -765,11 +794,12 @@ def run_monday_open(db: Session, mode: str | None = None):
             )
             continue
 
-        if not _gate(db, sym, qty, entry, stop, target, "MONDAY_OPEN", mode, user_id=admin_uid):
+        gate_trigger = "MONDAY_OPEN_PEAD" if stype == "pead" else "MONDAY_OPEN"
+        if not _gate(db, sym, qty, entry, stop, target, gate_trigger, mode, user_id=admin_uid):
             continue
 
         try:
-            order_desc   = _place_entry(db, sym, qty, entry, stop, target, "MONDAY_OPEN", mode, stype, target2=target2, user_id=admin_uid, committed=committed)
+            order_desc   = _place_entry(db, sym, qty, entry, stop, target, gate_trigger, mode, stype, target2=target2, user_id=admin_uid, committed=committed)
             order_placed = True
             logger.info("Monday open: %s qty=%.0f — %s", sym, qty, order_desc)
 
@@ -962,8 +992,10 @@ def _refill_slot(
     """
     from .claude_analyst import analyze_slot_refill, log_analysis
 
-    mv_max = int(get_setting(db, "mv_max_slots", "3") or "3")
-    pb_max = int(get_setting(db, "pb_max_slots", "2") or "2")
+    mv_max   = int(get_setting(db, "mv_max_slots",   "3") or "3")
+    pb_max   = int(get_setting(db, "pb_max_slots",   "2") or "2")
+    rs_max   = int(get_setting(db, "rs_max_slots",   "2") or "2")
+    pead_max = int(get_setting(db, "pead_max_slots", "2") or "2")
     mv_held, pb_held, rs_held, pead_held = _count_positions_by_type(db, mode, current_positions)
 
     try:
@@ -978,24 +1010,37 @@ def _refill_slot(
     held_tuple = tuple(current_positions) if current_positions else ("__none__",)
 
     # Determine which type(s) have open slots
-    mv_available = mv_held < mv_max
-    pb_available = pb_held < pb_max
+    mv_available   = mv_held   < mv_max
+    pb_available   = pb_held   < pb_max
+    rs_available   = rs_held   < rs_max
+    pead_available = pead_held < pead_max
 
     # Build type filter: prefer same type as what closed, fall back if needed
     if closed_stype in ("minervini", "both") and mv_available:
         type_filter = ("minervini", "both")
     elif closed_stype == "pullback" and pb_available:
         type_filter = ("pullback",)
+    elif closed_stype == "rs_momentum" and rs_available:
+        type_filter = ("rs_momentum",)
+    elif closed_stype == "pead" and pead_available:
+        type_filter = ("pead",)
     elif mv_available:
         type_filter = ("minervini", "both")
-        logger.info("Slot refill: no pb slot available — trying mv pick instead")
+        logger.info("Slot refill: no %s slot available — trying mv pick instead", closed_stype)
     elif pb_available:
         type_filter = ("pullback",)
         logger.info("Slot refill: no mv slot available — trying pb pick instead")
+    elif rs_available:
+        type_filter = ("rs_momentum",)
+        logger.info("Slot refill: no mv/pb slot available — trying rs pick instead")
+    elif pead_available:
+        type_filter = ("pead",)
+        logger.info("Slot refill: no mv/pb/rs slot available — trying pead pick instead")
     else:
         logger.info(
-            "Slot refill [%s]: all strategy slots full (mv=%d/%d pb=%d/%d) — skipping",
-            mode, mv_held, mv_max, pb_held, pb_max,
+            "Slot refill [%s]: all strategy slots full "
+            "(mv=%d/%d pb=%d/%d rs=%d/%d pead=%d/%d) — skipping",
+            mode, mv_held, mv_max, pb_held, pb_max, rs_held, rs_max, pead_held, pead_max,
         )
         return
 
@@ -1150,11 +1195,12 @@ def _execute_specific_pick(db: Session, mode: str, symbol: str, pending_picks: l
         logger.info("Slot refill: %s position size < 1 share (avail=$%.2f) — skipping.", symbol, avail)
         return
 
-    if not _gate(db, symbol, qty, entry, stop, target, "SLOT_REFILL", mode, user_id=user_id):
+    refill_trigger = "SLOT_REFILL_PEAD" if stype == "pead" else "SLOT_REFILL"
+    if not _gate(db, symbol, qty, entry, stop, target, refill_trigger, mode, user_id=user_id):
         return
 
     try:
-        order_desc = _place_entry(db, symbol, qty, entry, stop, target, "SLOT_REFILL", mode, stype, target2=target2, user_id=user_id)
+        order_desc = _place_entry(db, symbol, qty, entry, stop, target, refill_trigger, mode, stype, target2=target2, user_id=user_id)
         logger.info("Slot refill: %s qty=%.0f — %s [%s]", symbol, qty, order_desc, mode)
 
         db.execute(
@@ -1249,11 +1295,12 @@ def _execute_next_pick(db: Session, mode: str, held: set, user_id: int | None = 
         return
 
     effective_uid = user_id or _resolve_admin_uid(db)
-    if not _gate(db, sym, qty, entry, stop, target, "POST_CLOSE", mode, user_id=effective_uid):
+    post_close_trigger = "POST_CLOSE_PEAD" if stype == "pead" else "POST_CLOSE"
+    if not _gate(db, sym, qty, entry, stop, target, post_close_trigger, mode, user_id=effective_uid):
         return
 
     try:
-        order_desc = _place_entry(db, sym, qty, entry, stop, target, "POST_CLOSE", mode, stype, target2=target2, user_id=effective_uid)
+        order_desc = _place_entry(db, sym, qty, entry, stop, target, post_close_trigger, mode, stype, target2=target2, user_id=effective_uid)
         logger.info("Post-close fallback: %s qty=%.0f — %s", sym, qty, order_desc)
 
         db.execute(

@@ -456,7 +456,7 @@ const SECTIONS = [
         title: 'Schedule (ET)',
         fields: [
           { key: 'pead_screener_auto_run',         label: 'Auto-run enabled',                        type: 'toggle',     defaultValue: 'true' },
-          { key: 'pead_screener_schedule_days',    label: 'Days (click to toggle)',                   type: 'day_picker', span: true, defaultValue: 'Mon,Tue,Wed,Thu,Fri' },
+          { key: 'pead_screener_schedule_days',    label: 'Days (click to toggle)',                   type: 'day_picker', span: true, defaultValue: '0,1,2,3,4' },
           { key: 'pead_screener_schedule_times',   label: 'Run times (24h ET, e.g. 17:00)',           type: 'time_list',  span: true, defaultValue: '17:00' },
         ],
       },

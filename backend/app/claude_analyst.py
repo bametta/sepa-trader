@@ -386,14 +386,24 @@ Note: Tape is context only — it does not override position-sizing rules. A CAU
             get_volume_confirmation, format_volume_for_prompt,
         )
         _earnings = get_earnings_proximity(symbol, db)
-        if is_pead and _earnings.get("days_since") is not None:
-            days_ago = _earnings["days_since"]
-            earnings_block = (
-                f"\n--- EARNINGS (POST-EVENT CONTEXT) — {symbol} ---\n"
-                f"Earnings reported ~{days_ago} day(s) ago. This is a PEAD entry — "
-                f"the earnings event is a catalyst, not a risk. "
-                f"Evaluate whether the gap-up is still intact, not whether to avoid earnings.\n"
-            )
+        if is_pead:
+            days_ago = _earnings.get("days_since")
+            if days_ago is not None:
+                earnings_block = (
+                    f"\n--- EARNINGS (POST-EVENT CONTEXT) — {symbol} ---\n"
+                    f"Earnings reported ~{days_ago} day(s) ago. This is a PEAD entry — "
+                    f"the earnings event is a catalyst, not a risk. "
+                    f"Evaluate whether the gap-up is still intact, not whether to avoid earnings.\n"
+                )
+            else:
+                # PEAD screener confirmed a gap-up; earnings cache may be stale.
+                # Treat as post-event rather than unknown risk.
+                earnings_block = (
+                    f"\n--- EARNINGS (POST-EVENT CONTEXT) — {symbol} ---\n"
+                    f"This is a PEAD entry — an earnings gap-up was detected by the screener. "
+                    f"The earnings event is a catalyst, not a risk. "
+                    f"Evaluate whether the gap-up is intact, not the earnings proximity.\n"
+                )
         else:
             earnings_block = format_earnings_for_prompt(symbol, _earnings)
         _volume      = get_volume_confirmation(symbol)
@@ -780,7 +790,12 @@ def analyze_picks(db: Session, picks: list[dict], closed_position: dict | None =
         rr = round((t1 - ep) / (ep - sp), 2) if ep > sp > 0 and t1 > ep else "N/A"
         src = p.get("screener_type", "minervini")
         score_raw = p.get("score", "?")
-        score_str = f"RS-pct={score_raw}/99" if src == "rs_momentum" else f"score={score_raw}/6"
+        if src == "rs_momentum":
+            score_str = f"RS-pct={score_raw}/99"
+        elif src == "pead":
+            score_str = f"SEPA-score={score_raw}/8"
+        else:
+            score_str = f"score={score_raw}/6"
         lines.append(
             f"{i}. {p['symbol']}  {score_str}  signal={p.get('signal','?')}"
             f"  entry=${ep:.2f}  stop=${sp:.2f}  t1=${t1:.2f}  R:R={rr}"
@@ -795,6 +810,7 @@ def analyze_picks(db: Session, picks: list[dict], closed_position: dict | None =
         "Rules: consider score, R:R ratio, signal quality, and any recent news.\n"
         "If news reveals an earnings miss, guidance cut, FDA rejection, or legal/regulatory risk, flag it.\n"
         "RS Momentum picks use EMA50 structural stops — R:R ≥1.2 is acceptable for them.\n"
+        "PEAD picks (Post-Earnings Drift) enter after an earnings gap-up — the earnings event is a catalyst. R:R ≥1.5 is acceptable. Do NOT flag past earnings as a risk for PEAD picks.\n"
         "Output the numbered list only — no preamble, no extra text."
     )
 
@@ -920,16 +936,19 @@ def analyze_picks_structured(
         rr   = round((t1 - ep) / (ep - sp), 2) if ep > sp > 0 and t1 > ep else "N/A"
         src  = p.get("screener_type", "minervini")
         src_label = {
-            "minervini":  "Minervini/SEPA",
-            "pullback":   "Pullback-to-MA (PPST+EMA)",
+            "minervini":   "Minervini/SEPA",
+            "pullback":    "Pullback-to-MA (PPST+EMA)",
             "rs_momentum": "RS Momentum (IBD-style)",
-            "both":       "Both screeners",
+            "both":        "Both screeners",
+            "pead":        "PEAD (Post-Earnings Drift)",
         }.get(src, src)
         score_raw = p.get("score", "?")
         if src == "rs_momentum":
             score_str = f"RS-percentile={score_raw}/99 (plan rank, not SEPA score)"
+        elif src == "pead":
+            score_str = f"SEPA-score={score_raw}/8"
         else:
-            score_str = f"SEPA-score={score_raw}/6"
+            score_str = f"SEPA-score={score_raw}/8"
         pick_lines.append(
             f"{i}. [{p['symbol']}]  source={src_label}  {score_str}"
             f"  signal={p.get('signal','?')}"

@@ -479,7 +479,7 @@ function PlanCard({ row, dd, ddLoading, news = [], onStatusChange, onForceBuy, t
             {row.screener_type === 'rs_momentum' ? (
               <span>RS <strong className="text-slate-200">{row.score}th</strong></span>
             ) : (
-              <span>Score <strong className="text-slate-200">{row.score}/6</strong></span>
+              <span>Score <strong className="text-slate-200">{row.score}/8</strong></span>
             )}
             <span>Entry <strong className="text-slate-200">${Number(row.entry_price).toFixed(2)}</strong></span>
             <span>Stop <strong className="text-red-400">${Number(row.stop_price).toFixed(2)}</strong></span>

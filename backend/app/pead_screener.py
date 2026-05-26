@@ -109,10 +109,10 @@ def scan_pead_opportunities(
     logger.info("PEAD scan: checking %d symbols for earnings gaps [%s]", len(universe), mode)
 
     picks: list[dict] = []
-    skipped_stage2  = 0
-    skipped_no_gap  = 0
-    skipped_rr      = 0
-    skipped_drift   = 0
+    skipped_stage2  = 0   # failed Stage 2 EMA structure
+    skipped_no_gap  = 0   # no qualifying gap found (includes drift rejections)
+    skipped_rr      = 0   # R:R below threshold
+    skipped_drift   = 0   # low SEPA score (reused counter; logged as "score")
     errors          = 0
 
     for sym in universe:
@@ -136,7 +136,7 @@ def scan_pead_opportunities(
 
             pick["score"] = score
             if score < cfg["min_sepa_score"]:
-                skipped_stage2 += 1
+                skipped_drift += 1   # "score" bucket in the log summary
                 logger.debug("PEAD: %s — SEPA score %d < %d", sym, score, cfg["min_sepa_score"])
                 continue
 
@@ -161,9 +161,9 @@ def scan_pead_opportunities(
 
     logger.info(
         "PEAD scan complete [%s]: %d candidates | "
-        "skipped no-gap=%d stage2=%d rr=%d drift=%d errors=%d",
+        "skipped no-gap/drift=%d stage2=%d score=%d rr=%d errors=%d",
         mode, len(picks), skipped_no_gap, skipped_stage2,
-        skipped_rr, skipped_drift, errors,
+        skipped_drift, skipped_rr, errors,
     )
 
     # Sort by R:R descending and cap at top_n
@@ -171,7 +171,7 @@ def scan_pead_opportunities(
     picks = picks[: cfg["top_n"]]
 
     if picks:
-        _save_pead_picks(db, picks, mode)
+        _save_pead_picks(db, picks, mode, user_id=user_id)
 
     return picks
 
@@ -394,7 +394,7 @@ def _build_universe(db: Session, mode: str) -> list[str]:
 
 # ── DB persistence ────────────────────────────────────────────────────────────
 
-def _save_pead_picks(db: Session, picks: list[dict], mode: str) -> None:
+def _save_pead_picks(db: Session, picks: list[dict], mode: str, user_id: int = 1) -> None:
     """
     Upsert PEAD picks into weekly_plan.
     Uses the current Monday as week_start so they appear in this week's plan.
@@ -442,11 +442,11 @@ def _save_pead_picks(db: Session, picks: list[dict], mode: str) -> None:
                     INSERT INTO weekly_plan
                       (week_start, mode, symbol, rank, status,
                        entry_price, stop_price, target1, target2,
-                       screener_type, signal, rationale)
+                       screener_type, signal, rationale, user_id)
                     VALUES
                       (:ws, :mode, :sym, :rank, 'PENDING',
                        :entry, :stop, :t1, :t2,
-                       'pead', :signal, :rationale)
+                       'pead', :signal, :rationale, :uid)
                 """),
                 {
                     "ws":       monday,
@@ -459,6 +459,7 @@ def _save_pead_picks(db: Session, picks: list[dict], mode: str) -> None:
                     "t2":       pick["target2"],
                     "signal":   pick["signal"],
                     "rationale": pick["rationale"][:500],
+                    "uid":      user_id,
                 },
             )
             db.commit()
