@@ -1934,19 +1934,32 @@ async def run_monitor(db: Session, user_id: int | None = None, mode: str | None 
                 except Exception:
                     pass
 
-        # PDT auto-suspend: block new entries on live accounts within $500 of the
-        # $25,000 PDT minimum (i.e. equity < $25,500).  This gives a protective
-        # cushion — volatility alone should not punch us into PDT territory.
-        # Paper accounts are unaffected.  Fires a one-shot Telegram alert per day.
-        _PDT_BUFFER = 25_500.0
-        if mode == "live" and not entries_halted and portfolio < _PDT_BUFFER:
+        # PDT guard: only block new entries when Alpaca has actually flagged the
+        # account as a pattern day trader (acct.pattern_day_trader == True) AND
+        # equity is below the $25k PDT minimum (with a $500 cushion).
+        #
+        # Buying to hold overnight is NEVER a day trade — the old code blocked
+        # all live entries whenever portfolio < $25,500 regardless of PDT status,
+        # which prevented legitimate swing-trade entries on sub-$25k accounts that
+        # had not tripped the PDT rule.
+        #
+        # pattern_day_trader = True means Alpaca has restricted the account to
+        # closing transactions only until equity is restored above $25k.
+        # daytrade_count tracks same-day roundtrips in the rolling 5-business-day
+        # window (0–3 allowed; 4th would trigger PDT flagging on an unflagged account).
+        _PDT_BUFFER        = 25_500.0
+        _is_pdt_account    = bool(getattr(acct, "pattern_day_trader", False))
+        _daytrade_count    = int(getattr(acct, "daytrade_count",    0) or 0)
+
+        if mode == "live" and not entries_halted and _is_pdt_account and portfolio < _PDT_BUFFER:
             entries_halted = True
             logger.warning(
-                "PDT BUFFER HALT [live]: portfolio=$%.2f < $%.2f threshold — "
-                "blocking new entries to preserve PDT cushion.",
-                portfolio, _PDT_BUFFER,
+                "PDT HALT [live]: account flagged as pattern day trader — "
+                "portfolio=$%.2f < $%.2f threshold, daytrade_count=%d — "
+                "blocking new entries until equity exceeds $%.2f.",
+                portfolio, _PDT_BUFFER, _daytrade_count, _PDT_BUFFER,
             )
-            # Alert once per day to avoid spam (reuses the drawdown_halt key pattern)
+            # Alert once per day to avoid spam
             _pdt_halt_key = "pdt_halt_alert_date"
             _pdt_today    = datetime.now(_ET).strftime("%Y-%m-%d")
             if get_setting(db, _pdt_halt_key, "") != _pdt_today:
@@ -1957,14 +1970,29 @@ async def run_monitor(db: Session, user_id: int | None = None, mode: str | None 
                     db.rollback()
                 try:
                     tg.send_sync(
-                        f"*PDT BUFFER HALT* [LIVE]\n\n"
-                        f"Account equity `${portfolio:,.2f}` is within $500 of the $25,000 PDT minimum.\n"
+                        f"*PDT HALT* [LIVE]\n\n"
+                        f"Account is flagged as a *pattern day trader* with equity "
+                        f"`${portfolio:,.2f}` (below $25,000 minimum).\n"
+                        f"Day trades used this week: `{_daytrade_count}/3`\n"
                         f"New entries blocked until equity exceeds `${_PDT_BUFFER:,.2f}`. "
-                        f"Exits and trailing stops still run.",
+                        f"Exits and trailing stops still run.\n"
+                        f"Deposit to restore equity above `${_PDT_BUFFER:,.2f}` to lift restriction.",
                         level="URGENT",
                     )
                 except Exception:
                     pass
+
+        elif mode == "live" and not entries_halted and not _is_pdt_account and _daytrade_count >= 2 and portfolio < _PDT_BUFFER:
+            # Soft caution only — NOT blocking entries.
+            # Account is not yet flagged as PDT but is burning through day-trade
+            # capacity on a sub-$25k account.  One more same-day roundtrip would
+            # trigger PDT flagging.  New long entries to hold overnight are still safe.
+            logger.warning(
+                "PDT CAUTION [live]: portfolio=$%.2f < $25k, daytrade_count=%d/3 — "
+                "one more same-day roundtrip would trigger PDT flagging. "
+                "Overnight entries are unaffected.",
+                portfolio, _daytrade_count,
+            )
 
         # Step 4: Weekly-plan slot fill — buys PENDING picks when capacity exists.
         # This is the primary entry mechanism (screener picks → weekly_plan → orders).
