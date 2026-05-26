@@ -544,6 +544,42 @@ def watchlist_export(
     )
 
 
+@router.post("/run-pead")
+def trigger_pead_screener(
+    background_tasks: BackgroundTasks,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Run the PEAD screener in background — detects post-earnings gap-up setups."""
+    uid  = current_user["id"]
+    mode = get_all_user_settings(db, uid).get("trading_mode", "paper")
+    log.info("Screener /run-pead triggered: uid=%s mode=%s", uid, mode)
+    set_user_setting(db, "screener_status",     "running",                  uid)
+    set_user_setting(db, "screener_error",      "",                         uid)
+    set_user_setting(db, "screener_phase",      "PEAD: scanning for gaps…", uid)
+    set_user_setting(db, "screener_started_at", str(time.time()),           uid)
+    db.commit()
+
+    def _run():
+        db2 = SessionLocal()
+        try:
+            from ..pead_screener import scan_pead_opportunities
+            picks = scan_pead_opportunities(db2, mode)
+            set_user_setting(db2, "screener_status", "done",                       uid)
+            set_user_setting(db2, "screener_phase",  f"PEAD done — {len(picks)} setup(s) found.", uid)
+            db2.commit()
+        except Exception as exc:
+            log.error("PEAD screener background run failed: %s", exc, exc_info=True)
+            set_user_setting(db2, "screener_status", "error", uid)
+            set_user_setting(db2, "screener_error",  str(exc)[:300], uid)
+            db2.commit()
+        finally:
+            db2.close()
+
+    background_tasks.add_task(_run)
+    return {"status": "started", "mode": mode}
+
+
 @router.post("/sync-tradingview")
 def sync_tradingview(
     current_user: dict = Depends(get_current_user),

@@ -2,7 +2,7 @@ import { useState, useEffect, useRef } from 'react'
 import { useQuery, useQueryClient } from 'react-query'
 import {
   fetchWeeklyPlan, fetchWeeklyDD, forceRefreshDD, fetchScreenerStatus,
-  runScreener, runMinerviniScreener, runPullbackScreener, runRsScreener,
+  runScreener, runMinerviniScreener, runPullbackScreener, runRsScreener, runPeadScreener,
   exportWatchlist, updatePlanStatus,
   fetchAnalyses, runAnalysis, fetchSettings,
   fetchWeeklyNews,
@@ -15,6 +15,8 @@ const SIGNAL_STYLE = {
   PULLBACK_EMA20: 'bg-cyan-500/20 text-cyan-300 border border-cyan-500/30',
   PULLBACK_EMA50: 'bg-blue-500/20 text-blue-300 border border-blue-500/30',
   STAGE2_WATCH:   'bg-yellow-500/20 text-yellow-300 border border-yellow-500/30',
+  RS_MOMENTUM:    'bg-teal-500/20 text-teal-300 border border-teal-500/30',
+  PEAD_DRIFT:     'bg-violet-500/20 text-violet-300 border border-violet-500/30',
   NO_SETUP:       'bg-red-500/20 text-red-400 border border-red-500/30',
 }
 
@@ -43,9 +45,11 @@ function pctColor(n) {
 }
 
 const SCREENER_BADGE = {
-  minervini: { label: 'Minervini',      cls: 'bg-indigo-500/15 text-indigo-300 border border-indigo-500/20' },
-  pullback:  { label: 'Pullback MA',    cls: 'bg-cyan-500/15   text-cyan-300   border border-cyan-500/20'   },
-  both:      { label: 'Both screeners', cls: 'bg-violet-500/15 text-violet-300 border border-violet-500/20' },
+  minervini:   { label: 'Minervini',      cls: 'bg-indigo-500/15 text-indigo-300 border border-indigo-500/20' },
+  pullback:    { label: 'Pullback MA',    cls: 'bg-cyan-500/15   text-cyan-300   border border-cyan-500/20'   },
+  both:        { label: 'Both screeners', cls: 'bg-violet-500/15 text-violet-300 border border-violet-500/20' },
+  rs_momentum: { label: 'RS Momentum',   cls: 'bg-teal-500/15   text-teal-300   border border-teal-500/20'   },
+  pead:        { label: 'PEAD',          cls: 'bg-violet-500/15 text-violet-300 border border-violet-500/25' },
 }
 
 export default function WeeklyPlan() {
@@ -276,6 +280,12 @@ export default function WeeklyPlan() {
               className="px-2 py-1.5 text-xs font-medium bg-emerald-700/80 hover:bg-emerald-600 text-white/80 disabled:opacity-50 transition-colors border-l border-white/10"
               title="Run RS Momentum only"
             >RS</button>
+            <button
+              onClick={async () => { setRunning(true); setMsg(null); setElapsed(0); try { await runPeadScreener(); refetchStatus() } catch(e) { setRunning(false); setMsg(e?.response?.data?.detail || 'Failed'); setMsgType('error') } }}
+              disabled={running}
+              className="px-2 py-1.5 text-xs font-medium bg-violet-700/80 hover:bg-violet-600 text-white/80 disabled:opacity-50 transition-colors border-l border-white/10"
+              title="Run PEAD (Post-Earnings Drift) screener only"
+            >PEAD</button>
           </div>
         </div>
       </div>

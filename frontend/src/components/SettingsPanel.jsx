@@ -23,6 +23,7 @@ const FIELD_TOOLTIPS = {
   mv_max_slots:         'Minervini can hold at most this many positions simultaneously, independent of overall capacity. Prevents one strategy from crowding out the others.',
   pb_max_slots:         'Pullback can hold at most this many simultaneous positions.',
   rs_max_slots:         'RS Momentum can hold at most this many simultaneous positions.',
+  pead_max_slots:       'PEAD (Post-Earnings Drift) can hold at most this many simultaneous positions. PEAD picks are higher-volatility by nature — keep this at 1-2.',
 
   // Minervini — Universe & Filters
   screener_universe:        'Comma-separated tickers to scan (e.g. AAPL,MSFT). Leave blank for a market-wide TradingView scan — recommended for maximum opportunity discovery.',
@@ -218,6 +219,7 @@ const SECTIONS = [
       { key: 'mv_max_slots',          label: 'Minervini slots — breakout picks (default 3)',              type: 'number' },
       { key: 'pb_max_slots',          label: 'Pullback slots — EMA pullback picks (default 2)',           type: 'number' },
       { key: 'rs_max_slots',          label: 'RS Momentum slots (default 2)',                             type: 'number' },
+      { key: 'pead_max_slots',        label: 'PEAD slots — post-earnings drift picks (default 2)',         type: 'number' },
     ],
   },
 
