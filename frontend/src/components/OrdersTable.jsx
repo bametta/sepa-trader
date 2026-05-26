@@ -60,7 +60,7 @@ function SectionCard({ title, loading, children }) {
 export function OpenOrdersTable() {
   const { data = [], isLoading } = useQuery('openOrders', () => fetchOpenOrders(), { refetchInterval: 15000 })
 
-  const headers = ['Symbol', 'Side', 'Qty', 'Type', 'Status', 'Submitted']
+  const headers = ['Symbol', 'Order Type', 'Side', 'Qty', 'Status', 'Submitted']
 
   return (
     <SectionCard title={`Open Orders${data.length ? ` (${data.length})` : ''}`} loading={isLoading}>
@@ -75,11 +75,13 @@ export function OpenOrdersTable() {
             return (
               <tr key={o.id} className={`border-t ${i === 0 ? 'border-white/5' : 'border-white/[0.03]'} hover:bg-white/[0.02] transition-colors`}>
                 <td className="py-2.5 pr-4 pl-1 font-bold text-slate-100 num">{o.symbol}</td>
+                <td className="py-2.5 pr-4">
+                  <OrderTypeBadge type={o.type} limitPrice={o.limit_price} stopPrice={o.stop_price} />
+                </td>
                 <td className={`py-2.5 pr-4 font-semibold ${SIDE_CLASS[side] || 'text-slate-400'}`}>
                   {side?.toUpperCase() || '—'}
                 </td>
                 <td className="py-2.5 pr-4 text-slate-300 num">{o.qty}</td>
-                <td className="py-2.5 pr-4 text-slate-500">{o.type?.replace('OrderType.', '')}</td>
                 <td className="py-2.5 pr-4"><StatusBadge status={o.status} /></td>
                 <td className="py-2.5 text-slate-600 num">
                   {o.submitted_at ? new Date(o.submitted_at).toLocaleString() : '—'}

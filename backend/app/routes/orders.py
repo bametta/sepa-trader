@@ -41,11 +41,13 @@ def open_orders(current_user: dict = Depends(get_current_user), db: Session = De
         {
             "id":           str(o.id),
             "symbol":       o.symbol,
-            "side":         str(o.side),
+            "side":         str(o.side).replace("OrderSide.", ""),
             "qty":          sf(o.qty, 0.0),
-            "status":       str(o.status),
-            "type":         str(o.type),
-            "order_class":  str(getattr(o, 'order_class', '') or ''),
+            "status":       str(o.status).replace("OrderStatus.", ""),
+            "type":         str(o.type).replace("OrderType.", ""),
+            "order_class":  str(getattr(o, 'order_class', '') or '').replace("OrderClass.", ""),
+            "limit_price":  sf(o.limit_price) if getattr(o, 'limit_price', None) else None,
+            "stop_price":   sf(o.stop_price)  if getattr(o, 'stop_price',  None) else None,
             "submitted_at": str(o.submitted_at),
             "mode":         mode,
         }
