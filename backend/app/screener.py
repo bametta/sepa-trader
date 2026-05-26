@@ -322,12 +322,13 @@ def run_screener(db: Session, mode: str = None, user_id: int = None, account_val
     #   2. Full-exchange unified scan — single TV request fetches universe AND
     #      SEPA indicators together, eliminating the second round-trip.
     #   3. Hardcoded DEFAULT_UNIVERSE fallback if unified scan returns nothing.
+    results_map: dict = {}   # populated by whichever universe path runs below
     universe_raw = _s("screener_universe", "")
     if universe_raw:
         universe = [s.strip().upper() for s in universe_raw.split(",") if s.strip()]
         logger.info(
             "Screener: scoring %d override symbols (source=override, mode=%s)...",
-            len(results_map), mode,
+            len(universe), mode,
         )
         results_map = batch_analyze(
             universe,

@@ -162,6 +162,22 @@ def _gate(
     except Exception as _tape_exc:
         logger.debug("Pre-trade gate: tape hard-block check failed (%s) — proceeding", _tape_exc)
 
+    # ── Dual Momentum veto: no new equity entries when DM says bonds/cash ────
+    # Reads the latest cached DM evaluation from the DB so there's no live
+    # network call during the gate.  Fails open (missing cache = no veto) so
+    # a first-run or stale cache never blocks legitimate entries.
+    try:
+        from .database import get_setting as _get_setting
+        dm_rec = _get_setting(db, "dm_recommended_symbol", "")
+        if dm_rec in ("AGG", "BIL"):
+            logger.warning(
+                "Pre-trade gate: DM signal=%s (bonds/cash) — blocking new equity entry %s [%s]",
+                dm_rec, symbol, mode,
+            )
+            return False
+    except Exception as _dm_exc:
+        logger.debug("Pre-trade gate: DM veto check failed (%s) — proceeding", _dm_exc)
+
     try:
         from .claude_analyst import pre_trade_analysis, log_pre_trade, get_stored_weekly_plan_analysis
         from .trader import _get_tape_context
@@ -196,7 +212,17 @@ def _gate(
         return True
 
     except Exception as exc:
-        logger.error("Pre-trade gate error for %s: %s — proceeding.", symbol, exc)
+        # For live accounts an unvetted entry is worse than a missed entry.
+        # Fail CLOSED on live so a broken AI connection never silently bypasses
+        # the gate when real money is at stake.  Paper fails open to keep
+        # practice sessions running during temporary outages.
+        if mode == "live":
+            logger.error(
+                "Pre-trade gate error for %s [live]: %s — BLOCKING (fail-closed on live).",
+                symbol, exc,
+            )
+            return False
+        logger.error("Pre-trade gate error for %s [paper]: %s — proceeding (fail-open on paper).", symbol, exc)
         return True
 
 

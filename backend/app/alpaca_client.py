@@ -164,65 +164,6 @@ def get_all_orders(mode: str = "paper", limit: int = 100):
     )
 
 
-def find_recent_fill(mode: str, symbol: str, side: str, days: int = 30):
-    """Return the most-recent FILLED order for (symbol, side) within `days`,
-    or None if none found. Used to reconstruct SELL fills that were executed
-    by Alpaca-side bracket OCOs (stop / take-profit) which the bot never
-    submitted itself and therefore never logged.
-    """
-    from datetime import datetime, timedelta, timezone
-    side_enum = OrderSide.SELL if side.upper() == "SELL" else OrderSide.BUY
-    after = datetime.now(timezone.utc) - timedelta(days=days)
-    try:
-        orders = get_client(mode).get_orders(
-            GetOrdersRequest(
-                status=QueryOrderStatus.CLOSED,
-                symbols=[symbol],
-                side=side_enum,
-                after=after,
-                limit=100,
-            )
-        )
-    except Exception:
-        return None
-    fills = [o for o in (orders or []) if getattr(o, "status", None) and str(o.status).lower().endswith("filled") and getattr(o, "filled_at", None)]
-    if not fills:
-        return None
-    fills.sort(key=lambda o: o.filled_at, reverse=True)
-    return fills[0]
-
-
-def find_recent_fills(mode: str, symbol: str, side: str, days: int = 30) -> list:
-    """Return ALL filled orders for (symbol, side) within `days`, sorted oldest
-    → newest. Used by _log_alpaca_side_sell to reconstruct multi-leg exits
-    (T1 then T2) so each fill becomes its own trade_log SELL row instead of
-    one row at the most-recent fill price.
-    """
-    from datetime import datetime, timedelta, timezone
-    side_enum = OrderSide.SELL if side.upper() == "SELL" else OrderSide.BUY
-    after = datetime.now(timezone.utc) - timedelta(days=days)
-    try:
-        orders = get_client(mode).get_orders(
-            GetOrdersRequest(
-                status=QueryOrderStatus.CLOSED,
-                symbols=[symbol],
-                side=side_enum,
-                after=after,
-                limit=100,
-            )
-        )
-    except Exception:
-        return []
-    fills = [
-        o for o in (orders or [])
-        if getattr(o, "status", None)
-           and str(o.status).lower().endswith("filled")
-           and getattr(o, "filled_at", None)
-    ]
-    fills.sort(key=lambda o: o.filled_at)
-    return fills
-
-
 def find_position_close_activity(mode: str, symbol: str, days: int = 90) -> list:
     """Query /account/activities for non-trade dispositions of `symbol` —
     mergers (MA), symbol/name changes (SC, NC), reorgs (REORG), cash-in-lieu

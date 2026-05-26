@@ -9,6 +9,7 @@ Auto-execution engine: fires trades based on SEPA signals.
 """
 import asyncio
 import logging
+import threading
 from datetime import datetime
 import pytz
 from sqlalchemy import text
@@ -21,6 +22,12 @@ from . import telegram_alerts as tg
 _ET = pytz.timezone("America/New_York")
 
 logger = logging.getLogger(__name__)
+
+# Lock protecting all module-level session sets below.
+# Paper and live monitor cycles can run concurrently; without this lock,
+# simultaneous add/clear/in-check on the same set can corrupt its internal
+# hash-table state even under CPython's GIL (resize + iteration race).
+_session_sets_lock: threading.Lock = threading.Lock()
 
 # Symbols blocked by PDT protection this session (cleared at market open).
 # Prevents the monitor from spamming PDT alerts every cycle when there is
@@ -579,7 +586,9 @@ def _check_t1_partial_exit(
 
         if not plan or plan[4]:         # missing plan or t1 already taken (DB truth)
             continue
-        if (sym, mode) in _t1_fired:   # in-process guard: DB commit may not have landed yet
+        with _session_sets_lock:
+            _t1_already_fired = (sym, mode) in _t1_fired
+        if _t1_already_fired:          # in-process guard: DB commit may not have landed yet
             continue
 
         t1          = float(plan[0] or 0)
@@ -593,7 +602,8 @@ def _check_t1_partial_exit(
         # ── T1 hit ─────────────────────────────────────────────────────────
         # Stamp in-process set BEFORE any I/O so a concurrent monitor cycle
         # (which may read a stale t1_taken=False from DB) won't double-exit.
-        _t1_fired.add((sym, mode))
+        with _session_sets_lock:
+            _t1_fired.add((sym, mode))
         sell_qty   = max(1, qty // 2)
         remain_qty = qty - sell_qty
         be_stop    = round(plan_entry, 2)    # breakeven = our fill entry
@@ -632,9 +642,32 @@ def _check_t1_partial_exit(
             logger.error("T1 partial exit: sell failed for %s: %s", sym, exc)
             continue
 
-        # Place fresh OCO for the remaining half: stop = BE, target = T2
+        # Place fresh OCO for the remaining half: stop = BE, target = T2.
+        # Poll until the position qty drops to remain_qty (fill confirmed) before
+        # placing the new OCO — avoids "pledged qty" rejections on pending shares.
         if remain_qty > 0:
-            import time as _t; _t.sleep(1.0)   # let the market sell settle before placing exits
+            import time as _t
+            _fill_deadline = _t.monotonic() + 8.0   # up to 8 s
+            _fill_confirmed = False
+            while _t.monotonic() < _fill_deadline:
+                try:
+                    _positions_now = alp.get_positions_for_user(db, user_id, mode)
+                    _pos_now = [p for p in _positions_now if p.symbol == sym]
+                    if _pos_now and int(float(_pos_now[0].qty)) <= remain_qty:
+                        _fill_confirmed = True
+                        break
+                    if not _pos_now:
+                        # Position fully closed — shouldn't happen at T1, but handle gracefully
+                        _fill_confirmed = True
+                        break
+                except Exception:
+                    pass
+                _t.sleep(0.5)
+            if not _fill_confirmed:
+                logger.warning(
+                    "T1 partial exit: %s sell confirmation timed out after 8s — "
+                    "placing OCO anyway (may hit Alpaca pledged-qty error)", sym,
+                )
             try:
                 alp.replace_oca_exit(sym, remain_qty, be_stop, exit_tgt, mode)
             except Exception as exc:
@@ -670,8 +703,11 @@ def _check_t1_partial_exit(
             db.rollback()
 
         # Alert (once per position per session)
-        if (sym, mode) not in _t1_alerted:
-            _t1_alerted.add((sym, mode))
+        with _session_sets_lock:
+            _t1_alert_needed = (sym, mode) not in _t1_alerted
+            if _t1_alert_needed:
+                _t1_alerted.add((sym, mode))
+        if _t1_alert_needed:
             try:
                 tg.send_sync(
                     f"*T1 PARTIAL EXIT* [{mode.upper()}] {sym}\n\n"
@@ -882,7 +918,9 @@ def _ensure_exit_orders(
         # Skip silently if Alpaca's PDT protection already blocked all exits
         # for this symbol today. The monitor will succeed tomorrow once the
         # buy is no longer a same-day trade. _pdt_blocked is cleared at open.
-        if (sym, mode) in _pdt_blocked:
+        with _session_sets_lock:
+            _is_pdt_blocked = (sym, mode) in _pdt_blocked
+        if _is_pdt_blocked:
             logger.debug(
                 "Exit guard: %s skipped — PDT-blocked this session [%s]", sym, mode
             )
@@ -908,8 +946,11 @@ def _ensure_exit_orders(
                 {"sym": sym, "mode": mode},
             ).fetchone()
             same_day_buys = int(buy_count_row[0]) if buy_count_row else 0
-            if same_day_buys >= 2 and (sym, mode) not in _size_mismatch_alerted:
-                _size_mismatch_alerted.add((sym, mode))
+            with _session_sets_lock:
+                _already_alerted = (sym, mode) in _size_mismatch_alerted
+                if same_day_buys >= 2 and not _already_alerted:
+                    _size_mismatch_alerted.add((sym, mode))
+            if same_day_buys >= 2 and not _already_alerted:
                 logger.warning(
                     "Exit guard: %s has %d BUY fills today — possible double entry [%s]",
                     sym, same_day_buys, mode,
@@ -1299,7 +1340,8 @@ def _ensure_exit_orders(
                     if "40310100" in str(stop_exc) or "pattern day trad" in str(stop_exc).lower():
                         # Alpaca is blocking even plain stop orders today.
                         # Park this symbol; the monitor will place exits tomorrow.
-                        _pdt_blocked.add((sym, mode))
+                        with _session_sets_lock:
+                            _pdt_blocked.add((sym, mode))
                         logger.error(
                             "Exit guard: %s — ALL exits blocked by PDT today; "
                             "parked until next open [%s]",
@@ -1718,20 +1760,26 @@ async def run_monitor(db: Session, user_id: int | None = None, mode: str | None 
 
         # Clear per-session alert trackers at each market open so stale flags
         # don't suppress alerts that should fire again the next trading day.
-        if market_open and (_pdt_blocked or _size_mismatch_alerted):
-            if _pdt_blocked:
+        with _session_sets_lock:
+            _pdt_snap          = frozenset(_pdt_blocked)
+            _mismatch_snap_len = len(_size_mismatch_alerted)
+            if market_open and (_pdt_blocked or _size_mismatch_alerted):
+                if _pdt_blocked:
+                    _pdt_blocked.clear()
+                if _size_mismatch_alerted:
+                    _size_mismatch_alerted.clear()
+        if market_open:
+            if _pdt_snap:
                 logger.info(
                     "run_monitor [%s]: market open — clearing %d PDT-blocked symbol(s): %s",
-                    mode, len(_pdt_blocked),
-                    [s for s, m in _pdt_blocked if m == mode],
+                    mode, len(_pdt_snap),
+                    [s for s, m in _pdt_snap if m == mode],
                 )
-                _pdt_blocked.clear()
-            if _size_mismatch_alerted:
+            if _mismatch_snap_len:
                 logger.info(
                     "run_monitor [%s]: market open — clearing %d size-mismatch alert(s)",
-                    mode, len(_size_mismatch_alerted),
+                    mode, _mismatch_snap_len,
                 )
-                _size_mismatch_alerted.clear()
 
         acct         = alp.get_account_for_user(db, user_id, mode)
         positions    = alp.get_positions_for_user(db, user_id, mode)
@@ -1855,6 +1903,38 @@ async def run_monitor(db: Session, user_id: int | None = None, mode: str | None 
                         f"*DAILY DRAWDOWN HALT* [{mode.upper()}]\n\n"
                         f"Day P&L: `{day_pnl_pct:.2f}%` (threshold `-{halt_pct:.2f}%`)\n"
                         f"New entries blocked for the rest of the session. Exits still run.",
+                        level="URGENT",
+                    )
+                except Exception:
+                    pass
+
+        # PDT auto-suspend: block new entries on live accounts within $500 of the
+        # $25,000 PDT minimum (i.e. equity < $25,500).  This gives a protective
+        # cushion — volatility alone should not punch us into PDT territory.
+        # Paper accounts are unaffected.  Fires a one-shot Telegram alert per day.
+        _PDT_BUFFER = 25_500.0
+        if mode == "live" and not entries_halted and portfolio < _PDT_BUFFER:
+            entries_halted = True
+            logger.warning(
+                "PDT BUFFER HALT [live]: portfolio=$%.2f < $%.2f threshold — "
+                "blocking new entries to preserve PDT cushion.",
+                portfolio, _PDT_BUFFER,
+            )
+            # Alert once per day to avoid spam (reuses the drawdown_halt key pattern)
+            _pdt_halt_key = "pdt_halt_alert_date"
+            _pdt_today    = datetime.now(_ET).strftime("%Y-%m-%d")
+            if get_setting(db, _pdt_halt_key, "") != _pdt_today:
+                try:
+                    set_setting(db, _pdt_halt_key, _pdt_today)
+                    db.commit()
+                except Exception:
+                    db.rollback()
+                try:
+                    tg.send_sync(
+                        f"*PDT BUFFER HALT* [LIVE]\n\n"
+                        f"Account equity `${portfolio:,.2f}` is within $500 of the $25,000 PDT minimum.\n"
+                        f"New entries blocked until equity exceeds `${_PDT_BUFFER:,.2f}`. "
+                        f"Exits and trailing stops still run.",
                         level="URGENT",
                     )
                 except Exception:

@@ -827,6 +827,17 @@ async def _dm_watchdog():
                 signal["trigger"] = reason
                 _save_signal(db, user_id, STRATEGY_DM, signal, ai_decision, mode)
 
+                # Cache the recommended symbol so the pre-trade gate can veto
+                # new equity entries without a live network call (fail-open if
+                # DM has never run or DB write fails).
+                try:
+                    from .database import set_setting as _set_global
+                    _set_global(db, "dm_recommended_symbol", signal.get("recommended_symbol", ""))
+                    db.commit()
+                except Exception as _dm_cache_exc:
+                    db.rollback()
+                    logger.debug("DM eval: failed to cache dm_recommended_symbol: %s", _dm_cache_exc)
+
                 logger.info("DM eval complete: user %d → %s [%s] (trigger: %s)",
                             user_id, ai_decision.get("decision"),
                             signal.get("recommended_symbol"), reason)
