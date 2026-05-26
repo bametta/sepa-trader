@@ -106,9 +106,12 @@ def alpaca_order_history(
             "filled_avg":   sf(o.filled_avg_price) if o.filled_avg_price else None,
             "status":       str(o.status).replace("OrderStatus.", ""),
             "type":         str(o.type).replace("OrderType.", ""),
-            "order_class":  str(getattr(o, 'order_class', '') or ''),
+            "order_class":  str(getattr(o, 'order_class', '') or '').replace("OrderClass.", ""),
+            "limit_price":  sf(o.limit_price) if getattr(o, 'limit_price', None) else None,
+            "stop_price":   sf(o.stop_price)  if getattr(o, 'stop_price',  None) else None,
             "submitted_at": str(o.submitted_at) if o.submitted_at else None,
             "filled_at":    str(o.filled_at)    if o.filled_at    else None,
+            "expires_at":   str(o.expires_at)   if getattr(o, 'expires_at', None) else None,
             "mode":         mode,
         }
         for o in orders
