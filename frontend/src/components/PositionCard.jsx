@@ -124,6 +124,14 @@ export default function PositionCard({ pos }) {
         <div>
           <div className="flex items-center gap-2">
             <div className="text-xl font-bold text-slate-100 tracking-tight num">{pos.symbol}</div>
+            {pos.screener_type === 'pead' && (
+              <span
+                title="Post-Earnings Announcement Drift — entered after an earnings gap-up"
+                className="text-[9px] font-bold uppercase tracking-widest px-1.5 py-0.5 rounded border leading-none bg-violet-500/12 border-violet-500/30 text-violet-300"
+              >
+                PEAD
+              </span>
+            )}
             {daysHeld != null && (
               <span
                 title={tsLimit

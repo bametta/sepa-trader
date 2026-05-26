@@ -350,9 +350,14 @@ Breadth   : {f"{breadth}% sector ETFs above 50MA" if breadth is not None else 'N
 Note: Tape is context only — it does not override position-sizing rules. A CAUTION/UNFAVORABLE tape warrants a WARN unless rules are clearly violated (ABORT).
 """
 
-    is_rs = "rs_momentum" in (trigger or "").lower()
-    min_rr    = 1.2 if is_rs else 2.0
-    rs_rr_note = " (RS Momentum strategy uses EMA50 structural stops — minimum is 1.2x)" if is_rs else ""
+    is_rs   = "rs_momentum" in (trigger or "").lower()
+    is_pead = "pead" in (trigger or "").lower()
+    min_rr     = 1.2 if is_rs else (1.5 if is_pead else 2.0)
+    rs_rr_note = (
+        " (RS Momentum strategy uses EMA50 structural stops — minimum is 1.2x)" if is_rs
+        else " (PEAD strategy uses gap-day-low stop — minimum is 1.5x; gap-anchored stops are tighter than SEPA stops)" if is_pead
+        else ""
+    )
 
     # Expand news window to 7 days for gate — insider-related news can lag.
     # Limit to 5 headlines to stay concise in the prompt.
@@ -372,15 +377,27 @@ Note: Tape is context only — it does not override position-sizing rules. A CAU
         insider_block = ""
 
     # Earnings proximity + volume confirmation
+    # PEAD entries enter AFTER an earnings gap — the earnings risk is a tailwind,
+    # not a threat.  Reframe the earnings block and suppress the ABORT rule.
+    is_pead = "pead" in (trigger or "").lower()
     try:
         from .market_checks import (
             get_earnings_proximity, format_earnings_for_prompt,
             get_volume_confirmation, format_volume_for_prompt,
         )
-        _earnings      = get_earnings_proximity(symbol, db)
-        earnings_block = format_earnings_for_prompt(symbol, _earnings)
-        _volume        = get_volume_confirmation(symbol)
-        volume_block   = format_volume_for_prompt(symbol, _volume)
+        _earnings = get_earnings_proximity(symbol, db)
+        if is_pead and _earnings.get("days_since") is not None:
+            days_ago = _earnings["days_since"]
+            earnings_block = (
+                f"\n--- EARNINGS (POST-EVENT CONTEXT) — {symbol} ---\n"
+                f"Earnings reported ~{days_ago} day(s) ago. This is a PEAD entry — "
+                f"the earnings event is a catalyst, not a risk. "
+                f"Evaluate whether the gap-up is still intact, not whether to avoid earnings.\n"
+            )
+        else:
+            earnings_block = format_earnings_for_prompt(symbol, _earnings)
+        _volume      = get_volume_confirmation(symbol)
+        volume_block = format_volume_for_prompt(symbol, _volume)
     except Exception as _mc_exc:
         logger.debug("pre_trade_analysis: market_checks failed for %s: %s", symbol, _mc_exc)
         earnings_block = ""
@@ -452,6 +469,7 @@ simultaneously or if a CEO/CFO liquidates a large portion of their stake with no
 Note on earnings proximity: Use ABORT when earnings are ≤5 trading days away (high risk). Use WARN
 when 6-10 trading days away — position may still be open at the event; flag it so the trader can
 decide whether to size down or set an exit before the announcement.
+{"EXCEPTION — PEAD entries: this trade is triggered by a recent earnings gap-up. The earnings event has already happened and is the catalyst, not the risk. Do NOT abort because of the recent past earnings report. Evaluate instead: is the gap still intact? Is the stock trading above the gap-day low?" if is_pead else ""}
 Note on volume: Volume confirms conviction. Use WARN (not ABORT alone) when volume is below_avg
 (ratio < 0.8×) — low volume on a breakout suggests weak institutional participation and raises
 the probability of a failed move. Strong volume (≥1.5×) is a positive signal worth noting."""

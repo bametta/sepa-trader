@@ -852,6 +852,62 @@ async def _dm_watchdog():
         db.close()
 
 
+async def _pead_screener_job():
+    """
+    Nightly PEAD scan — runs Mon–Fri at 5:00 PM ET.
+    Scans the combined universe for earnings gap-up setups and saves
+    qualifying picks to weekly_plan as screener_type='pead'.
+    Runs for both paper and live modes if live_auto_execute is enabled.
+    """
+    db = SessionLocal()
+    try:
+        admin_row = db.execute(
+            text("SELECT id FROM users WHERE role='admin' ORDER BY id LIMIT 1")
+        ).fetchone()
+        if not admin_row:
+            logger.warning("PEAD screener: no admin user found — skipping.")
+            return
+        user_id = admin_row[0]
+
+        from .pead_screener import scan_pead_opportunities
+        from .database import get_user_setting
+
+        for mode in ("paper", "live"):
+            try:
+                # Only run live scan if live credentials are configured
+                if mode == "live":
+                    live_key = get_user_setting(db, "alpaca_live_key", "", user_id)
+                    if not live_key:
+                        continue
+
+                logger.info("PEAD screener starting [%s]…", mode)
+                picks = scan_pead_opportunities(db, mode)
+                logger.info("PEAD screener [%s]: %d picks saved.", mode, len(picks))
+
+                if picks:
+                    try:
+                        from . import telegram_alerts as tg
+                        symbols = ", ".join(p["symbol"] for p in picks)
+                        tg.send_sync(
+                            f"*PEAD Screener* [{mode.upper()}] — {len(picks)} setup(s) found\n\n"
+                            + "\n".join(
+                                f"• *{p['symbol']}*  gap +{p['gap_pct']*100:.1f}%  "
+                                f"vol {p['volume_ratio']:.1f}×  "
+                                f"R:R {p['rr']:.1f}×  stop ${p['stop_price']:.2f}"
+                                for p in picks
+                            ),
+                            level="INFO",
+                        )
+                    except Exception:
+                        pass
+
+            except Exception as exc:
+                logger.error("PEAD screener [%s] failed: %s", mode, exc)
+
+    finally:
+        db.close()
+
+
 def start_scheduler():
     # Watchdog fires every minute — interval is controlled by monitor_interval_minutes setting
     scheduler.add_job(
@@ -936,6 +992,16 @@ def start_scheduler():
         _dm_watchdog,
         CronTrigger(day_of_week="mon-fri", hour=15, minute=30, timezone="America/New_York"),
         id="dm_watchdog",
+        replace_existing=True,
+    )
+
+    # PEAD screener — runs Mon–Fri at 5:00 PM ET (after market close + DM).
+    # Detects gap-up earnings setups from the day's action and adds qualifying
+    # picks to the weekly_plan so fill_open_slots picks them up next session.
+    scheduler.add_job(
+        _pead_screener_job,
+        CronTrigger(day_of_week="mon-fri", hour=17, minute=0, timezone="America/New_York"),
+        id="pead_screener",
         replace_existing=True,
     )
 

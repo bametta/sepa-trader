@@ -49,7 +49,8 @@ def positions(current_user: dict = Depends(get_current_user), db: Session = Depe
     plan_rows = db.execute(
         text("""
             SELECT DISTINCT ON (symbol)
-                symbol, stop_price, target1, target2, week_start
+                symbol, stop_price, target1, target2, week_start,
+                COALESCE(screener_type, 'minervini') AS screener_type
             FROM weekly_plan
             WHERE symbol = ANY(:syms)
               AND mode = :mode
@@ -61,10 +62,11 @@ def positions(current_user: dict = Depends(get_current_user), db: Session = Depe
 
     plan_map = {
         r[0]: {
-            "stop_price": sf(r[1]),
-            "target1":    sf(r[2]),
-            "target2":    sf(r[3]),
-            "plan_week":  str(r[4]) if r[4] else None,
+            "stop_price":    sf(r[1]),
+            "target1":       sf(r[2]),
+            "target2":       sf(r[3]),
+            "plan_week":     str(r[4]) if r[4] else None,
+            "screener_type": r[5],
         }
         for r in plan_rows
     }
@@ -165,6 +167,7 @@ def positions(current_user: dict = Depends(get_current_user), db: Session = Depe
             "target1":         plan.get("target1"),
             "target2":         plan.get("target2"),
             "plan_week":       plan.get("plan_week"),
+            "screener_type":   plan.get("screener_type", "minervini"),
             "mode":            mode,
             "days_held":       buy_map.get(p.symbol),   # trading days since BUY fill
             "time_stop_days":  time_stop_days if time_stop_days > 0 else None,

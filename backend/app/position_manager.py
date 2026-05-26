@@ -439,14 +439,15 @@ def _place_entry(
             return f"market buy"
 
 
-def _count_positions_by_type(db: Session, mode: str, symbols: set) -> tuple[int, int, int]:
+def _count_positions_by_type(db: Session, mode: str, symbols: set) -> tuple[int, int, int, int]:
     """
-    Return (mv_count, pb_count, rs_count) of currently held positions by screener type.
-    Looks up the screener_type from the most recent EXECUTED weekly_plan row.
-    'both' and 'minervini' → mv; 'pullback' → pb; 'rs_momentum' → rs.
+    Return (mv_count, pb_count, rs_count, pead_count) of currently held
+    positions by screener type.  Looks up screener_type from the most recent
+    EXECUTED weekly_plan row for each symbol.
+    'both'/'minervini' → mv; 'pullback' → pb; 'rs_momentum' → rs; 'pead' → pead.
     """
     if not symbols:
-        return 0, 0, 0
+        return 0, 0, 0, 0
     rows = db.execute(
         text("""
             SELECT COALESCE(screener_type, 'minervini') AS stype, COUNT(*) AS cnt
@@ -460,15 +461,17 @@ def _count_positions_by_type(db: Session, mode: str, symbols: set) -> tuple[int,
         """),
         {"syms": tuple(symbols), "mode": mode},
     ).fetchall()
-    mv, pb, rs = 0, 0, 0
+    mv, pb, rs, pead = 0, 0, 0, 0
     for stype, cnt in rows:
         if stype in ("minervini", "both"):
             mv += cnt
         elif stype == "rs_momentum":
             rs += cnt
+        elif stype == "pead":
+            pead += cnt
         else:
             pb += cnt
-    return mv, pb, rs
+    return mv, pb, rs, pead
 
 
 def _get_symbol_screener_type(db: Session, symbol: str, mode: str) -> str:
@@ -549,7 +552,7 @@ def run_monday_open(db: Session, mode: str | None = None):
         return
 
     held_symbols   = {p.symbol for p in positions}
-    mv_held, pb_held, rs_held = _count_positions_by_type(db, mode, held_symbols)
+    mv_held, pb_held, rs_held, pead_held = _count_positions_by_type(db, mode, held_symbols)
 
     mv_slots = min(max(0, mv_max - mv_held), max_pos - total_held)
     pb_slots = min(max(0, pb_max - pb_held), max_pos - total_held - mv_slots)
@@ -961,7 +964,7 @@ def _refill_slot(
 
     mv_max = int(get_setting(db, "mv_max_slots", "3") or "3")
     pb_max = int(get_setting(db, "pb_max_slots", "2") or "2")
-    mv_held, pb_held, rs_held = _count_positions_by_type(db, mode, current_positions)
+    mv_held, pb_held, rs_held, pead_held = _count_positions_by_type(db, mode, current_positions)
 
     try:
         acct         = alp.get_account_for_user(db, user_id or _resolve_admin_uid(db), mode)
@@ -1394,14 +1397,16 @@ def fill_open_slots(
     if total_held >= max_pos:
         return
 
-    rs_max = int(get_setting(db, "rs_max_slots", "2") or "2")
+    rs_max   = int(get_setting(db, "rs_max_slots",   "2") or "2")
+    pead_max = int(get_setting(db, "pead_max_slots", "2") or "2")
 
-    mv_held, pb_held, rs_held = _count_positions_by_type(db, mode, held_symbols)
-    mv_slots = max(0, mv_max - mv_held)
-    pb_slots = max(0, pb_max - pb_held)
-    rs_slots = max(0, rs_max - rs_held)
+    mv_held, pb_held, rs_held, pead_held = _count_positions_by_type(db, mode, held_symbols)
+    mv_slots   = max(0, mv_max   - mv_held)
+    pb_slots   = max(0, pb_max   - pb_held)
+    rs_slots   = max(0, rs_max   - rs_held)
+    pead_slots = max(0, pead_max - pead_held)
 
-    if mv_slots == 0 and pb_slots == 0 and rs_slots == 0:
+    if mv_slots == 0 and pb_slots == 0 and rs_slots == 0 and pead_slots == 0:
         logger.debug("fill_open_slots [%s]: all strategy slots full — skipping.", mode)
         return
 
@@ -1435,8 +1440,8 @@ def fill_open_slots(
         return
 
     logger.info(
-        "fill_open_slots [%s]: %d PENDING picks | slots mv=%d pb=%d rs=%d | held=%d/%d",
-        mode, len(rows), mv_slots, pb_slots, rs_slots, total_held, max_pos,
+        "fill_open_slots [%s]: %d PENDING picks | slots mv=%d pb=%d rs=%d pead=%d | held=%d/%d",
+        mode, len(rows), mv_slots, pb_slots, rs_slots, pead_slots, total_held, max_pos,
     )
 
     # Build cooldown set: symbols sold within the last 8 hours — never re-enter same day
@@ -1482,13 +1487,48 @@ def fill_open_slots(
         elif stype == "rs_momentum":
             if rs_slots <= 0:
                 continue
+        elif stype == "pead":
+            if pead_slots <= 0:
+                continue
+
+        # PEAD picks: gap-anchored exits are already computed by the screener.
+        # Use the stored stop/target directly — don't re-derive from EMAs.
+        # Apply a tight deviation guard: if price has drifted >5% from plan
+        # entry (gap filled or too extended), skip — the setup is no longer valid.
+        if stype == "pead":
+            signal = "PEAD_DRIFT"
+            try:
+                from .tv_analyzer import analyze as _tv_analyze
+                _pead_tech = _tv_analyze(sym, db=db) or {}
+                _pead_px   = float(_pead_tech.get("price") or 0)
+            except Exception:
+                _pead_px = 0.0
+            price = _pead_px if _pead_px > 0 else entry
+
+            # Gap-fill guard: skip if price dropped below the plan stop (gap filled)
+            if price > 0 and stop > 0 and price <= stop:
+                logger.info(
+                    "fill_open_slots: PEAD %s price=$%.2f <= stop=$%.2f — "
+                    "gap filled, setup invalid [%s]", sym, price, stop, mode,
+                )
+                continue
+
+            # Drift guard: skip if price is >5% above the plan entry (too extended)
+            if price > 0 and entry > 0:
+                _pead_dev = (price - entry) / entry * 100
+                if _pead_dev > 5.0:
+                    logger.info(
+                        "fill_open_slots: PEAD %s price=+%.1f%% above plan entry — "
+                        "too extended to enter safely [%s]", sym, _pead_dev, mode,
+                    )
+                    continue
 
         # RS momentum picks are already in Stage 2 by screener definition —
         # skip SEPA signal confirmation but still fetch the live price so
         # sizing and order placement are anchored to the current market, not
         # the stale screener entry.  Also apply the deviation guard so a pick
         # that has run too far or gapped down is skipped just like Minervini.
-        if stype == "rs_momentum":
+        elif stype == "rs_momentum":
             signal = "RS_MOMENTUM"
             try:
                 from .tv_analyzer import analyze as _tv_analyze
@@ -1528,7 +1568,11 @@ def fill_open_slots(
         # current technicals keeps R:R and risk sizing honest, and ensures
         # the pre-trade gate sees current numbers — not what the screener
         # froze on Monday.
+        # PEAD: skip re-evaluation — the gap-day low stop is the thesis anchor.
+        # Replacing it with EMA-derived levels would defeat the whole strategy.
         try:
+            if stype == "pead":
+                raise ValueError("PEAD: skip re-evaluation — use gap-anchored exits")
             from .trader import _compute_fresh_exits
             fresh_stop, fresh_target, basis = _compute_fresh_exits(db, sym, price)
             if fresh_stop > 0 and fresh_target > 0:
@@ -1623,16 +1667,21 @@ def fill_open_slots(
             held_symbols.add(sym)
             total_held += 1
             if stype in ("minervini", "both"):
-                mv_held  += 1
-                mv_slots -= 1
+                mv_held    += 1
+                mv_slots   -= 1
             elif stype == "rs_momentum":
-                rs_held  += 1
-                rs_slots -= 1
+                rs_held    += 1
+                rs_slots   -= 1
+            elif stype == "pead":
+                pead_held  += 1
+                pead_slots -= 1
             else:
-                pb_held  += 1
-                pb_slots -= 1
+                pb_held    += 1
+                pb_slots   -= 1
 
-            if total_held >= max_pos or (mv_slots == 0 and pb_slots == 0 and rs_slots == 0):
+            if total_held >= max_pos or (
+                mv_slots == 0 and pb_slots == 0 and rs_slots == 0 and pead_slots == 0
+            ):
                 break
 
         except Exception as exc:

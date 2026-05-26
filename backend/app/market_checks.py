@@ -54,13 +54,16 @@ def get_earnings_proximity(symbol: str, db=None) -> dict:
         return {
             "earnings_date":    None,
             "days_to_earnings": None,
+            "days_since":       None,
             "trading_days":     None,
             "risk_level":       "unknown",
             "summary":          "Next earnings date unknown — treat as elevated risk.",
         }
 
     cal_days  = (next_earn - today).days
-    trad_days = max(0, int(cal_days * 5 / 7))
+    # Positive = days until next earnings; negative = days since last earnings
+    days_since = abs(cal_days) if cal_days < 0 else None
+    trad_days  = max(0, int(cal_days * 5 / 7))
 
     if trad_days <= 5:
         risk = "high"
@@ -88,6 +91,7 @@ def get_earnings_proximity(symbol: str, db=None) -> dict:
     return {
         "earnings_date":    str(next_earn),
         "days_to_earnings": cal_days,
+        "days_since":       days_since,
         "trading_days":     trad_days,
         "risk_level":       risk,
         "summary":          summary,
