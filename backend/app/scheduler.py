@@ -860,12 +860,21 @@ async def _pead_screener_watchdog():
     """
     db = SessionLocal()
     run_key = None
+    admin_uid = None
     try:
+        # Resolve admin user first so we can read user-scoped settings
+        admin_row = db.execute(
+            text("SELECT id FROM users WHERE role='admin' ORDER BY id LIMIT 1")
+        ).fetchone()
+        admin_uid = admin_row[0] if admin_row else None
+
         # Check both the master enable toggle (pead_screener_enabled) and the
         # auto-run schedule toggle (pead_screener_auto_run) — both must be true.
-        if get_setting(db, "pead_screener_enabled",  "true") not in ("true", "1", ""):
+        # Use user-scoped settings so the toggle in SettingsPanel is respected.
+        from .database import get_user_setting as _gus
+        if _gus(db, "pead_screener_enabled",  "true", admin_uid) not in ("true", "1", ""):
             return
-        if get_setting(db, "pead_screener_auto_run", "true") != "true":
+        if _gus(db, "pead_screener_auto_run", "true", admin_uid) != "true":
             return
 
         now_et  = datetime.now(_ET)
@@ -885,29 +894,26 @@ async def _pead_screener_watchdog():
     if not run_key:
         return
 
+    if admin_uid is None:
+        logger.warning("PEAD screener: no admin user found — skipping.")
+        return
+
     db2 = SessionLocal()
     try:
-        admin_row = db2.execute(
-            text("SELECT id FROM users WHERE role='admin' ORDER BY id LIMIT 1")
-        ).fetchone()
-        if not admin_row:
-            logger.warning("PEAD screener: no admin user found — skipping.")
-            return
-        user_id = admin_row[0]
-
         from .pead_screener import scan_pead_opportunities
         from .database import get_user_setting
 
         total_picks = 0
+        had_error   = False
         for mode in ("paper", "live"):
             try:
                 if mode == "live":
-                    live_key = get_user_setting(db2, "alpaca_live_key", "", user_id)
+                    live_key = get_user_setting(db2, "alpaca_live_key", "", admin_uid)
                     if not live_key:
                         continue
 
                 logger.info("Scheduled PEAD screener starting [%s] (%s ET)…", mode, run_key)
-                picks = scan_pead_opportunities(db2, mode, user_id=user_id)
+                picks = scan_pead_opportunities(db2, mode, user_id=admin_uid)
                 logger.info("Scheduled PEAD screener [%s]: %d picks saved.", mode, len(picks))
                 total_picks += len(picks)
 
@@ -928,9 +934,11 @@ async def _pead_screener_watchdog():
                         pass
 
             except Exception as exc:
+                had_error = True
                 logger.error("Scheduled PEAD screener [%s] failed: %s", mode, exc)
 
-        set_setting(db2, "screener_status", "done")
+        final_status = "error" if had_error and total_picks == 0 else "done"
+        set_setting(db2, "screener_status", final_status)
         set_setting(db2, "screener_phase",  f"PEAD done — {total_picks} setup(s) found.")
         db2.commit()
 

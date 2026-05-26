@@ -208,7 +208,7 @@ export default function PositionCard({ pos }) {
         <EmaRow label="52W Hi" value={pos.week52_high} current={pos.current_price} noColor />
       </div>
 
-      {/* Score bar */}
+      {/* Score bar — PEAD uses /8 with a lower passing bar (min 3); others use /8 too */}
       <div>
         <div className="flex justify-between label mb-2">
           <span>Stage 2 Score</span>
@@ -216,11 +216,18 @@ export default function PositionCard({ pos }) {
         </div>
         <div className="h-1.5 bg-white/5 rounded-full overflow-hidden">
           <div
-            className={`h-full rounded-full transition-all duration-700 ${
-              pos.score >= 7 ? 'bg-gradient-to-r from-emerald-500 to-emerald-400' :
-              pos.score >= 5 ? 'bg-gradient-to-r from-amber-500 to-yellow-400' :
-                               'bg-gradient-to-r from-red-600 to-red-500'
-            }`}
+            className={`h-full rounded-full transition-all duration-700 ${(() => {
+              if (pos.screener_type === 'pead') {
+                // PEAD min passing score is 3/8 — amber starts at 3, green at 6
+                return pos.score >= 6 ? 'bg-gradient-to-r from-emerald-500 to-emerald-400'
+                     : pos.score >= 3 ? 'bg-gradient-to-r from-amber-500 to-yellow-400'
+                     :                  'bg-gradient-to-r from-red-600 to-red-500'
+              }
+              // Standard SEPA score thresholds (out of 8)
+              return pos.score >= 7 ? 'bg-gradient-to-r from-emerald-500 to-emerald-400'
+                   : pos.score >= 5 ? 'bg-gradient-to-r from-amber-500 to-yellow-400'
+                   :                  'bg-gradient-to-r from-red-600 to-red-500'
+            })()}`}
             style={{ width: `${(pos.score / 8) * 100}%` }}
           />
         </div>

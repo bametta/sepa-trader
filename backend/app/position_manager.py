@@ -799,12 +799,8 @@ def run_monday_open(db: Session, mode: str | None = None):
             continue
 
         try:
-            order_desc   = _place_entry(db, sym, qty, entry, stop, target, gate_trigger, mode, stype, target2=target2, user_id=admin_uid, committed=committed)
-            order_placed = True
+            order_desc = _place_entry(db, sym, qty, entry, stop, target, gate_trigger, mode, stype, target2=target2, user_id=admin_uid, committed=committed)
             logger.info("Monday open: %s qty=%.0f — %s", sym, qty, order_desc)
-
-            if not order_placed:
-                continue
 
             db.execute(
                 text("""
@@ -819,9 +815,9 @@ def run_monday_open(db: Session, mode: str | None = None):
             db.execute(
                 text("""
                     INSERT INTO trade_log (symbol, action, qty, price, trigger, mode)
-                    VALUES (:s, 'BUY', :q, :p, 'MONDAY_OPEN', :m)
+                    VALUES (:s, 'BUY', :q, :p, :trig, :m)
                 """),
-                {"s": sym, "q": qty, "p": entry, "m": mode},
+                {"s": sym, "q": qty, "p": entry, "trig": gate_trigger, "m": mode},
             )
             db.commit()
             held.add(sym)
@@ -829,9 +825,9 @@ def run_monday_open(db: Session, mode: str | None = None):
             try:
                 from . import telegram_alerts as tg
                 from .claude_analyst import get_latest_pre_trade
-                v, r = get_latest_pre_trade(db, sym, mode)
+                v, r = get_latest_pre_trade(db, sym, mode, user_id=admin_uid)
                 tg.alert_trade_sync(
-                    "BUY", sym, qty, entry, "MONDAY_OPEN", mode,
+                    "BUY", sym, qty, entry, gate_trigger, mode,
                     ai_verdict=v, ai_reason=r,
                 )
             except Exception:
@@ -1216,18 +1212,18 @@ def _execute_specific_pick(db: Session, mode: str, symbol: str, pending_picks: l
         db.execute(
             text("""
                 INSERT INTO trade_log (symbol, action, qty, price, trigger, mode)
-                VALUES (:s, 'BUY', :q, :p, 'SLOT_REFILL', :m)
+                VALUES (:s, 'BUY', :q, :p, :trig, :m)
             """),
-            {"s": symbol, "q": qty, "p": entry, "m": mode},
+            {"s": symbol, "q": qty, "p": entry, "trig": refill_trigger, "m": mode},
         )
         db.commit()
         logger.info("Slot refill complete: opened %s [%s]", symbol, mode)
         try:
             from . import telegram_alerts as tg
             from .claude_analyst import get_latest_pre_trade
-            v, r = get_latest_pre_trade(db, symbol, mode)
+            v, r = get_latest_pre_trade(db, symbol, mode, user_id=user_id)
             tg.alert_trade_sync(
-                "BUY", symbol, qty, entry, "SLOT_REFILL", mode,
+                "BUY", symbol, qty, entry, refill_trigger, mode,
                 ai_verdict=v, ai_reason=r,
             )
         except Exception:
@@ -1238,7 +1234,27 @@ def _execute_specific_pick(db: Session, mode: str, symbol: str, pending_picks: l
 
 
 def _execute_next_pick(db: Session, mode: str, held: set, user_id: int | None = None):
-    """Fallback — execute the next PENDING pick without slot-refill analysis."""
+    """Fallback — execute the next PENDING pick without slot-refill analysis.
+    Respects per-strategy slot limits so a PEAD/RS/mv slot cap is not exceeded
+    even through this fallback path.
+    """
+    # Determine which strategy types still have open slots
+    mv_max   = int(get_setting(db, "mv_max_slots",   "3") or "3")
+    pb_max   = int(get_setting(db, "pb_max_slots",   "2") or "2")
+    rs_max   = int(get_setting(db, "rs_max_slots",   "2") or "2")
+    pead_max = int(get_setting(db, "pead_max_slots", "2") or "2")
+    held_set = held if isinstance(held, set) else set(held)
+    mv_held, pb_held, rs_held, pead_held = _count_positions_by_type(db, mode, held_set)
+    allowed_types = []
+    if mv_held   < mv_max:   allowed_types += ["minervini", "both"]
+    if pb_held   < pb_max:   allowed_types.append("pullback")
+    if rs_held   < rs_max:   allowed_types.append("rs_momentum")
+    if pead_held < pead_max: allowed_types.append("pead")
+    if not allowed_types:
+        logger.info("Post-close fallback [%s]: all strategy slots full — skipping.", mode)
+        return
+
+    allowed_tuple = tuple(set(allowed_types))
     row = db.execute(
         text("""
             SELECT symbol, entry_price, stop_price, target1, target2,
@@ -1249,10 +1265,11 @@ def _execute_next_pick(db: Session, mode: str, held: set, user_id: int | None = 
             )
               AND mode = :mode
               AND status = 'PENDING'
+              AND COALESCE(screener_type, 'minervini') = ANY(:types)
             ORDER BY rank ASC
             LIMIT 1
         """),
-        {"mode": mode},
+        {"mode": mode, "types": list(allowed_tuple)},
     ).fetchone()
 
     if not row:
@@ -1316,18 +1333,18 @@ def _execute_next_pick(db: Session, mode: str, held: set, user_id: int | None = 
         db.execute(
             text("""
                 INSERT INTO trade_log (symbol, action, qty, price, trigger, mode)
-                VALUES (:s, 'BUY', :q, :p, 'POST_CLOSE', :m)
+                VALUES (:s, 'BUY', :q, :p, :trig, :m)
             """),
-            {"s": sym, "q": qty, "p": entry, "m": mode},
+            {"s": sym, "q": qty, "p": entry, "trig": post_close_trigger, "m": mode},
         )
         db.commit()
         logger.info("Post-close fallback: opened %s [%s]", sym, mode)
         try:
             from . import telegram_alerts as tg
             from .claude_analyst import get_latest_pre_trade
-            v, r = get_latest_pre_trade(db, sym, mode)
+            v, r = get_latest_pre_trade(db, sym, mode, user_id=effective_uid)
             tg.alert_trade_sync(
-                "BUY", sym, qty, entry, "POST_CLOSE", mode,
+                "BUY", sym, qty, entry, post_close_trigger, mode,
                 ai_verdict=v, ai_reason=r,
             )
         except Exception:
@@ -1343,7 +1360,8 @@ def _run_claude_analysis(db: Session, closed_sym: str, mode: str, user_id: int |
 
         picks_rows = db.execute(
             text("""
-                SELECT symbol, score, signal, entry_price, stop_price, target1, status, rationale
+                SELECT symbol, score, signal, entry_price, stop_price, target1, status, rationale,
+                       COALESCE(screener_type, 'minervini') AS screener_type
                 FROM weekly_plan
                 WHERE week_start = (
                     SELECT MAX(week_start) FROM weekly_plan WHERE mode = :mode
@@ -1617,32 +1635,31 @@ def fill_open_slots(
         # froze on Monday.
         # PEAD: skip re-evaluation — the gap-day low stop is the thesis anchor.
         # Replacing it with EMA-derived levels would defeat the whole strategy.
-        try:
-            if stype == "pead":
-                raise ValueError("PEAD: skip re-evaluation — use gap-anchored exits")
-            from .trader import _compute_fresh_exits
-            fresh_stop, fresh_target, basis = _compute_fresh_exits(db, sym, price)
-            if fresh_stop > 0 and fresh_target > 0:
-                logger.info(
-                    "fill_open_slots: re-evaluated %s — basis=%s px=$%.2f stop=$%.2f→$%.2f target=$%.2f→$%.2f",
-                    sym, basis, price, stop, fresh_stop, target, fresh_target,
-                )
-                stop, target = fresh_stop, fresh_target
-                # Persist the refreshed plan so monitor/UI read consistent values.
-                try:
-                    db.execute(
-                        text("""
-                            UPDATE weekly_plan SET stop_price = :s, target1 = :t, entry_price = :e
-                            WHERE symbol = :sym AND mode = :mode
-                              AND week_start = (SELECT MAX(week_start) FROM weekly_plan WHERE mode = :mode)
-                        """),
-                        {"s": stop, "t": target, "e": price, "sym": sym, "mode": mode},
+        if stype != "pead":
+            try:
+                from .trader import _compute_fresh_exits
+                fresh_stop, fresh_target, basis = _compute_fresh_exits(db, sym, price)
+                if fresh_stop > 0 and fresh_target > 0:
+                    logger.info(
+                        "fill_open_slots: re-evaluated %s — basis=%s px=$%.2f stop=$%.2f→$%.2f target=$%.2f→$%.2f",
+                        sym, basis, price, stop, fresh_stop, target, fresh_target,
                     )
-                    db.commit()
-                except Exception as _exc:
-                    logger.warning("fill_open_slots: persist refreshed plan failed for %s: %s", sym, _exc)
-        except Exception as _exc:
-            logger.warning("fill_open_slots: re-evaluation failed for %s — using stored exits: %s", sym, _exc)
+                    stop, target = fresh_stop, fresh_target
+                    # Persist the refreshed plan so monitor/UI read consistent values.
+                    try:
+                        db.execute(
+                            text("""
+                                UPDATE weekly_plan SET stop_price = :s, target1 = :t, entry_price = :e
+                                WHERE symbol = :sym AND mode = :mode
+                                  AND week_start = (SELECT MAX(week_start) FROM weekly_plan WHERE mode = :mode)
+                            """),
+                            {"s": stop, "t": target, "e": price, "sym": sym, "mode": mode},
+                        )
+                        db.commit()
+                    except Exception as _exc:
+                        logger.warning("fill_open_slots: persist refreshed plan failed for %s: %s", sym, _exc)
+            except Exception as _exc:
+                logger.warning("fill_open_slots: re-evaluation failed for %s — using stored exits: %s", sym, _exc)
 
         qty = _size_qty(portfolio, price, stop, risk_pct, stop_pct)
         # Cap at max_position_pct of portfolio
@@ -1670,13 +1687,14 @@ def fill_open_slots(
             )
             continue
 
-        if not _gate(db, sym, qty, price, stop, target, f"FILL_{signal}", mode, user_id=user_id):
+        fill_trigger = "FILL_PEAD" if stype == "pead" else f"FILL_{signal}"
+        if not _gate(db, sym, qty, price, stop, target, fill_trigger, mode, user_id=user_id):
             logger.info("fill_open_slots: %s blocked by pre-trade gate.", sym)
             continue
 
         order_placed = False
         try:
-            order_desc = _place_entry(db, sym, qty, price, stop, target, f"FILL_{signal}", mode, stype, target2=target2, user_id=user_id, committed=committed)
+            order_desc = _place_entry(db, sym, qty, price, stop, target, fill_trigger, mode, stype, target2=target2, user_id=user_id, committed=committed)
             order_placed = True
             logger.info(
                 "fill_open_slots [%s]: opened %s qty=%.0f signal=%s — %s",
@@ -1696,7 +1714,7 @@ def fill_open_slots(
                     INSERT INTO trade_log (symbol, action, qty, price, trigger, mode)
                     VALUES (:s, 'BUY', :q, :p, :t, :m)
                 """),
-                {"s": sym, "q": qty, "p": price, "t": f"FILL_{signal}", "m": mode},
+                {"s": sym, "q": qty, "p": price, "t": fill_trigger, "m": mode},
             )
             db.commit()
             try:
@@ -1704,7 +1722,7 @@ def fill_open_slots(
                 from .claude_analyst import get_latest_pre_trade
                 v, r = get_latest_pre_trade(db, sym, mode, user_id=user_id)
                 tg.alert_trade_sync(
-                    "BUY", sym, qty, price, f"FILL_{signal}", mode,
+                    "BUY", sym, qty, price, fill_trigger, mode,
                     ai_verdict=v, ai_reason=r,
                 )
             except Exception:

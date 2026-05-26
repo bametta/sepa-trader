@@ -105,7 +105,7 @@ def scan_pead_opportunities(
 
     effective_lookback = lookback_days if lookback_days is not None else cfg["lookback_days"]
 
-    universe = _build_universe(db, mode)
+    universe = _build_universe(db, mode, user_id=user_id)
     logger.info("PEAD scan: checking %d symbols for earnings gaps [%s]", len(universe), mode)
 
     picks: list[dict] = []
@@ -338,7 +338,7 @@ def _check_stage2(sym: str, current_price: float, db: Session) -> tuple[int, boo
 
 # ── Universe builder ──────────────────────────────────────────────────────────
 
-def _build_universe(db: Session, mode: str) -> list[str]:
+def _build_universe(db: Session, mode: str, user_id: int = 1) -> list[str]:
     """
     Build the scan universe by combining:
     1. DEFAULT_UNIVERSE — the fixed quality watchlist
@@ -355,22 +355,23 @@ def _build_universe(db: Session, mode: str) -> list[str]:
     except Exception as exc:
         logger.warning("PEAD: could not load DEFAULT_UNIVERSE: %s", exc)
 
-    # 2. Recent weekly plan symbols (last 2 weeks, any status)
+    # 2. Recent weekly plan symbols (last 2 weeks, any status) — user-scoped
     try:
         rows = db.execute(
             text("""
                 SELECT DISTINCT symbol FROM weekly_plan
                 WHERE mode = :mode
                   AND week_start >= CURRENT_DATE - INTERVAL '14 days'
+                  AND (user_id = :uid OR user_id IS NULL)
             """),
-            {"mode": mode},
+            {"mode": mode, "uid": user_id},
         ).fetchall()
         symbols.update(r[0] for r in rows if r[0])
     except Exception as exc:
         logger.debug("PEAD: weekly_plan universe lookup failed: %s", exc)
 
     # Remove any symbols already in a PEAD PENDING pick this week
-    # (don't re-add what we already added last night)
+    # (don't re-add what we already added last night) — user-scoped
     try:
         existing = {
             r[0] for r in db.execute(
@@ -380,8 +381,9 @@ def _build_universe(db: Session, mode: str) -> list[str]:
                       AND screener_type = 'pead'
                       AND status = 'PENDING'
                       AND week_start >= CURRENT_DATE - INTERVAL '7 days'
+                      AND (user_id = :uid OR user_id IS NULL)
                 """),
-                {"mode": mode},
+                {"mode": mode, "uid": user_id},
             ).fetchall()
         }
         symbols -= existing
@@ -412,15 +414,16 @@ def _save_pead_picks(db: Session, picks: list[dict], mode: str, user_id: int = 1
     for i, pick in enumerate(picks):
         sym = pick["symbol"]
         try:
-            # Skip if already in plan this week as any status
+            # Skip if already in plan this week as any status (user-scoped)
             existing = db.execute(
                 text("""
                     SELECT status FROM weekly_plan
-                    WHERE symbol   = :sym
-                      AND mode     = :mode
+                    WHERE symbol    = :sym
+                      AND mode      = :mode
                       AND week_start = :ws
+                      AND (user_id = :uid OR user_id IS NULL)
                 """),
-                {"sym": sym, "mode": mode, "ws": monday},
+                {"sym": sym, "mode": mode, "ws": monday, "uid": user_id},
             ).fetchone()
 
             if existing:
