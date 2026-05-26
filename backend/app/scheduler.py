@@ -871,10 +871,12 @@ async def _pead_screener_watchdog():
         # Check both the master enable toggle (pead_screener_enabled) and the
         # auto-run schedule toggle (pead_screener_auto_run) — both must be true.
         # Use user-scoped settings so the toggle in SettingsPanel is respected.
+        # Logic matches _load_pead_settings: disabled only when explicitly set to
+        # "false" or "0"; default "true" (unset) means enabled.
         from .database import get_user_setting as _gus
-        if _gus(db, "pead_screener_enabled",  "true", admin_uid) not in ("true", "1", ""):
+        if _gus(db, "pead_screener_enabled",  "true", admin_uid) in ("false", "0"):
             return
-        if _gus(db, "pead_screener_auto_run", "true", admin_uid) != "true":
+        if _gus(db, "pead_screener_auto_run", "true", admin_uid) in ("false", "0"):
             return
 
         now_et  = datetime.now(_ET)

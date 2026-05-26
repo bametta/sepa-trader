@@ -7,7 +7,7 @@ import pytz
 from datetime import datetime
 from sqlalchemy import text
 from sqlalchemy.orm import Session
-from .database import get_setting, set_setting
+from .database import get_setting, set_setting, get_user_setting as _gus
 from . import alpaca_client as alp
 
 _ET = pytz.timezone("America/New_York")
@@ -34,14 +34,14 @@ def _size_qty(portfolio: float, entry: float, stop: float, risk_pct: float, stop
     return (portfolio * risk_pct / 100) / stop_dollar
 
 
-def _is_economic(db: Session, qty: float, price: float) -> bool:
+def _is_economic(db: Session, qty: float, price: float, user_id: int | None = None) -> bool:
     """Reject sub-economic orders (e.g. 1 share of a $40 stock when cash
     starvation collapses sizing). Commissions, slippage, and partial-fill
     bracket churn make these orders net-negative even on a winning thesis.
     Floor is configurable via `min_position_dollars` setting; default $500.
     """
     try:
-        floor = float(get_setting(db, "min_position_dollars", "500") or "500")
+        floor = float(_gus(db, "min_position_dollars", "500", user_id or _resolve_admin_uid(db)) or "500")
     except (TypeError, ValueError):
         floor = 500.0
     return (qty * price) >= floor
@@ -69,17 +69,18 @@ def _settled_funds_available(acct, portfolio: float, min_cash_pct: float, commit
     return max(0.0, settled - buffer - committed)
 
 
-def _effective_max_positions(db: Session, mode: str) -> int:
+def _effective_max_positions(db: Session, mode: str, user_id: int | None = None) -> int:
     """
     For live accounts under $10K, cap max_positions at 3 regardless of
     what the settings say. Paper accounts always use the settings value.
     """
-    configured = int(get_setting(db, "max_positions", "10"))
+    uid = user_id or _resolve_admin_uid(db)
+    configured = int(_gus(db, "max_positions", "10", uid))
     if mode != "live":
         return configured
     try:
         from .database import get_live_account_limits
-        acct   = alp.get_account_for_user(db, _resolve_admin_uid(db), mode)
+        acct   = alp.get_account_for_user(db, uid, mode)
         limits = get_live_account_limits(float(acct.portfolio_value))
         cap    = limits.get("max_positions")
         if cap is not None:
@@ -305,18 +306,19 @@ def _place_entry(
       mv_entry_order_type / mv_entry_slippage_pct  — Minervini/breakout picks
       pb_entry_order_type / pb_entry_slippage_pct  — Pullback-to-MA picks
     """
+    _uid = user_id or _resolve_admin_uid(db)
     if screener_type == "pullback":
-        order_type   = get_setting(db, "pb_entry_order_type",   "limit")
-        slippage_pct = float(get_setting(db, "pb_entry_slippage_pct", "0.5"))
+        order_type   = _gus(db, "pb_entry_order_type",   "limit",     _uid)
+        slippage_pct = float(_gus(db, "pb_entry_slippage_pct", "0.5", _uid))
     elif screener_type == "pead":
         # PEAD entries are at or near the current market price (gap-day close).
         # A stop-limit order would be rejected by Alpaca (stop already triggered).
         # Use limit order — same as Pullback — to capture at the current level.
         order_type   = "limit"
-        slippage_pct = float(get_setting(db, "pb_entry_slippage_pct", "0.5"))
+        slippage_pct = float(_gus(db, "pb_entry_slippage_pct", "0.5", _uid))
     else:  # minervini / rs_momentum (default — breakout-style stop-limit)
-        order_type   = get_setting(db, "mv_entry_order_type",   "stop_limit")
-        slippage_pct = float(get_setting(db, "mv_entry_slippage_pct", "1.0"))
+        order_type   = _gus(db, "mv_entry_order_type",   "stop_limit", _uid)
+        slippage_pct = float(_gus(db, "mv_entry_slippage_pct", "1.0", _uid))
 
     # Hard pre-submit cash guard. Sizing already enforces min_cash_pct on a
     # snapshot, but slippage and racing fills (other entries within the same
@@ -505,11 +507,14 @@ def run_monday_open(db: Session, mode: str | None = None):
     """
     if mode is None:
         mode = get_setting(db, "trading_mode", "paper")
+    admin_uid_early = _resolve_admin_uid(db)
     # Use mode-specific auto_execute — live is fail-safe (default off)
     if mode == "live":
-        auto_exec = get_setting(db, "live_auto_execute", "false").lower() == "true"
+        auto_exec = _gus(db, "live_auto_execute", "false", admin_uid_early).lower() == "true"
     else:
-        auto_exec = get_setting(db, "paper_auto_execute", get_setting(db, "auto_execute", "true")).lower() == "true"
+        auto_exec = _gus(db, "paper_auto_execute",
+                         _gus(db, "auto_execute", "true", admin_uid_early),
+                         admin_uid_early).lower() == "true"
     if not auto_exec:
         logger.info("Monday open [%s]: auto_execute off — skipping.", mode)
         return
@@ -540,12 +545,12 @@ def run_monday_open(db: Session, mode: str | None = None):
     except Exception as _cb_exc:
         logger.debug("Monday open: circuit-breaker check failed (%s) — proceeding", _cb_exc)
 
-    admin_uid = _resolve_admin_uid(db)
-    max_pos   = _effective_max_positions(db, mode)
-    mv_max    = int(get_setting(db, "mv_max_slots",   "3") or "3")
-    pb_max    = int(get_setting(db, "pb_max_slots",   "2") or "2")
-    rs_max    = int(get_setting(db, "rs_max_slots",   "2") or "2")
-    pead_max  = int(get_setting(db, "pead_max_slots", "2") or "2")
+    admin_uid = admin_uid_early  # already resolved above
+    max_pos   = _effective_max_positions(db, mode, admin_uid)
+    mv_max    = int(_gus(db, "mv_max_slots",   "3", admin_uid) or "3")
+    pb_max    = int(_gus(db, "pb_max_slots",   "2", admin_uid) or "2")
+    rs_max    = int(_gus(db, "rs_max_slots",   "2", admin_uid) or "2")
+    pead_max  = int(_gus(db, "pead_max_slots", "2", admin_uid) or "2")
 
     try:
         positions = alp.get_positions_for_user(db, admin_uid, mode)
@@ -646,10 +651,10 @@ def run_monday_open(db: Session, mode: str | None = None):
         logger.error("Monday open: could not fetch account: %s", exc)
         return
 
-    risk_pct         = float(get_setting(db, "risk_pct", "2.0"))
-    stop_pct         = float(get_setting(db, "stop_loss_pct", "8.0"))
-    min_cash_pct     = float(get_setting(db, "min_cash_pct",     "10.0") or "10.0")
-    max_position_pct = float(get_setting(db, "max_position_pct", "20.0") or "20.0")
+    risk_pct         = float(_gus(db, "risk_pct",         "2.0",  admin_uid))
+    stop_pct         = float(_gus(db, "stop_loss_pct",    "8.0",  admin_uid))
+    min_cash_pct     = float(_gus(db, "min_cash_pct",     "10.0", admin_uid) or "10.0")
+    max_position_pct = float(_gus(db, "max_position_pct", "20.0", admin_uid) or "20.0")
     held             = {p.symbol for p in positions}
     committed        = 0.0
 
@@ -721,7 +726,7 @@ def run_monday_open(db: Session, mode: str | None = None):
         # Threshold is configurable via entry_max_deviation_pct (default 5%).
         try:
             from .tv_analyzer import analyze as _tv_analyze
-            _max_dev = float(get_setting(db, "entry_max_deviation_pct", "5.0") or "5.0")
+            _max_dev = float(_gus(db, "entry_max_deviation_pct", "5.0", admin_uid) or "5.0")
             _live_tech  = _tv_analyze(sym, db=db) or {}
             _live_price = float(_live_tech.get("price") or 0)
             if _live_price > 0 and entry > 0:
@@ -787,7 +792,7 @@ def run_monday_open(db: Session, mode: str | None = None):
         if qty < 1:
             logger.info("Monday open: skipping %s — position size < 1 share (avail=$%.2f).", sym, avail)
             continue
-        if not _is_economic(db, qty, entry):
+        if not _is_economic(db, qty, entry, admin_uid):
             logger.info(
                 "Monday open: skipping %s — sub-economic order (qty=%d × $%.2f < min).",
                 sym, int(qty), entry,
@@ -925,10 +930,12 @@ def check_post_close(db: Session, mode: str | None = None):
         api_key = get_setting(db, "claude_api_key", "")
     # Use mode-specific auto_execute — live is fail-safe (default off)
     if mode == "live":
-        auto_exec = get_setting(db, "live_auto_execute", "false").lower() == "true"
+        auto_exec = _gus(db, "live_auto_execute", "false", admin_uid).lower() == "true"
     else:
-        auto_exec = get_setting(db, "paper_auto_execute", get_setting(db, "auto_execute", "true")).lower() == "true"
-    max_pos   = _effective_max_positions(db, mode)
+        auto_exec = _gus(db, "paper_auto_execute",
+                         _gus(db, "auto_execute", "true", admin_uid),
+                         admin_uid).lower() == "true"
+    max_pos   = _effective_max_positions(db, mode, admin_uid)
 
     for sym in closed:
         close_reason, entry_price, close_price = _infer_close_reason(db, sym, mode)
@@ -988,14 +995,15 @@ def _refill_slot(
     """
     from .claude_analyst import analyze_slot_refill, log_analysis
 
-    mv_max   = int(get_setting(db, "mv_max_slots",   "3") or "3")
-    pb_max   = int(get_setting(db, "pb_max_slots",   "2") or "2")
-    rs_max   = int(get_setting(db, "rs_max_slots",   "2") or "2")
-    pead_max = int(get_setting(db, "pead_max_slots", "2") or "2")
+    _ruid    = user_id or _resolve_admin_uid(db)
+    mv_max   = int(_gus(db, "mv_max_slots",   "3", _ruid) or "3")
+    pb_max   = int(_gus(db, "pb_max_slots",   "2", _ruid) or "2")
+    rs_max   = int(_gus(db, "rs_max_slots",   "2", _ruid) or "2")
+    pead_max = int(_gus(db, "pead_max_slots", "2", _ruid) or "2")
     mv_held, pb_held, rs_held, pead_held = _count_positions_by_type(db, mode, current_positions)
 
     try:
-        acct         = alp.get_account_for_user(db, user_id or _resolve_admin_uid(db), mode)
+        acct         = alp.get_account_for_user(db, _ruid, mode)
         portfolio    = float(acct.portfolio_value)
         cash         = float(acct.cash)
         buying_power = float(acct.buying_power)
@@ -1177,9 +1185,10 @@ def _execute_specific_pick(db: Session, mode: str, symbol: str, pending_picks: l
         logger.error("Slot refill: account fetch failed: %s", exc)
         return
 
-    risk_pct     = float(get_setting(db, "risk_pct", "2.0"))
-    stop_pct     = float(get_setting(db, "stop_loss_pct", "8.0"))
-    min_cash_pct = float(get_setting(db, "min_cash_pct", "10.0") or "10.0")
+    _esuid   = user_id or _resolve_admin_uid(db)
+    risk_pct     = float(_gus(db, "risk_pct",      "2.0",  _esuid))
+    stop_pct     = float(_gus(db, "stop_loss_pct", "8.0",  _esuid))
+    min_cash_pct = float(_gus(db, "min_cash_pct",  "10.0", _esuid) or "10.0")
     qty          = _size_qty(portfolio, entry, stop, risk_pct, stop_pct)
     avail        = _settled_funds_available(acct, portfolio, min_cash_pct, 0.0)
     if avail > 0 and entry > 0:
@@ -1239,10 +1248,11 @@ def _execute_next_pick(db: Session, mode: str, held: set, user_id: int | None = 
     even through this fallback path.
     """
     # Determine which strategy types still have open slots
-    mv_max   = int(get_setting(db, "mv_max_slots",   "3") or "3")
-    pb_max   = int(get_setting(db, "pb_max_slots",   "2") or "2")
-    rs_max   = int(get_setting(db, "rs_max_slots",   "2") or "2")
-    pead_max = int(get_setting(db, "pead_max_slots", "2") or "2")
+    _npuid   = user_id or _resolve_admin_uid(db)
+    mv_max   = int(_gus(db, "mv_max_slots",   "3", _npuid) or "3")
+    pb_max   = int(_gus(db, "pb_max_slots",   "2", _npuid) or "2")
+    rs_max   = int(_gus(db, "rs_max_slots",   "2", _npuid) or "2")
+    pead_max = int(_gus(db, "pead_max_slots", "2", _npuid) or "2")
     held_set = held if isinstance(held, set) else set(held)
     mv_held, pb_held, rs_held, pead_held = _count_positions_by_type(db, mode, held_set)
     allowed_types = []
@@ -1293,9 +1303,9 @@ def _execute_next_pick(db: Session, mode: str, held: set, user_id: int | None = 
         logger.error("Post-close fallback: account fetch failed: %s", exc)
         return
 
-    risk_pct     = float(get_setting(db, "risk_pct", "2.0"))
-    stop_pct     = float(get_setting(db, "stop_loss_pct", "8.0"))
-    min_cash_pct = float(get_setting(db, "min_cash_pct", "10.0") or "10.0")
+    risk_pct     = float(_gus(db, "risk_pct",      "2.0",  _npuid))
+    stop_pct     = float(_gus(db, "stop_loss_pct", "8.0",  _npuid))
+    min_cash_pct = float(_gus(db, "min_cash_pct",  "10.0", _npuid) or "10.0")
     qty          = _size_qty(portfolio, entry, stop, risk_pct, stop_pct)
     avail        = _settled_funds_available(acct, portfolio, min_cash_pct, 0.0)
     if avail > 0 and entry > 0:
@@ -1304,7 +1314,7 @@ def _execute_next_pick(db: Session, mode: str, held: set, user_id: int | None = 
         qty = 0
     if qty < 1:
         return
-    if not _is_economic(db, qty, entry):
+    if not _is_economic(db, qty, entry, _npuid):
         logger.info(
             "Post-close fallback: %s sub-economic (qty=%d × $%.2f < min) — skipping.",
             sym, int(qty), entry,
@@ -1417,9 +1427,10 @@ def fill_open_slots(
     Only buys when the current SEPA signal confirms entry (BREAKOUT or PULLBACK).
     Runs the AI pre-trade gate before each order.
     """
-    mv_max  = int(get_setting(db, "mv_max_slots", "3") or "3")
-    pb_max  = int(get_setting(db, "pb_max_slots", "2") or "2")
-    max_pos = _effective_max_positions(db, mode)
+    _fuid   = user_id or _resolve_admin_uid(db)
+    mv_max  = int(_gus(db, "mv_max_slots", "3", _fuid) or "3")
+    pb_max  = int(_gus(db, "pb_max_slots", "2", _fuid) or "2")
+    max_pos = _effective_max_positions(db, mode, _fuid)
 
     total_held   = len(positions)
     held_symbols = {p.symbol for p in positions}
@@ -1462,8 +1473,8 @@ def fill_open_slots(
     if total_held >= max_pos:
         return
 
-    rs_max   = int(get_setting(db, "rs_max_slots",   "2") or "2")
-    pead_max = int(get_setting(db, "pead_max_slots", "2") or "2")
+    rs_max   = int(_gus(db, "rs_max_slots",   "2", _fuid) or "2")
+    pead_max = int(_gus(db, "pead_max_slots", "2", _fuid) or "2")
 
     mv_held, pb_held, rs_held, pead_held = _count_positions_by_type(db, mode, held_symbols)
     mv_slots   = max(0, mv_max   - mv_held)
@@ -1588,6 +1599,23 @@ def fill_open_slots(
                     )
                     continue
 
+            # Persist live entry_price so UI / exit guard see the actual fill anchor,
+            # not the stale screener price. Stop & target are intentionally preserved.
+            if price != entry and price > 0:
+                try:
+                    db.execute(
+                        text("""
+                            UPDATE weekly_plan SET entry_price = :e
+                            WHERE symbol = :sym AND mode = :mode
+                              AND week_start = (SELECT MAX(week_start) FROM weekly_plan WHERE mode = :mode)
+                        """),
+                        {"e": price, "sym": sym, "mode": mode},
+                    )
+                    db.commit()
+                    entry = price  # use live price for sizing below
+                except Exception as _pe:
+                    logger.warning("fill_open_slots: PEAD entry_price update failed for %s: %s", sym, _pe)
+
         # RS momentum picks are already in Stage 2 by screener definition —
         # skip SEPA signal confirmation but still fetch the live price so
         # sizing and order placement are anchored to the current market, not
@@ -1605,7 +1633,7 @@ def fill_open_slots(
 
             # Deviation guard (same thresholds as Monday open)
             if price > 0 and entry > 0:
-                _rs_max_dev = float(get_setting(db, "entry_max_deviation_pct", "5.0") or "5.0")
+                _rs_max_dev = float(_gus(db, "entry_max_deviation_pct", "5.0", _fuid) or "5.0")
                 _rs_dev_pct = (price - entry) / entry * 100
                 if abs(_rs_dev_pct) > _rs_max_dev:
                     logger.info(
@@ -1663,8 +1691,8 @@ def fill_open_slots(
 
         qty = _size_qty(portfolio, price, stop, risk_pct, stop_pct)
         # Cap at max_position_pct of portfolio
-        max_position_pct = float(get_setting(db, "max_position_pct", "20.0") or "20.0")
-        min_cash_pct     = float(get_setting(db, "min_cash_pct",     "10.0") or "10.0")
+        max_position_pct = float(_gus(db, "max_position_pct", "20.0", _fuid) or "20.0")
+        min_cash_pct     = float(_gus(db, "min_cash_pct",     "10.0", _fuid) or "10.0")
         if price > 0:
             max_pos_shares  = int(portfolio * max_position_pct / 100 / price)
             if max_pos_shares > 0:
@@ -1680,7 +1708,7 @@ def fill_open_slots(
         if qty < 1:
             logger.info("fill_open_slots: %s qty<1 (price=$%.2f stop=$%.2f) — skipping.", sym, price, stop)
             continue
-        if not _is_economic(db, qty, price):
+        if not _is_economic(db, qty, price, _fuid):
             logger.info(
                 "fill_open_slots: %s sub-economic (qty=%d × $%.2f < min) — skipping.",
                 sym, int(qty), price,
