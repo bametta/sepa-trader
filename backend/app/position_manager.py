@@ -2087,7 +2087,7 @@ _RECONCILE_LAST_ALERT: dict[str, float] = {}
 _RECONCILE_COOLDOWN_SEC = 3600  # don't re-alert the same drift more than 1×/hour
 
 
-def reconcile_db_vs_alpaca(db: Session, mode: str) -> dict:
+def reconcile_db_vs_alpaca(db: Session, mode: str, user_id: int | None = None) -> dict:
     """Compare live Alpaca positions against the DB's view of intended state.
 
     Source of DB truth: BUY trade_log entries from the past 30 days that have
@@ -2105,8 +2105,9 @@ def reconcile_db_vs_alpaca(db: Session, mode: str) -> dict:
     import time
     from . import telegram_alerts as tg
 
+    _ruid = user_id or _resolve_admin_uid(db)
     try:
-        alpaca_syms = {p.symbol for p in alp.get_positions_for_user(db, _resolve_admin_uid(db), mode)}
+        alpaca_syms = {p.symbol for p in alp.get_positions_for_user(db, _ruid, mode)}
     except Exception as exc:
         logger.error("reconcile_db_vs_alpaca [%s]: alpaca fetch failed: %s", mode, exc)
         return {"drift": False, "error": str(exc)}
@@ -2234,7 +2235,7 @@ def reconcile_db_vs_alpaca(db: Session, mode: str) -> dict:
     # current position state as fallback) so trade_log reflects truth.
     if unexpected_in_alpaca:
         try:
-            alpaca_pos_by_sym = {p.symbol: p for p in alp.get_positions_for_user(db, _resolve_admin_uid(db), mode)}
+            alpaca_pos_by_sym = {p.symbol: p for p in alp.get_positions_for_user(db, _ruid, mode)}
         except Exception as exc:
             logger.warning("reconcile: position fetch for backfill failed: %s", exc)
             alpaca_pos_by_sym = {}

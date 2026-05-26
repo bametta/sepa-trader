@@ -35,29 +35,64 @@ async def _run_monitor_for_mode(admin_uid: int | None, mode: str) -> None:
     Runs the full monitor cycle (trailing stops → exit guard → slot fill) for
     one specific mode.  Uses an independent DB session so paper and live can
     run concurrently without sharing a connection.
+
+    check_post_close and reconcile_db_vs_alpaca are offloaded to a thread-pool
+    executor so they never block the asyncio event loop (each makes multiple
+    Alpaca API calls that could take 30-60 s).  APScheduler's max_instances=1
+    would otherwise see the watchdog still "running" on the next minute tick
+    and skip it — causing the "monitor not running every minute" symptom.
     """
+    from .position_manager import check_post_close, reconcile_db_vs_alpaca
+
     db = SessionLocal()
     try:
         result = await run_monitor(db, user_id=admin_uid, mode=mode)
-        if isinstance(result, dict) and result.get("status") == "error":
-            logger.error("Watchdog [%s]: monitor error — %s", mode, result.get("error"))
-        else:
-            logger.info(
-                "Watchdog [%s]: monitor done — portfolio=$%.0f positions=%d",
-                mode,
-                result.get("portfolio", 0),
-                len(result.get("results", [])),
-            )
-        from .position_manager import check_post_close, reconcile_db_vs_alpaca
-        check_post_close(db, mode=mode)
-        try:
-            reconcile_db_vs_alpaca(db, mode=mode)
-        except Exception as exc:
-            logger.error("Watchdog [%s]: reconciliation failed — %s", mode, exc)
     except Exception as exc:
         logger.error("Watchdog [%s]: monitor failed — %s", mode, exc, exc_info=True)
+        return
     finally:
         db.close()
+
+    if isinstance(result, dict) and result.get("status") == "error":
+        logger.error("Watchdog [%s]: monitor error — %s", mode, result.get("error"))
+        # Skip post-close and reconcile when the monitor itself errored
+        # (bad credentials, network failure, etc.) to avoid cascading errors.
+        return
+
+    logger.info(
+        "Watchdog [%s]: monitor done — portfolio=$%.0f positions=%d",
+        mode,
+        result.get("portfolio", 0) if isinstance(result, dict) else 0,
+        result.get("positions", 0) if isinstance(result, dict) else 0,
+    )
+
+    loop = asyncio.get_event_loop()
+
+    # check_post_close — own DB session, runs in thread pool
+    def _post_close():
+        _db = SessionLocal()
+        try:
+            check_post_close(_db, mode=mode)
+        except Exception as exc:
+            logger.error("Watchdog [%s]: check_post_close failed — %s", mode, exc)
+        finally:
+            _db.close()
+
+    # reconcile_db_vs_alpaca — own DB session, runs in thread pool
+    def _reconcile():
+        _db = SessionLocal()
+        try:
+            reconcile_db_vs_alpaca(_db, mode=mode, user_id=admin_uid)
+        except Exception as exc:
+            logger.error("Watchdog [%s]: reconciliation failed — %s", mode, exc)
+        finally:
+            _db.close()
+
+    await asyncio.gather(
+        loop.run_in_executor(None, _post_close),
+        loop.run_in_executor(None, _reconcile),
+        return_exceptions=True,
+    )
 
 
 async def _monitor_watchdog():
