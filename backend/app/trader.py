@@ -535,6 +535,8 @@ def _adjust_trailing_stops(
 # the remaining 50% run to target2 (3R) with an EMA20-anchored trailing stop.
 
 _t1_alerted: set = set()   # session-level dedup; prevents repeat Telegram alerts
+_t1_fired:   set = set()   # session-level gate; prevents double-exit if DB commit
+                            # hasn't landed before the next monitor cycle reads t1_taken
 
 
 def _check_t1_partial_exit(
@@ -575,7 +577,9 @@ def _check_t1_partial_exit(
             logger.warning("T1 check: DB fetch failed for %s: %s", sym, exc)
             continue
 
-        if not plan or plan[4]:   # missing plan or t1 already taken
+        if not plan or plan[4]:         # missing plan or t1 already taken (DB truth)
+            continue
+        if (sym, mode) in _t1_fired:   # in-process guard: DB commit may not have landed yet
             continue
 
         t1          = float(plan[0] or 0)
@@ -587,6 +591,9 @@ def _check_t1_partial_exit(
             continue
 
         # ── T1 hit ─────────────────────────────────────────────────────────
+        # Stamp in-process set BEFORE any I/O so a concurrent monitor cycle
+        # (which may read a stale t1_taken=False from DB) won't double-exit.
+        _t1_fired.add((sym, mode))
         sell_qty   = max(1, qty // 2)
         remain_qty = qty - sell_qty
         be_stop    = round(plan_entry, 2)    # breakeven = our fill entry
@@ -1883,9 +1890,10 @@ async def run_monitor(db: Session, user_id: int | None = None, mode: str | None 
                 _log_signal(db, sym, signal, result.get("score", 0), result.get("price"), mode)
 
                 if signal == "BREAKOUT" and result.get("price"):
-                    price               = result["price"]
+                    price          = result["price"]
                     stop, _t1, _t2 = _get_weekly_plan_exits(db, sym, mode)
-                    qty                 = _size_position(portfolio, price, risk_pct, stop_pct, stop_price=stop)
+                    target         = _t2 if _t2 > 0 else _t1   # T2 preferred; fallback to T1
+                    qty            = _size_position(portfolio, price, risk_pct, stop_pct, stop_price=stop)
 
                     # Apply min_cash_pct buffer — risk-based sizing alone doesn't
                     # respect the cash floor, so a watchlist breakout could push
