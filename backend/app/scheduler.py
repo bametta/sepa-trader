@@ -180,7 +180,7 @@ async def _premarket_exit_refresh():
         try:
             from . import alpaca_client as alp
             from .trader import _ensure_exit_orders
-            from .database import get_all_user_settings as _gaus
+            from .database import get_all_user_settings as _gaus, get_user_setting as _gus
 
             merged = _gaus(db, admin_uid)
             # Only refresh if auto_execute is on for this mode
@@ -188,6 +188,18 @@ async def _premarket_exit_refresh():
             default  = "false" if mode == "live" else "true"   # live is opt-in; paper is opt-out
             if merged.get(auto_key, default) != "true":
                 continue
+
+            # Guard: skip live refresh when no live credentials are configured.
+            # Avoids a noisy ERROR on every pre-market refresh for users who
+            # only run paper mode — the 401 from Alpaca is not an error, just
+            # "not set up yet".
+            if mode == "live":
+                live_key = _gus(db, "alpaca_live_key", "", admin_uid)
+                if not live_key:
+                    logger.debug(
+                        "Pre-market OCO refresh [live]: no live API key configured — skipping"
+                    )
+                    continue
 
             positions    = alp.get_positions_for_user(db, admin_uid, mode)
             open_orders  = alp.get_open_orders_by_symbol_for_user(db, admin_uid, mode)
@@ -203,7 +215,14 @@ async def _premarket_exit_refresh():
             logger.info("Pre-market OCO refresh [%s]: done", mode)
 
         except Exception as exc:
-            logger.error("Pre-market OCO refresh [%s] failed: %s", mode, exc)
+            exc_str = str(exc).lower()
+            if "unauthorized" in exc_str or '"401"' in exc_str or "401" in exc_str:
+                logger.warning(
+                    "Pre-market OCO refresh [%s]: Alpaca API returned unauthorized — "
+                    "verify API key and secret in Settings → Alpaca", mode,
+                )
+            else:
+                logger.error("Pre-market OCO refresh [%s] failed: %s", mode, exc)
         finally:
             db.close()
 

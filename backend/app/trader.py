@@ -1149,13 +1149,38 @@ def _ensure_exit_orders(
                     and current_target is not None
                     and current_target > oco_target
                     and _price_changed(current_target, oco_target)):
-                logger.warning(
-                    "Exit guard: %s OCO target would REGRESS $%.2f → $%.2f — "
-                    "preserving existing target to prevent T2→T1 downgrade [%s]",
-                    sym, current_target, oco_target, mode,
-                )
-                # If only the stop needs updating but target would regress,
-                # we can't do a partial OCO update — skip the full replace.
+                # Self-heal: write the Alpaca OCO target back to weekly_plan.target2
+                # so the plan reflects reality and this guard never fires again for
+                # this position. Without this, the WARNING re-fires every cycle.
+                try:
+                    db.execute(
+                        text("""
+                            UPDATE weekly_plan
+                            SET target2 = :t2
+                            WHERE symbol = :sym AND mode = :mode
+                              AND status = 'EXECUTED'
+                              AND week_start = (
+                                  SELECT MAX(week_start) FROM weekly_plan
+                                  WHERE symbol = :sym AND mode = :mode
+                                    AND status = 'EXECUTED'
+                              )
+                        """),
+                        {"t2": current_target, "sym": sym, "mode": mode},
+                    )
+                    db.commit()
+                    logger.info(
+                        "Exit guard: %s synced plan T2=$%.2f from existing OCO "
+                        "(plan had $%.2f) — preserving OCO, suppressing future re-triggers [%s]",
+                        sym, current_target, oco_target, mode,
+                    )
+                except Exception as _sync_exc:
+                    db.rollback()
+                    logger.warning(
+                        "Exit guard: %s OCO target would REGRESS $%.2f → $%.2f — "
+                        "preserving existing target (T2 sync failed: %s) [%s]",
+                        sym, current_target, oco_target, _sync_exc, mode,
+                    )
+                # Either way: don't replace the OCO — the existing target is correct.
                 continue
 
         else:
