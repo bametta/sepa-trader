@@ -25,6 +25,19 @@ const FIELD_TOOLTIPS = {
   rs_max_slots:         'RS Momentum can hold at most this many simultaneous positions.',
   pead_max_slots:       'PEAD (Post-Earnings Drift) can hold at most this many simultaneous positions. PEAD picks are higher-volatility by nature — keep this at 1-2.',
 
+  // PEAD Screener
+  pead_screener_enabled:  'Master switch for the PEAD screener. When disabled, no PEAD picks are generated or added to the weekly plan.',
+  pead_lookback_days:     'How many recent trading sessions to scan for an earnings gap-up. Default 5 = look at the last 5 trading days.',
+  pead_gap_min_pct:       'Minimum gap-up size (open vs prior close) as a percentage. Default 5 means ≥5% open gap.',
+  pead_vol_ratio_min:     'Gap-day volume must be at least this many times the 50-day average. Default 1.5 = 50% above average.',
+  pead_max_drift_pct:     'Current price must be within this % of the gap-day close. Rejects stocks that have already run too far or are reversing. Default 5.',
+  pead_min_rr:            'Minimum reward-to-risk ratio required to include a pick. The gap-anchored stop is structural and tight, so 1.5 is the minimum sensible threshold.',
+  pead_min_sepa_score:    'Minimum SEPA technical score (0–8) required. Set low (3) to allow stocks in early Stage 2 without a full 8-criterion score.',
+  pead_top_n:             'Maximum number of PEAD picks to save per scan. Best picks are ranked by R:R.',
+  pead_screener_auto_run: 'Whether the PEAD screener fires automatically at the scheduled time (Mon–Fri 5 PM ET by default).',
+  pead_screener_schedule_days:  'Which weekdays the PEAD screener auto-runs.',
+  pead_screener_schedule_times: 'Times the PEAD screener runs (24h ET). Default 17:00 = 5 PM, shortly after close.',
+
   // Minervini — Universe & Filters
   screener_universe:        'Comma-separated tickers to scan (e.g. AAPL,MSFT). Leave blank for a market-wide TradingView scan — recommended for maximum opportunity discovery.',
   screener_top_n:           'How many Minervini candidates to include in the weekly plan. Set to 0 to auto-derive from your position cap.',
@@ -416,6 +429,35 @@ const SECTIONS = [
           { key: 'rs_screener_schedule_times',   label: 'Slot 1 — Run times (24h ET, e.g. 20:00)', type: 'time_list',  span: true },
           { key: 'rs_screener_schedule_days_2',  label: 'Slot 2 — Days (optional)',                 type: 'day_picker', span: true },
           { key: 'rs_screener_schedule_times_2', label: 'Slot 2 — Run times (24h ET, e.g. 16:30)', type: 'time_list',  span: true },
+        ],
+      },
+    ],
+  },
+
+  // ── PEAD Screener ─────────────────────────────────────────────────────────
+  {
+    title: 'PEAD Screener',
+    description: 'Post-Earnings Announcement Drift — buys 1-5 days after a ≥5% gap-up on elevated volume. Stop anchored to the gap-day low; thesis dies if the gap fills.',
+    subsections: [
+      {
+        title: 'Universe & Filters',
+        fields: [
+          { key: 'pead_screener_enabled', label: 'Enable PEAD screener',                                     type: 'toggle', defaultValue: 'true', span: true },
+          { key: 'pead_lookback_days',    label: 'Gap lookback window (trading days, default 5)',             type: 'number' },
+          { key: 'pead_gap_min_pct',      label: 'Min gap-up % (default 5)',                                  type: 'number' },
+          { key: 'pead_vol_ratio_min',    label: 'Min volume ratio vs 50d avg (default 1.5)',                 type: 'number' },
+          { key: 'pead_max_drift_pct',    label: 'Max drift from gap close % — rejects extended/reversing (default 5)', type: 'number' },
+          { key: 'pead_min_rr',           label: 'Min R:R ratio (default 1.5)',                               type: 'number' },
+          { key: 'pead_min_sepa_score',   label: 'Min SEPA score 0–8 (default 3)',                            type: 'number' },
+          { key: 'pead_top_n',            label: 'Top N picks per scan (default 10)',                         type: 'number' },
+        ],
+      },
+      {
+        title: 'Schedule (ET)',
+        fields: [
+          { key: 'pead_screener_auto_run',         label: 'Auto-run enabled',                        type: 'toggle',     defaultValue: 'true' },
+          { key: 'pead_screener_schedule_days',    label: 'Days (click to toggle)',                   type: 'day_picker', span: true, defaultValue: 'Mon,Tue,Wed,Thu,Fri' },
+          { key: 'pead_screener_schedule_times',   label: 'Run times (24h ET, e.g. 17:00)',           type: 'time_list',  span: true, defaultValue: '17:00' },
         ],
       },
     ],

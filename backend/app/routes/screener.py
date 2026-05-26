@@ -564,7 +564,7 @@ def trigger_pead_screener(
         db2 = SessionLocal()
         try:
             from ..pead_screener import scan_pead_opportunities
-            picks = scan_pead_opportunities(db2, mode)
+            picks = scan_pead_opportunities(db2, mode, user_id=uid)
             set_user_setting(db2, "screener_status", "done",                       uid)
             set_user_setting(db2, "screener_phase",  f"PEAD done — {len(picks)} setup(s) found.", uid)
             db2.commit()

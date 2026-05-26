@@ -42,7 +42,7 @@ from sqlalchemy.orm import Session
 
 logger = logging.getLogger(__name__)
 
-# ── Config ────────────────────────────────────────────────────────────────────
+# ── Config (defaults — overridden by user settings in DB) ─────────────────────
 
 LOOKBACK_DAYS    = 5     # how many recent trading sessions to inspect for gaps
 MIN_GAP_PCT      = 0.05  # 5% minimum open-vs-prev-close gap
@@ -53,12 +53,41 @@ MIN_SEPA_SCORE   = 3     # skip clear junk; full SEPA bar (≥5) not required
 STOP_BUFFER      = 0.99  # stop = gap_day_low × STOP_BUFFER
 
 
+def _load_pead_settings(db: Session, user_id: int) -> dict:
+    """Read user-configurable PEAD thresholds from the settings table."""
+    from .database import get_user_setting as _gs
+
+    def _f(key: str, default: float) -> float:
+        try:
+            return float(_gs(db, key, str(default), user_id) or default)
+        except (TypeError, ValueError):
+            return default
+
+    def _i(key: str, default: int) -> int:
+        try:
+            return int(float(_gs(db, key, str(default), user_id) or default))
+        except (TypeError, ValueError):
+            return default
+
+    return {
+        "lookback_days":    _i("pead_lookback_days",   LOOKBACK_DAYS),
+        "min_gap_pct":      _f("pead_gap_min_pct",     MIN_GAP_PCT * 100) / 100,
+        "min_vol_ratio":    _f("pead_vol_ratio_min",   MIN_VOLUME_RATIO),
+        "max_drift_pct":    _f("pead_max_drift_pct",   MAX_DRIFT_PCT * 100) / 100,
+        "min_rr":           _f("pead_min_rr",          MIN_RR),
+        "min_sepa_score":   _i("pead_min_sepa_score",  MIN_SEPA_SCORE),
+        "top_n":            _i("pead_top_n",            10),
+        "enabled":          _gs(db, "pead_screener_enabled", "true", user_id) not in ("false", "0", ""),
+    }
+
+
 # ── Main scan ─────────────────────────────────────────────────────────────────
 
 def scan_pead_opportunities(
     db: Session,
     mode: str,
-    lookback_days: int = LOOKBACK_DAYS,
+    user_id: int = 1,
+    lookback_days: int | None = None,
 ) -> list[dict]:
     """
     Scan the combined universe (DEFAULT_UNIVERSE + current weekly plan)
@@ -68,6 +97,14 @@ def scan_pead_opportunities(
       symbol, entry_price, stop_price, target1, target2,
       gap_date, gap_pct, volume_ratio, rr, score, signal, rationale
     """
+    cfg = _load_pead_settings(db, user_id)
+
+    if not cfg["enabled"]:
+        logger.info("PEAD screener disabled for user %s — skipping.", user_id)
+        return []
+
+    effective_lookback = lookback_days if lookback_days is not None else cfg["lookback_days"]
+
     universe = _build_universe(db, mode)
     logger.info("PEAD scan: checking %d symbols for earnings gaps [%s]", len(universe), mode)
 
@@ -80,7 +117,12 @@ def scan_pead_opportunities(
 
     for sym in universe:
         try:
-            pick = _evaluate_symbol(sym, db, lookback_days)
+            pick = _evaluate_symbol(
+                sym, db, effective_lookback,
+                min_gap_pct=cfg["min_gap_pct"],
+                min_vol_ratio=cfg["min_vol_ratio"],
+                max_drift_pct=cfg["max_drift_pct"],
+            )
             if pick is None:
                 skipped_no_gap += 1
                 continue
@@ -93,15 +135,15 @@ def scan_pead_opportunities(
                 continue
 
             pick["score"] = score
-            if score < MIN_SEPA_SCORE:
+            if score < cfg["min_sepa_score"]:
                 skipped_stage2 += 1
-                logger.debug("PEAD: %s — SEPA score %d < %d", sym, score, MIN_SEPA_SCORE)
+                logger.debug("PEAD: %s — SEPA score %d < %d", sym, score, cfg["min_sepa_score"])
                 continue
 
             # Validate R:R
-            if pick.get("rr", 0) < MIN_RR:
+            if pick.get("rr", 0) < cfg["min_rr"]:
                 skipped_rr += 1
-                logger.debug("PEAD: %s — R:R %.2f < %.1f", sym, pick["rr"], MIN_RR)
+                logger.debug("PEAD: %s — R:R %.2f < %.1f", sym, pick["rr"], cfg["min_rr"])
                 continue
 
             logger.info(
@@ -124,6 +166,10 @@ def scan_pead_opportunities(
         skipped_rr, skipped_drift, errors,
     )
 
+    # Sort by R:R descending and cap at top_n
+    picks.sort(key=lambda p: p.get("rr", 0), reverse=True)
+    picks = picks[: cfg["top_n"]]
+
     if picks:
         _save_pead_picks(db, picks, mode)
 
@@ -136,6 +182,9 @@ def _evaluate_symbol(
     sym: str,
     db: Session,
     lookback_days: int,
+    min_gap_pct: float = MIN_GAP_PCT,
+    min_vol_ratio: float = MIN_VOLUME_RATIO,
+    max_drift_pct: float = MAX_DRIFT_PCT,
 ) -> Optional[dict]:
     """
     Fetch OHLCV and check for a qualifying PEAD gap.
@@ -185,7 +234,7 @@ def _evaluate_symbol(
         gap_pct    = (day_open - prev_close) / prev_close
         vol_ratio  = day_vol / avg_vol_50d
 
-        if gap_pct >= MIN_GAP_PCT and vol_ratio >= MIN_VOLUME_RATIO:
+        if gap_pct >= min_gap_pct and vol_ratio >= min_vol_ratio:
             # Take the most recent qualifying gap
             gap_row = recent.iloc[i]
             gap_idx = i
@@ -206,7 +255,7 @@ def _evaluate_symbol(
     # Current price must not be more than MAX_DRIFT_PCT from the gap-day close
     # (either direction: too extended above = chasing; below gap close = reversing)
     drift_from_close = (current_price - gap_day_close) / gap_day_close
-    if abs(drift_from_close) > MAX_DRIFT_PCT:
+    if abs(drift_from_close) > max_drift_pct:
         return None
 
     # Compute exits anchored to the gap-day low

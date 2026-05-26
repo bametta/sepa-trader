@@ -60,6 +60,17 @@ EDITABLE_KEYS = {
     "rs_exchanges", "rs_excluded_sectors",
     # PEAD screener settings
     "pead_max_slots",
+    "pead_screener_enabled",
+    "pead_lookback_days",
+    "pead_gap_min_pct",
+    "pead_vol_ratio_min",
+    "pead_max_drift_pct",
+    "pead_min_rr",
+    "pead_min_sepa_score",
+    "pead_top_n",
+    "pead_screener_auto_run",
+    "pead_screener_schedule_days",
+    "pead_screener_schedule_times",
     # Plan diversity / merge settings
     "screener_min_rr", "max_picks_per_sector",
     # Cash floor

@@ -852,16 +852,38 @@ async def _dm_watchdog():
         db.close()
 
 
-async def _pead_screener_job():
+async def _pead_screener_watchdog():
     """
-    Nightly PEAD scan — runs Mon–Fri at 5:00 PM ET.
-    Scans the combined universe for earnings gap-up setups and saves
-    qualifying picks to weekly_plan as screener_type='pead'.
-    Runs for both paper and live modes if live_auto_execute is enabled.
+    Fires every minute. Runs the PEAD screener when the configured schedule
+    slot matches. Schedule is controlled via pead_screener_schedule_days/times
+    settings (default Mon–Fri at 17:00 ET, shortly after market close).
     """
     db = SessionLocal()
+    run_key = None
     try:
-        admin_row = db.execute(
+        if get_setting(db, "pead_screener_auto_run", "true") != "true":
+            return
+
+        now_et  = datetime.now(_ET)
+        run_key = _check_schedule_slots(db, "pead_screener", now_et)
+        if not run_key:
+            return
+
+        set_setting(db, "pead_screener_last_auto_run", run_key)
+        set_setting(db, "screener_status", "running")
+        set_setting(db, "screener_phase",  "PEAD: scanning for gaps…")
+        set_setting(db, "screener_error",  "")
+        db.commit()
+
+    finally:
+        db.close()
+
+    if not run_key:
+        return
+
+    db2 = SessionLocal()
+    try:
+        admin_row = db2.execute(
             text("SELECT id FROM users WHERE role='admin' ORDER BY id LIMIT 1")
         ).fetchone()
         if not admin_row:
@@ -872,22 +894,22 @@ async def _pead_screener_job():
         from .pead_screener import scan_pead_opportunities
         from .database import get_user_setting
 
+        total_picks = 0
         for mode in ("paper", "live"):
             try:
-                # Only run live scan if live credentials are configured
                 if mode == "live":
-                    live_key = get_user_setting(db, "alpaca_live_key", "", user_id)
+                    live_key = get_user_setting(db2, "alpaca_live_key", "", user_id)
                     if not live_key:
                         continue
 
-                logger.info("PEAD screener starting [%s]…", mode)
-                picks = scan_pead_opportunities(db, mode)
-                logger.info("PEAD screener [%s]: %d picks saved.", mode, len(picks))
+                logger.info("Scheduled PEAD screener starting [%s] (%s ET)…", mode, run_key)
+                picks = scan_pead_opportunities(db2, mode, user_id=user_id)
+                logger.info("Scheduled PEAD screener [%s]: %d picks saved.", mode, len(picks))
+                total_picks += len(picks)
 
                 if picks:
                     try:
                         from . import telegram_alerts as tg
-                        symbols = ", ".join(p["symbol"] for p in picks)
                         tg.send_sync(
                             f"*PEAD Screener* [{mode.upper()}] — {len(picks)} setup(s) found\n\n"
                             + "\n".join(
@@ -902,10 +924,27 @@ async def _pead_screener_job():
                         pass
 
             except Exception as exc:
-                logger.error("PEAD screener [%s] failed: %s", mode, exc)
+                logger.error("Scheduled PEAD screener [%s] failed: %s", mode, exc)
 
+        set_setting(db2, "screener_status", "done")
+        set_setting(db2, "screener_phase",  f"PEAD done — {total_picks} setup(s) found.")
+        db2.commit()
+
+    except Exception as exc:
+        logger.error("Scheduled PEAD screener failed: %s", exc)
+        try:
+            set_setting(db2, "screener_status", "error")
+            set_setting(db2, "screener_error",  str(exc)[:500])
+            db2.commit()
+        except Exception:
+            pass
+        try:
+            from . import telegram_alerts as tg
+            tg.alert_system_error_sync("PEAD screener (scheduled)", exc)
+        except Exception:
+            pass
     finally:
-        db.close()
+        db2.close()
 
 
 def start_scheduler():
@@ -995,13 +1034,13 @@ def start_scheduler():
         replace_existing=True,
     )
 
-    # PEAD screener — runs Mon–Fri at 5:00 PM ET (after market close + DM).
-    # Detects gap-up earnings setups from the day's action and adds qualifying
-    # picks to the weekly_plan so fill_open_slots picks them up next session.
+    # PEAD screener watchdog — fires every minute, schedule controlled by
+    # pead_screener_schedule_days / pead_screener_schedule_times settings.
+    # Default: Mon–Fri at 17:00 ET (shortly after market close).
     scheduler.add_job(
-        _pead_screener_job,
-        CronTrigger(day_of_week="mon-fri", hour=17, minute=0, timezone="America/New_York"),
-        id="pead_screener",
+        _pead_screener_watchdog,
+        CronTrigger(minute="*"),
+        id="pead_screener_watchdog",
         replace_existing=True,
     )
 
