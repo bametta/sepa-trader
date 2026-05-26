@@ -17,6 +17,7 @@ from datetime import datetime, timedelta
 
 import pandas as pd
 import requests
+from requests.exceptions import HTTPError
 
 logger = logging.getLogger(__name__)
 
@@ -127,6 +128,7 @@ def fetch_history(symbol: str, period_days: int = 365) -> pd.DataFrame:
         "includePrePost": "false",
     }
 
+    not_found = False
     for host in ("query1", "query2"):
         url = f"https://{host}.finance.yahoo.com/v8/finance/chart/{symbol}"
         try:
@@ -141,10 +143,19 @@ def fetch_history(symbol: str, period_days: int = 365) -> pd.DataFrame:
             df = _parse_chart_response(body)
             if not df.empty:
                 return df
+        except HTTPError as exc:
+            if exc.response is not None and exc.response.status_code == 404:
+                # Symbol not found — delisted, acquired, or invalid ticker.
+                # Both hosts share the same data source; no point retrying.
+                logger.debug("yf_client: %s not found on Yahoo Finance (404) — skipping", symbol)
+                not_found = True
+                break
+            logger.warning("yf_client: %s %s failed: %s", host, symbol, exc)
         except Exception as exc:
             logger.warning("yf_client: %s %s failed: %s", host, symbol, exc)
 
-    logger.error("yf_client: all hosts failed for %s — returning empty", symbol)
+    if not not_found:
+        logger.warning("yf_client: all hosts failed for %s — returning empty", symbol)
     return pd.DataFrame()
 
 
@@ -177,6 +188,13 @@ def fetch_ohlcv(symbol: str, period_days: int = 60) -> pd.DataFrame:
             df = _parse_chart_response(body, ohlcv=True)
             if not df.empty:
                 return df
+        except HTTPError as exc:
+            if exc.response is not None and exc.response.status_code == 404:
+                # Symbol not found — delisted, acquired, or invalid ticker.
+                # Both hosts share the same data; no point retrying query2.
+                logger.debug("yf_client fetch_ohlcv: %s not found on Yahoo Finance (404) — skipping", symbol)
+                break
+            logger.warning("yf_client fetch_ohlcv: %s %s failed: %s", host, symbol, exc)
         except Exception as exc:
             logger.warning("yf_client fetch_ohlcv: %s %s failed: %s", host, symbol, exc)
 
