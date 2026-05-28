@@ -15,6 +15,28 @@ _ET = pytz.timezone("America/New_York")
 logger = logging.getLogger(__name__)
 
 
+def _has_consecutive_down_days(symbol: str, days: int = 3) -> bool:
+    """Return True if the stock has closed lower for `days` consecutive sessions.
+
+    Used as a late-stage entry guard: a stock "on a dive" (e.g. 3 red days in a
+    row) should not be entered even if it still carries a valid SEPA signal,
+    because EMA support values lag price action by definition.
+
+    Fails open (returns False) on any data error so stale/missing yf data never
+    hard-blocks an otherwise valid entry — the other EMA and signal guards
+    already provide structural protection.
+    """
+    try:
+        from .strategies.yf_client import fetch_history
+        df = fetch_history(symbol, period_days=days + 5)
+        if df.empty or len(df) < days + 1:
+            return False
+        closes = df["Close"].tail(days + 1).tolist()
+        return all(closes[i] < closes[i - 1] for i in range(1, len(closes)))
+    except Exception:
+        return False
+
+
 def _resolve_admin_uid(db: Session) -> int | None:
     """Look up the admin user's ID from the DB. Used when a function has no
     user_id param but needs user-scoped Alpaca credentials."""
@@ -1642,14 +1664,64 @@ def fill_open_slots(
                         sym, _rs_dev_pct, price, entry, _rs_max_dev, mode,
                     )
                     continue
+
+            # EMA20 guard: RS picks should stay above short-term trend.
+            # If price is below EMA20 the stock is in a short-term downtrend;
+            # relative-strength picks are thesis-invalid when they stop outperforming.
+            _rs_ema20 = float(_rs_tech.get("ema20") or 0)
+            if _rs_ema20 and price < _rs_ema20:
+                logger.info(
+                    "fill_open_slots: skipping RS %s — price=$%.2f below EMA20=$%.2f "
+                    "(short-term downtrend) [%s]",
+                    sym, price, _rs_ema20, mode,
+                )
+                continue
         else:
             # Confirm current SEPA signal before buying stale screener picks
             result = analyze(sym, db=db)
             signal = result.get("signal", "ERROR")
             price  = result.get("price") or entry
 
-            if signal not in ("BREAKOUT", "PULLBACK_EMA20", "PULLBACK_EMA50", "STAGE2_WATCH"):
+            # Require a precise, high-confidence entry trigger.
+            # STAGE2_WATCH is intentionally excluded — a stock in Stage 2 but
+            # extended above all EMAs with no volume surge or EMA support nearby
+            # is not at a safe entry point, and could easily be in a topping pattern.
+            if signal not in ("BREAKOUT", "PULLBACK_EMA20", "PULLBACK_EMA50"):
                 logger.debug("fill_open_slots: %s signal=%s — skipping.", sym, signal)
+                continue
+
+            # EMA position guard: price must be at or above the relevant EMA level.
+            # The PULLBACK_EMA20/50 signal fires when |price - EMA| ≤ 2-3%, which
+            # includes prices BELOW the EMA (stock declining through support).
+            # Entering below the EMA means buying into a breakdown, not a pullback.
+            _ema20 = float(result.get("ema20") or 0)
+            _ema50 = float(result.get("ema50") or 0)
+            if signal == "PULLBACK_EMA20" and _ema20 and price < _ema20 * 0.99:
+                logger.info(
+                    "fill_open_slots: %s signal=PULLBACK_EMA20 but price=$%.2f is %.1f%% below "
+                    "EMA20=$%.2f — declining through support, not a pullback entry [%s]",
+                    sym, price, (_ema20 - price) / _ema20 * 100, _ema20, mode,
+                )
+                continue
+            if signal == "PULLBACK_EMA50" and _ema50 and price < _ema50 * 0.99:
+                logger.info(
+                    "fill_open_slots: %s signal=PULLBACK_EMA50 but price=$%.2f is %.1f%% below "
+                    "EMA50=$%.2f — declining through support, not a pullback entry [%s]",
+                    sym, price, (_ema50 - price) / _ema50 * 100, _ema50, mode,
+                )
+                continue
+
+            # Plan entry deviation guard (downside only): skip if price has fallen
+            # more than entry_max_deviation_pct below the screener's entry price.
+            # The screened setup was valid at that price — a significant drop since
+            # then means the thesis has deteriorated.
+            _entry_max_dev = float(_gus(db, "entry_max_deviation_pct", "5.0", _fuid) or "5.0")
+            if entry > 0 and price < entry * (1 - _entry_max_dev / 100):
+                logger.info(
+                    "fill_open_slots: %s price=$%.2f declined %.1f%% from plan entry=$%.2f "
+                    "(max=%.1f%%) — setup degraded since screened, skipping [%s]",
+                    sym, price, (entry - price) / entry * 100, entry, _entry_max_dev, mode,
+                )
                 continue
 
         if price <= 0:
@@ -1712,6 +1784,20 @@ def fill_open_slots(
             logger.info(
                 "fill_open_slots: %s sub-economic (qty=%d × $%.2f < min) — skipping.",
                 sym, int(qty), price,
+            )
+            continue
+
+        # Consecutive-down-day guard: skip stocks actively declining over multiple
+        # sessions. EMA values lag price action; a stock can still carry a valid
+        # SEPA signal while recording 3+ consecutive lower closes — that is a
+        # "stock on a dive" and not a safe entry regardless of EMA positioning.
+        # Runs last (after sizing) to avoid extra yf calls for already-skipped picks.
+        # Fails open so a yf outage never blocks a correctly-signalled entry.
+        if _has_consecutive_down_days(sym, days=3):
+            logger.info(
+                "fill_open_slots: %s has 3 consecutive down closes — "
+                "actively declining, skipping entry [%s]",
+                sym, mode,
             )
             continue
 
