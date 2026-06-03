@@ -1813,6 +1813,15 @@ async def run_monitor(db: Session, user_id: int | None = None, mode: str | None 
         cash         = float(acct.cash)
         buying_power = float(acct.buying_power)
         day_pnl      = float(acct.equity) - float(acct.last_equity)
+        # Trading-only day P&L: sum of intraday unrealized P&L across open positions.
+        # Used exclusively for the drawdown halt trigger so that cash deposits and
+        # withdrawals (which shift equity but don't reflect trading performance)
+        # never fire the circuit breaker.  day_pnl (equity delta) is preserved for
+        # monitor summary display since it's still useful as an account-level view.
+        _trading_day_pnl = sum(
+            float(getattr(p, "unrealized_intraday_pl", 0) or 0)
+            for p in positions
+        )
 
         if market_open and positions:
             # Step 0: Reconcile partial fills before any stop/target sizing.
@@ -1913,8 +1922,10 @@ async def run_monitor(db: Session, user_id: int | None = None, mode: str | None 
 
         last_eq = float(getattr(acct, "last_equity", 0) or 0)
         if not entries_halted and halt_pct > 0 and last_eq > 0:
-            day_pnl_pct = day_pnl / last_eq * 100
-            if day_pnl_pct <= -halt_pct:
+            # Use position-level intraday P&L (excludes cash deposits/withdrawals).
+            trading_pnl_pct = _trading_day_pnl / last_eq * 100
+            day_pnl_pct     = day_pnl / last_eq * 100   # equity delta — for logging context only
+            if trading_pnl_pct <= -halt_pct:
                 entries_halted = True
                 try:
                     set_setting(db, halt_key, today_et)
@@ -1922,19 +1933,27 @@ async def run_monitor(db: Session, user_id: int | None = None, mode: str | None 
                 except Exception:
                     db.rollback()
                 logger.warning(
-                    "DAILY DRAWDOWN HALT [%s]: day_pnl=%.2f%% breached -%.2f%% threshold — "
-                    "blocking new entries (exits still run).",
-                    mode, day_pnl_pct, halt_pct,
+                    "DAILY DRAWDOWN HALT [%s]: trading_pnl=%.2f%% (equity_delta=%.2f%%) "
+                    "breached -%.2f%% threshold — blocking new entries (exits still run).",
+                    mode, trading_pnl_pct, day_pnl_pct, halt_pct,
                 )
                 try:
                     tg.send_sync(
                         f"*DAILY DRAWDOWN HALT* [{mode.upper()}]\n\n"
-                        f"Day P&L: `{day_pnl_pct:.2f}%` (threshold `-{halt_pct:.2f}%`)\n"
+                        f"Trading P&L: `{trading_pnl_pct:.2f}%` (threshold `-{halt_pct:.2f}%`)\n"
                         f"New entries blocked for the rest of the session. Exits still run.",
                         level="URGENT",
                     )
                 except Exception:
                     pass
+            elif trading_pnl_pct != day_pnl_pct and abs(day_pnl_pct - trading_pnl_pct) > 1.0:
+                # Cash movement detected: equity delta differs meaningfully from position P&L.
+                # Log so it's visible in diagnostics without triggering the halt.
+                logger.info(
+                    "run_monitor [%s]: equity_delta=%.2f%% vs trading_pnl=%.2f%% — "
+                    "likely cash deposit/withdrawal (%.2f%% difference, halt NOT triggered).",
+                    mode, day_pnl_pct, trading_pnl_pct, day_pnl_pct - trading_pnl_pct,
+                )
 
         # PDT guard: only block new entries when Alpaca has actually flagged the
         # account as a pattern day trader (acct.pattern_day_trader == True) AND
