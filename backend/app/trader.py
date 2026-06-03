@@ -1894,12 +1894,14 @@ async def run_monitor(db: Session, user_id: int | None = None, mode: str | None 
         # so a mid-day restart doesn't forget that we already tripped.
         entries_halted = False
         try:
-            halt_pct = float(get_setting(db, "daily_drawdown_halt_pct", "5.0") or "0")
+            from .database import get_user_setting as _gus_trader
+            halt_pct = float(_gus_trader(db, "daily_drawdown_halt_pct", "5.0", user_id) or "0")
         except (TypeError, ValueError):
             halt_pct = 5.0
 
         today_et   = datetime.now(_ET).strftime("%Y-%m-%d")
         halt_key   = f"drawdown_halt_{mode}_date"
+        # Latch key is system state (not user-configurable) — global read is correct.
         prior_halt = get_setting(db, halt_key, "")
 
         if halt_pct > 0 and prior_halt == today_et:
