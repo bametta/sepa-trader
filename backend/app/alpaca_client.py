@@ -170,6 +170,47 @@ def get_all_orders(mode: str = "paper", limit: int = 100):
     )
 
 
+def find_recent_fills(mode: str, symbol: str, side: str, days: int = 90) -> list:
+    """Filled orders for `symbol` on `side` ("BUY"/"SELL") in the last `days`,
+    oldest first. Bracket/OCO exit legs are listed flat by Alpaca, so stop and
+    target fills are included. Orders that never filled (cancelled/expired/
+    rejected) are excluded — callers use an empty result to detect phantom BUYs.
+    Raises on API errors so callers can fail safe instead of treating an outage
+    as "no fills".
+    """
+    from datetime import datetime, timedelta, timezone
+    from alpaca.common.enums import Sort
+
+    side_u = (side or "").upper()
+    if side_u not in ("BUY", "SELL"):
+        raise ValueError(f"find_recent_fills: side must be BUY or SELL, got {side!r}")
+
+    orders = get_client(mode).get_orders(GetOrdersRequest(
+        status=QueryOrderStatus.CLOSED,
+        symbols=[symbol.upper()],
+        side=OrderSide.BUY if side_u == "BUY" else OrderSide.SELL,
+        after=datetime.now(timezone.utc) - timedelta(days=days),
+        direction=Sort.DESC,   # newest first so the 500 cap never drops recent fills
+        limit=500,
+    ))
+
+    fills = []
+    for o in orders or []:
+        if (getattr(o, "symbol", "") or "").upper() != symbol.upper():
+            continue
+        if side_u.lower() not in str(getattr(o, "side", "") or "").lower():
+            continue
+        try:
+            filled_qty = float(getattr(o, "filled_qty", 0) or 0)
+        except (TypeError, ValueError):
+            filled_qty = 0.0
+        if filled_qty <= 0 or getattr(o, "filled_at", None) is None:
+            continue
+        fills.append(o)
+    fills.sort(key=lambda o: o.filled_at)
+    return fills
+
+
 def find_position_close_activity(mode: str, symbol: str, days: int = 90) -> list:
     """Query /account/activities for non-trade dispositions of `symbol` —
     mergers (MA), symbol/name changes (SC, NC), reorgs (REORG), cash-in-lieu
