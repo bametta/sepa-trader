@@ -28,6 +28,7 @@ class AccountBody(BaseModel):
     account_type: str
     annual_contribution: float = 0.0
     contribution_source: str = "employee"      # "employee" or "employer" (e.g. the match account)
+    max_deferral: bool = False                 # your own 401(k): follow the IRS deferral limit each year
     retirement: bool = True
     notes: str = ""
 
@@ -38,6 +39,7 @@ class AccountPatch(BaseModel):
     account_type: str | None = None
     annual_contribution: float | None = None
     contribution_source: str | None = None
+    max_deferral: bool | None = None
     retirement: bool | None = None
     notes: str | None = None
 
@@ -72,7 +74,8 @@ def history(limit: int = 400, current_user: dict = Depends(get_current_user), db
 def create_account(body: AccountBody, current_user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
     try:
         new_id = savings.create_account(db, current_user["id"], body.provider, body.name, body.account_type,
-                                        body.annual_contribution, body.retirement, body.notes, body.contribution_source)
+                                        body.annual_contribution, body.retirement, body.notes, body.contribution_source,
+                                        body.max_deferral)
     except ValueError as exc:
         raise HTTPException(400, str(exc))
     return {"id": new_id}

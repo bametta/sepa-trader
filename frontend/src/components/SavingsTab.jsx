@@ -141,12 +141,25 @@ function AccountCard({ a, onChanged }) {
         <div className="text-right">
           <div className="text-lg font-bold text-slate-100 num">{usd0(a.value)}</div>
           {!a.read_only && (
-            <div className="text-[11px] text-slate-500 flex items-center gap-1 justify-end">
-              saves
-              <input className="input w-20 text-right py-0" type="number" min="0" value={contrib}
-                     onChange={e => setContrib(e.target.value)}
-                     onBlur={() => parseFloat(contrib) !== a.annual_contribution && patch.mutate({ id: a.id, annual_contribution: parseFloat(contrib) || 0 })} />
-              /yr
+            <div className="text-[11px] text-slate-500 space-y-0.5">
+              {a.max_deferral
+                ? <div className="text-right">saves <span className="num text-slate-300">{usd0(a.annual_contribution)}</span>/yr · the IRS limit</div>
+                : (
+                  <div className="flex items-center gap-1 justify-end">
+                    saves
+                    <input className="input w-20 text-right py-0" type="number" min="0" value={contrib}
+                           onChange={e => setContrib(e.target.value)}
+                           onBlur={() => parseFloat(contrib) !== a.annual_contribution && patch.mutate({ id: a.id, annual_contribution: parseFloat(contrib) || 0 })} />
+                    /yr
+                  </div>
+                )}
+              {['401k', 'roth_401k'].includes(a.account_type) && a.contribution_source === 'employee' && (
+                <label className="flex items-center gap-1 justify-end cursor-pointer">
+                  <input type="checkbox" checked={!!a.max_deferral} disabled={patch.isLoading}
+                         onChange={e => patch.mutate({ id: a.id, max_deferral: e.target.checked })} />
+                  max the IRS limit every year
+                </label>
+              )}
             </div>
           )}
           {a.read_only && <div className="text-[11px] text-slate-500">managed in the IRA tab</div>}
@@ -213,7 +226,7 @@ function AccountCard({ a, onChanged }) {
 }
 
 function AddAccount({ onAdded }) {
-  const blank = { provider: '', name: '', account_type: '401k', annual_contribution: '', contribution_source: 'employee', retirement: true }
+  const blank = { provider: '', name: '', account_type: '401k', annual_contribution: '', contribution_source: 'employee', max_deferral: false, retirement: true }
   const [f, setF] = useState(blank)
   const add = useMutation(createSavingsAccount, { onSuccess: () => { setF(blank); onAdded() } })
   return (
@@ -240,8 +253,15 @@ function AddAccount({ onAdded }) {
         </select>
       </label>
       <label className="text-[10px] uppercase tracking-wider text-slate-500">Goes in per year $
-        <input className="input w-full" type="number" min="0" placeholder="this account only" value={f.annual_contribution}
+        <input className="input w-full" type="number" min="0" placeholder={f.max_deferral ? 'follows the IRS limit' : 'this account only'}
+               value={f.max_deferral ? '' : f.annual_contribution} disabled={f.max_deferral}
                onChange={e => setF({ ...f, annual_contribution: e.target.value })} />
+        {['401k', 'roth_401k'].includes(f.account_type) && f.contribution_source === 'employee' && (
+          <span className="flex items-center gap-1 normal-case tracking-normal text-[11px] mt-1 cursor-pointer">
+            <input type="checkbox" checked={f.max_deferral} onChange={e => setF({ ...f, max_deferral: e.target.checked })} />
+            max the IRS limit every year
+          </span>
+        )}
       </label>
       <label className="text-[10px] uppercase tracking-wider text-slate-500 flex items-center gap-2 pb-2">
         <input type="checkbox" checked={f.retirement} onChange={e => setF({ ...f, retirement: e.target.checked })} />

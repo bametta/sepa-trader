@@ -283,6 +283,60 @@ class DeferralTests(unittest.TestCase):
         self.assertEqual(sv.validate_account("P", "n", "401k", 100, "employer")["contribution_source"], "employer")
 
 
+class MaxDeferralTests(unittest.TestCase):
+    """'Max the IRS limit every year' follows the limit (with catch-up) instead of a typed amount."""
+
+    def summary(self, accounts, birth=1988):
+        return sv.build_summary(accounts, {}, TODAY, birth_year=birth)
+
+    def roth(self, **kw):
+        a = pcra("PCRA Roth", "roth_401k", kw.pop("annual", 0), "employee", val=1000.0)
+        a["max_deferral"] = kw.pop("max_deferral", True)
+        a.update(kw)
+        return a
+
+    def test_amount_follows_the_limit_not_the_typed_value(self):
+        s = self.summary([self.roth(annual=1)])
+        self.assertEqual(s["accounts"][0]["annual_contribution"], 24500)
+        self.assertTrue(s["accounts"][0]["max_deferral"])
+        d = s["deferrals"][0]
+        self.assertEqual((d["employee_planned"], d["over_by"], d["room_left"]), (24500, 0, 0))
+
+    def test_catch_up_ages_raise_the_amount(self):
+        self.assertEqual(self.summary([self.roth()], birth=1970)["accounts"][0]["annual_contribution"], 32500)   # 56
+        self.assertEqual(self.summary([self.roth()], birth=1965)["accounts"][0]["annual_contribution"], 35750)   # 61
+
+    def test_unset_flag_keeps_the_typed_amount(self):
+        s = self.summary([self.roth(annual=20000, max_deferral=False)])
+        self.assertEqual(s["accounts"][0]["annual_contribution"], 20000)
+
+    def test_match_account_amount_is_independent_of_the_max_account(self):
+        s = self.summary([self.roth(),
+                          pcra("PCRA Match", "401k", 5000, "employer", val=500.0, aid=2)])
+        d = s["deferrals"][0]
+        self.assertEqual((d["employee_planned"], d["employer_planned"]), (24500, 5000))
+        self.assertEqual(d["over_by"], 0)
+
+    def test_only_own_401k_accounts_may_follow_the_limit(self):
+        for atype, source in (("roth_ira", "employee"), ("ira", "employee"), ("401k", "employer"), ("taxable", "employee")):
+            with self.subTest(atype=atype, source=source), self.assertRaises(ValueError):
+                sv.validate_account("P", "n", atype, 0, source, True)
+        self.assertTrue(sv.validate_account("P", "n", "roth_401k", 0, "employee", True)["max_deferral"])
+        self.assertTrue(sv.validate_account("P", "n", "401k", 0, "employee", True)["max_deferral"])
+
+    def test_flag_is_saved_and_updated(self):
+        db = FakeDB()
+        sv.create_account(db, 1, "Schwab", "PCRA", "roth_401k", 0, max_deferral=True)
+        self.assertTrue(db.calls[-1][1]["md"])
+        db = FakeDB(account_row=("Schwab", "PCRA", "roth_401k", 0, True, "", "employee", False))
+        sv.update_account(db, 1, 5, max_deferral=True)
+        update = [c for c in db.calls if "UPDATE savings_accounts" in c[0]][0][1]
+        self.assertTrue(update["md"])
+        with self.assertRaises(ValueError):                                        # can't switch type away while maxing
+            sv.update_account(FakeDB(account_row=("S", "P", "roth_401k", 0, True, "", "employee", True)), 1, 5,
+                              account_type="taxable")
+
+
 class SnapshotDiffTests(unittest.TestCase):
     def snap(self, *items):
         return [{"key": k, "symbol": k if q is not None else None, "name": k, "quantity": q, "value": v}
@@ -394,16 +448,17 @@ class DbLayerTests(unittest.TestCase):
         self.assertEqual(sum("INSERT INTO savings_holdings" in c[0] for c in db.calls), 2)
 
     def test_update_merges_and_validates(self):
-        db = FakeDB(account_row=("Fidelity", "IRA", "ira", 100, True, "", "employee"))
+        db = FakeDB(account_row=("Fidelity", "IRA", "ira", 100, True, "", "employee", False))
         self.assertTrue(sv.update_account(db, 1, 5, annual_contribution=500))
         update = [c for c in db.calls if "UPDATE savings_accounts" in c[0]][0][1]
         self.assertEqual((update["p"], update["c"]), ("Fidelity", 500.0))
         with self.assertRaises(ValueError):
-            sv.update_account(FakeDB(account_row=("F", "I", "ira", 1, True, "", "employee")), 1, 5, account_type="nope")
+            sv.update_account(FakeDB(account_row=("F", "I", "ira", 1, True, "", "employee", False)), 1, 5,
+                              account_type="nope")
         self.assertFalse(sv.update_account(FakeDB(account_row=None), 1, 5, name="x"))
 
     def test_every_query_is_scoped_to_the_user(self):
-        db = FakeDB(account_row=("F", "I", "ira", 1, True, "", "employee"))
+        db = FakeDB(account_row=("F", "I", "ira", 1, True, "", "employee", False))
         sv.update_account(db, 7, 5, name="x")
         sv.delete_account(db, 7, 5)
         for sql, params in db.calls:

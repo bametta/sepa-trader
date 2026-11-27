@@ -107,7 +107,7 @@ CONTRIBUTION_SOURCES = ("employee", "employer")
 
 
 def validate_account(provider: str, name: str, account_type: str, annual_contribution,
-                     contribution_source="employee") -> dict:
+                     contribution_source="employee", max_deferral=False) -> dict:
     provider, name = (provider or "").strip(), (name or "").strip()
     if not (1 <= len(provider) <= 60) or not (1 <= len(name) <= 100):
         raise ValueError("provider (1-60 chars) and name (1-100 chars) are required")
@@ -121,8 +121,10 @@ def validate_account(provider: str, name: str, account_type: str, annual_contrib
         raise ValueError("annual_contribution must be a number")
     if not (0 <= contrib <= 10_000_000):
         raise ValueError("annual_contribution must be between 0 and 10,000,000")
+    if max_deferral and not (account_type in K401_TYPES and contribution_source == "employee"):
+        raise ValueError("only your own 401(k) or Roth 401(k) account can follow the IRS deferral limit")
     return {"provider": provider, "name": name, "account_type": account_type, "annual_contribution": contrib,
-            "contribution_source": contribution_source}
+            "contribution_source": contribution_source, "max_deferral": bool(max_deferral)}
 
 
 # 401(k) employee elective-deferral limits (from memory; verify at irs.gov each year):
@@ -255,10 +257,14 @@ def build_summary(accounts: list[dict], prices: dict, today: date | None = None,
             r["pct_of_account"] = round(r["value"] / acct_value, 4) if acct_value else 0.0
         contrib = float(a.get("annual_contribution") or 0)
         source = a.get("contribution_source") or "employee"
+        max_def = bool(a.get("max_deferral"))
+        if max_def:                                   # follows the IRS limit (with catch-up) instead of a typed amount
+            contrib = deferral_limit(today.year, birth_year)["limit"]
         out_accounts.append({
             "id": a["id"], "provider": a["provider"], "name": a["name"], "account_type": a["account_type"],
             "tax": tax_bucket(a["account_type"]), "retirement": a.get("retirement", True),
-            "annual_contribution": contrib, "contribution_source": source, "read_only": bool(a.get("read_only")),
+            "annual_contribution": contrib, "contribution_source": source, "max_deferral": max_def,
+            "read_only": bool(a.get("read_only")),
             "value": round(acct_value, 2), "holdings": sorted(rows, key=lambda r: -r["value"]),
         })
 
@@ -319,7 +325,8 @@ def _holding_row(r) -> dict:
 
 def load_accounts(db, uid: int) -> list[dict]:
     accts = db.execute(
-        text("""SELECT id, provider, name, account_type, annual_contribution, retirement, notes, contribution_source
+        text("""SELECT id, provider, name, account_type, annual_contribution, retirement, notes, contribution_source,
+                       max_deferral
                 FROM savings_accounts WHERE user_id = :u AND is_active ORDER BY provider, name"""),
         {"u": uid}).fetchall()
     ids = [a[0] for a in accts]
@@ -331,39 +338,44 @@ def load_accounts(db, uid: int) -> list[dict]:
             holds[r[1]].append(_holding_row(r))
     return [{"id": a[0], "provider": a[1], "name": a[2], "account_type": a[3],
              "annual_contribution": float(a[4] or 0), "retirement": bool(a[5]), "notes": a[6] or "",
-             "contribution_source": a[7] or "employee", "holdings": holds[a[0]]} for a in accts]
+             "contribution_source": a[7] or "employee", "max_deferral": bool(a[8]),
+             "holdings": holds[a[0]]} for a in accts]
 
 
 def create_account(db, uid: int, provider, name, account_type, annual_contribution=0, retirement=True, notes="",
-                   contribution_source="employee") -> int:
-    v = validate_account(provider, name, account_type, annual_contribution, contribution_source)
+                   contribution_source="employee", max_deferral=False) -> int:
+    v = validate_account(provider, name, account_type, annual_contribution, contribution_source, max_deferral)
     new_id = db.execute(
         text("""INSERT INTO savings_accounts
-                (user_id, provider, name, account_type, annual_contribution, contribution_source, retirement, notes)
-                VALUES (:u, :p, :n, :t, :c, :s, :r, :no) RETURNING id"""),
+                (user_id, provider, name, account_type, annual_contribution, contribution_source, max_deferral,
+                 retirement, notes)
+                VALUES (:u, :p, :n, :t, :c, :s, :md, :r, :no) RETURNING id"""),
         {"u": uid, "p": v["provider"], "n": v["name"], "t": v["account_type"], "c": v["annual_contribution"],
-         "s": v["contribution_source"], "r": bool(retirement), "no": (notes or "")[:500]}).scalar()
+         "s": v["contribution_source"], "md": v["max_deferral"], "r": bool(retirement),
+         "no": (notes or "")[:500]}).scalar()
     db.commit()
     return new_id
 
 
 def update_account(db, uid: int, account_id: int, **fields) -> bool:
     cur = db.execute(text("""SELECT provider, name, account_type, annual_contribution, retirement, notes,
-                                    contribution_source
+                                    contribution_source, max_deferral
                              FROM savings_accounts WHERE id = :id AND user_id = :u AND is_active"""),
                      {"id": account_id, "u": uid}).fetchone()
     if not cur:
         return False
     merged = {"provider": cur[0], "name": cur[1], "account_type": cur[2], "annual_contribution": cur[3],
-              "retirement": cur[4], "notes": cur[5] or "", "contribution_source": cur[6] or "employee"}
+              "retirement": cur[4], "notes": cur[5] or "", "contribution_source": cur[6] or "employee",
+              "max_deferral": bool(cur[7])}
     merged.update({k: v for k, v in fields.items() if v is not None})
     v = validate_account(merged["provider"], merged["name"], merged["account_type"], merged["annual_contribution"],
-                         merged["contribution_source"])
+                         merged["contribution_source"], merged["max_deferral"])
     db.execute(text("""UPDATE savings_accounts SET provider=:p, name=:n, account_type=:t, annual_contribution=:c,
-                       contribution_source=:s, retirement=:r, notes=:no WHERE id = :id AND user_id = :u"""),
+                       contribution_source=:s, max_deferral=:md, retirement=:r, notes=:no
+                       WHERE id = :id AND user_id = :u"""),
                {"p": v["provider"], "n": v["name"], "t": v["account_type"], "c": v["annual_contribution"],
-                "s": v["contribution_source"], "r": bool(merged["retirement"]), "no": str(merged["notes"])[:500],
-                "id": account_id, "u": uid})
+                "s": v["contribution_source"], "md": v["max_deferral"], "r": bool(merged["retirement"]),
+                "no": str(merged["notes"])[:500], "id": account_id, "u": uid})
     db.commit()
     return True
 

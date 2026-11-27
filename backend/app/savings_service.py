@@ -128,17 +128,29 @@ def combined_plan(db, uid: int, summary: dict) -> dict:
         target = None
     years = p["years_to_retire"]
     balance = float(summary["retirement_total"])
-    annual = sum(a["annual_contribution"] for a in summary["accounts"] if a["retirement"])
+    # Yearly contributions as a per-year path: typed amounts stay flat; "max the IRS limit" accounts follow the
+    # deferral limit year by year, including the age-50 and 60-63 catch-ups (limits assumed to keep pace with inflation).
+    annual = np.zeros(years)
+    for a in summary["accounts"]:
+        if not a["retirement"]:
+            continue
+        if a.get("max_deferral"):
+            annual += [savings.deferral_limit(date.today().year + i, p["birth_year"])["limit"] for i in range(years)]
+        else:
+            annual += a["annual_contribution"]
+    first_year = float(annual[0])
     glide = ira_planner.glidepath_equity(p["age"], p["retire_age"], p["risk"])
     mu, sigma = ira_planner.mix_stats(ira_planner.strategic_mix(glide))
     end = ira_planner._simulate(balance, annual, years, mu, sigma)
     p10, p50, p90 = (float(np.percentile(end, q)) for q in (10, 50, 90))
     out = {
-        "ready": True, "balance": round(balance), "annual_contribution": round(annual), "years": years,
+        "ready": True, "balance": round(balance), "annual_contribution": round(first_year),
+        "avg_annual_contribution": round(float(annual.mean())), "years": years,
         "retire_age": p["retire_age"], "glidepath_equity": glide, "actual_equity_share": summary["equity_share"],
         "p10": round(p10), "p50": round(p50), "p90": round(p90), "target": round(target) if target else None,
         "assumptions": "Real (today's) dollars, long-run return assumptions, age-based glidepath mix, "
-                       "constant yearly contributions across all retirement accounts.",
+                       "yearly contributions across all retirement accounts (accounts set to the IRS limit follow it, "
+                       "including catch-up from age 50).",
     }
     try:
         safe = ira_stress.withdrawal_test(max(p50, 1.0), p["retire_age"], p["risk"], 0.04)["safe_rate_90pct"]
@@ -150,7 +162,7 @@ def combined_plan(db, uid: int, summary: dict) -> dict:
     if target:
         out["prob_reach_target"] = round(float((end >= target).mean()), 3)
         if out["prob_reach_target"] < 0.8:
-            lo, hi = 0.0, max(annual * 8, 100_000.0)
+            lo, hi = 0.0, max(first_year * 8, 100_000.0)
             for _ in range(18):
                 mid = (lo + hi) / 2
                 ok = float((ira_planner._simulate(balance, annual + mid, years, mu, sigma) >= target).mean()) >= 0.8

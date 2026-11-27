@@ -139,6 +139,7 @@ def _run_migrations():
                 created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )
         """))
+        db.execute(text("ALTER TABLE savings_accounts ADD COLUMN IF NOT EXISTS max_deferral BOOLEAN NOT NULL DEFAULT false"))
         db.execute(text("""
             CREATE TABLE IF NOT EXISTS savings_holdings (
                 id            SERIAL PRIMARY KEY,
