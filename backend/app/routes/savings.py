@@ -163,3 +163,26 @@ def trade_plan(body: TradePlanBody, current_user: dict = Depends(get_current_use
         return savings_service.trade_plan(db, current_user["id"], body.account_ids, body.mode, body.target)
     except ValueError as exc:
         raise HTTPException(400, str(exc))
+
+
+class ValueUpdate(BaseModel):
+    holding_id: int
+    value: float
+    as_of: str | None = None       # ISO date; defaults to today
+
+
+class ValuesBody(BaseModel):
+    updates: list[ValueUpdate]
+
+
+@router.put("/accounts/{account_id}/values")
+def put_values(account_id: int, body: ValuesBody, current_user: dict = Depends(get_current_user),
+               db: Session = Depends(get_db)):
+    """Update the value and as-of date of hand-valued holdings (real estate, notes, core funds) in one go."""
+    try:
+        n = savings.update_manual_values(db, current_user["id"], account_id, [u.model_dump() for u in body.updates])
+    except ValueError as exc:
+        if str(exc) == "account_not_found":
+            raise HTTPException(404, "account_not_found")
+        raise HTTPException(400, str(exc))
+    return {"status": "saved", "updated": n}

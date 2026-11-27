@@ -167,3 +167,5 @@ export const importSavingsPositions = ({ id, text, apply, account_key }) =>
   api.post(`/savings/accounts/${id}/import`, { text, apply: !!apply, account_key: account_key || null }).then(r => r.data)
 export const fetchTargetModel = () => api.get('/savings/target-model').then(r => r.data)
 export const runTradePlan = (body) => api.post('/savings/trade-plan', body, { timeout: 90000 }).then(r => r.data)
+export const updateManualValues = ({ id, updates }) =>
+  api.put(`/savings/accounts/${id}/values`, { updates }).then(r => r.data)

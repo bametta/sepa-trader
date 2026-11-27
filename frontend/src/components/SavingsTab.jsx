@@ -5,7 +5,7 @@ import { useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import {
   fetchSavingsSummary, fetchSavingsPlan, fetchSavingsHistory, fetchSavingsChanges, createSavingsAccount, patchSavingsAccount,
-  importSavingsPositions, fetchTargetModel, runTradePlan, updateSetting,
+  importSavingsPositions, fetchTargetModel, runTradePlan, updateSetting, updateManualValues,
   deleteSavingsAccount, fetchHoldingsCsv, saveHoldingsCsv,
 } from '../api/client'
 
@@ -134,11 +134,76 @@ function ImportPanel({ accountId, onDone, onCancel }) {
   )
 }
 
+function ValuesPanel({ accountId, rows, onDone, onCancel }) {
+  const today = new Date().toISOString().slice(0, 10)
+  const original = Object.fromEntries(rows.map(h => [h.id, { value: String(h.manual_value ?? h.value ?? ''), as_of: h.as_of || today }]))
+  const [edits, setEdits] = useState(original)
+  const save = useMutation(updateManualValues, { onSuccess: onDone })
+  const set = (id, patch) => setEdits(e => ({ ...e, [id]: { ...e[id], ...patch } }))
+  const changed = rows.filter(h => edits[h.id].value !== original[h.id].value || edits[h.id].as_of !== original[h.id].as_of)
+  const invalid = changed.some(h => !(parseFloat(edits[h.id].value) >= 0))
+
+  return (
+    <div className="space-y-2 rounded-lg border border-white/[0.08] p-3">
+      <div className="text-[11px] text-slate-500">
+        Update the value of anything you value by hand (real estate, notes, funds without a ticker). Use your latest statement,
+        an appraisal or your own estimate. Custodians like Equity Trust don't verify these values for you. Changing a value sets
+        its date to today; "still correct" keeps the value and refreshes the date. Everything saves together.
+      </div>
+      <table className="w-full text-xs">
+        <thead>
+          <tr className="text-left text-[10px] uppercase tracking-wider text-slate-500">
+            <th className="py-1">Holding</th><th className="text-right">Value $</th><th className="text-right">As of</th><th />
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map(h => {
+            const e = edits[h.id]
+            const dirty = e.value !== original[h.id].value || e.as_of !== original[h.id].as_of
+            return (
+              <tr key={h.id} className="border-t border-white/[0.05]">
+                <td className="py-1 pr-2 text-slate-300">
+                  {h.name}{h.stale && <span className="ml-2 text-amber-400">out of date</span>}
+                </td>
+                <td className="text-right">
+                  <input className="input w-28 text-right py-0" type="number" min="0" step="0.01" value={e.value}
+                         onChange={ev => set(h.id, { value: ev.target.value, as_of: today })} />
+                </td>
+                <td className="text-right">
+                  <input className="input w-32 py-0" type="date" max={today} value={e.as_of}
+                         onChange={ev => set(h.id, { as_of: ev.target.value })} />
+                </td>
+                <td className="text-right pl-2">
+                  <button className="underline text-slate-500 hover:text-slate-200 disabled:no-underline disabled:opacity-40"
+                          disabled={e.as_of === today && !dirty ? true : false} onClick={() => set(h.id, { as_of: today })}>
+                    still correct
+                  </button>
+                </td>
+              </tr>
+            )
+          })}
+        </tbody>
+      </table>
+      <div className="flex gap-2">
+        <button className="btn-primary" disabled={changed.length === 0 || invalid || save.isLoading}
+                onClick={() => save.mutate({ id: accountId, updates: changed.map(h => ({
+                  holding_id: h.id, value: parseFloat(edits[h.id].value), as_of: edits[h.id].as_of })) })}>
+          {save.isLoading ? 'Saving…' : `Save ${changed.length} change${changed.length === 1 ? '' : 's'}`}
+        </button>
+        <button className="btn-ghost" onClick={onCancel}>Cancel</button>
+      </div>
+      {save.isError && <div className="text-sm text-red-400">{errMsg(save.error)}</div>}
+    </div>
+  )
+}
+
 function AccountCard({ a, onChanged }) {
   const [editing, setEditing] = useState(false)
   const [csv, setCsv] = useState('')
   const [contrib, setContrib] = useState(a.annual_contribution)
   const [importing, setImporting] = useState(false)
+  const [valuing, setValuing] = useState(false)
+  const handValued = a.holdings.filter(h => h.id != null && h.quantity == null && h.source !== 'live')
   const load = useMutation(fetchHoldingsCsv, { onSuccess: d => { setCsv(d.csv); setEditing(true) } })
   const save = useMutation(saveHoldingsCsv, { onSuccess: () => { setEditing(false); onChanged() } })
   const patch = useMutation(patchSavingsAccount, { onSuccess: onChanged })
@@ -223,8 +288,13 @@ function AccountCard({ a, onChanged }) {
           <button className="underline text-slate-400 hover:text-slate-200" disabled={load.isLoading}
                   onClick={() => load.mutate(a.id)}>Edit holdings</button>
           <button className="underline text-slate-400 hover:text-slate-200" onClick={() => setImporting(v => !v)}>
-            Import Schwab export
+            Import positions file
           </button>
+          {handValued.length > 0 && (
+            <button className="underline text-slate-400 hover:text-slate-200" onClick={() => setValuing(v => !v)}>
+              Update values
+            </button>
+          )}
           <button className="underline text-slate-600 hover:text-red-400"
                   onClick={() => window.confirm(`Delete ${a.provider} ${a.name} and all its holdings?`) && del.mutate(a.id)}>
             Delete account
@@ -233,6 +303,10 @@ function AccountCard({ a, onChanged }) {
       )}
       {importing && !a.read_only && (
         <ImportPanel accountId={a.id} onDone={() => { setImporting(false); onChanged() }} onCancel={() => setImporting(false)} />
+      )}
+      {valuing && !a.read_only && handValued.length > 0 && (
+        <ValuesPanel accountId={a.id} rows={handValued} onDone={() => { setValuing(false); onChanged() }}
+                     onCancel={() => setValuing(false)} />
       )}
       {(load.isError || patch.isError || del.isError) && (
         <div className="text-sm text-red-400">{errMsg(load.error || patch.error || del.error)}</div>
