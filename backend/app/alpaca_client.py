@@ -3,6 +3,7 @@ from alpaca.trading.requests import (
     MarketOrderRequest,
     LimitOrderRequest,
     StopLimitOrderRequest,
+    StopOrderRequest,
     GetOrdersRequest,
     StopLossRequest,
     TakeProfitRequest,
@@ -35,31 +36,6 @@ def get_client(mode: str = "paper") -> TradingClient:
                 paper=False,
             )
     return _clients[mode]
-
-
-def configure_from_db_settings(merged: dict, mode: str, is_admin: bool = True) -> None:
-    """Override the cached client for `mode` using credentials from merged user_settings.
-    Falls back to .env values when `is_admin=True` and DB values are empty.
-    Call this at the start of background jobs that run on behalf of a specific user.
-    """
-    if mode == "paper":
-        key    = (merged.get("alpaca_paper_key")    or "").strip()
-        secret = (merged.get("alpaca_paper_secret") or "").strip()
-        if is_admin:
-            key    = key    or (settings.alpaca_paper_key    or "").strip()
-            secret = secret or (settings.alpaca_paper_secret or "").strip()
-        paper = True
-    else:
-        key    = (merged.get("alpaca_live_key")    or "").strip()
-        secret = (merged.get("alpaca_live_secret") or "").strip()
-        if is_admin:
-            key    = key    or (settings.alpaca_live_key    or "").strip()
-            secret = secret or (settings.alpaca_live_secret or "").strip()
-        paper = False
-    if not key or not secret:
-        raise ValueError(f"No Alpaca credentials configured for mode={mode}")
-    _clients[mode] = TradingClient(api_key=key, secret_key=secret, paper=paper)
-    logger.info("configure_from_db_settings: updated %s client (key=%.8s…)", mode, key)
 
 
 def get_client_for_keys(api_key: str, secret_key: str, paper: bool) -> TradingClient:
@@ -106,10 +82,7 @@ def configure_from_db_settings(merged: dict, mode: str, is_admin: bool = True) -
     if not key or not secret:
         raise ValueError(f"No Alpaca credentials configured for {mode} mode")
 
-    logger.info(
-        "configure_from_db_settings: updating %s client key_prefix=%s",
-        mode, key[:6],
-    )
+    logger.info("configure_from_db_settings: updating %s client (credentials set)", mode)
     _clients[mode] = TradingClient(api_key=key, secret_key=secret, paper=paper)
 
 
@@ -119,6 +92,63 @@ def get_account(mode: str = "paper"):
 
 def get_positions(mode: str = "paper"):
     return get_client(mode).get_all_positions()
+
+
+def _get_user_client(db, user_id: int | None, mode: str) -> TradingClient | None:
+    """Resolve a TradingClient from DB-stored credentials for a specific user.
+    Returns None if user_id is None or no credentials are found (caller falls
+    back to the global env-based client).
+    """
+    if not user_id:
+        return None
+    from .database import get_user_setting as _gus
+    is_admin = db.execute(
+        __import__("sqlalchemy").text("SELECT role FROM users WHERE id = :id"),
+        {"id": user_id},
+    ).scalar() == "admin"
+    if mode == "paper":
+        key    = (_gus(db, "alpaca_paper_key",    "", user_id) or "").strip()
+        secret = (_gus(db, "alpaca_paper_secret", "", user_id) or "").strip()
+        if is_admin:
+            key    = key    or (settings.alpaca_paper_key    or "").strip()
+            secret = secret or (settings.alpaca_paper_secret or "").strip()
+        paper = True
+    else:
+        key    = (_gus(db, "alpaca_live_key",    "", user_id) or "").strip()
+        secret = (_gus(db, "alpaca_live_secret", "", user_id) or "").strip()
+        if is_admin:
+            key    = key    or (settings.alpaca_live_key    or "").strip()
+            secret = secret or (settings.alpaca_live_secret or "").strip()
+        paper = False
+    if not key or not secret:
+        return None
+    return get_client_for_keys(key, secret, paper)
+
+
+def get_positions_for_user(db, user_id: int | None, mode: str = "paper"):
+    """Fetch positions using DB-stored credentials for a specific user.
+    Falls back to the global client if no DB creds are found.
+    """
+    client = _get_user_client(db, user_id, mode)
+    return (client or get_client(mode)).get_all_positions()
+
+
+def get_account_for_user(db, user_id: int | None, mode: str = "paper"):
+    """Fetch account using DB-stored credentials for a specific user.
+    Falls back to the global client if no DB creds are found.
+    """
+    client = _get_user_client(db, user_id, mode)
+    return (client or get_client(mode)).get_account()
+
+
+def get_open_orders_by_symbol_for_user(db, user_id: int | None, mode: str = "paper") -> dict[str, list]:
+    """Open orders keyed by symbol, using user-scoped credentials."""
+    client = _get_user_client(db, user_id, mode) or get_client(mode)
+    orders = client.get_orders(GetOrdersRequest(status=QueryOrderStatus.OPEN))
+    result: dict[str, list] = {}
+    for o in orders:
+        result.setdefault(o.symbol, []).append(o)
+    return result
 
 
 def get_open_orders(mode: str = "paper"):
@@ -138,6 +168,57 @@ def get_all_orders(mode: str = "paper", limit: int = 100):
     return get_client(mode).get_orders(
         GetOrdersRequest(status=QueryOrderStatus.ALL, limit=limit)
     )
+
+
+def find_position_close_activity(mode: str, symbol: str, days: int = 90) -> list:
+    """Query /account/activities for non-trade dispositions of `symbol` —
+    mergers (MA), symbol/name changes (SC, NC), reorgs (REORG), cash-in-lieu
+    (CIL), ACATS transfers, and stock splits (SPLIT).
+
+    Used as a fallback when a position is closed on Alpaca but no SELL order
+    exists. Returns list of dicts with at least {qty, price, timestamp,
+    activity_type} so trade_log can record what happened to the shares.
+
+    NOTE: Alpaca rejects the entire request with `invalid activity type` if
+    ANY listed type is unrecognized — only include types from Alpaca's
+    documented enum. `NRC` was previously listed and broke this whole call.
+    """
+    from datetime import datetime, timedelta, timezone
+    after = (datetime.now(timezone.utc) - timedelta(days=days)).date().isoformat()
+    activity_types = "MA,SC,NC,REORG,CIL,ACATC,ACATS,SPLIT"
+    try:
+        raw = get_client(mode).get(
+            "/account/activities",
+            data={"activity_types": activity_types, "after": after},
+        )
+    except Exception as exc:
+        logger.warning("find_position_close_activity[%s] %s: %s", mode, symbol, exc)
+        return []
+
+    out: list = []
+    for a in (raw or []):
+        if not isinstance(a, dict):
+            continue
+        if (a.get("symbol") or "").upper() != symbol.upper():
+            continue
+        try:
+            qty = abs(float(a.get("qty") or 0))
+        except (TypeError, ValueError):
+            qty = 0.0
+        try:
+            price = float(a.get("per_share_amount") or a.get("price") or 0)
+        except (TypeError, ValueError):
+            price = 0.0
+        if qty <= 0:
+            continue
+        out.append({
+            "qty":           qty,
+            "price":         price,
+            "timestamp":     a.get("date") or a.get("transaction_time"),
+            "activity_type": a.get("activity_type") or "CORP_ACTION",
+            "description":   a.get("description") or "",
+        })
+    return out
 
 
 def get_clock(mode: str = "paper"):
@@ -191,6 +272,10 @@ def place_bracket_buy(
     Stop and target legs: GTC — remain active until one fills or position is closed.
     Use this for NEW entries only. For existing positions use place_oca_exit().
     """
+    if qty <= 0 or stop_price <= 0 or target_price <= 0:
+        raise ValueError(f"place_bracket_buy {symbol}: invalid qty/stop/target ({qty}/{stop_price}/{target_price})")
+    if target_price <= stop_price:
+        raise ValueError(f"place_bracket_buy {symbol}: target ${target_price:.2f} must exceed stop ${stop_price:.2f}")
     req = MarketOrderRequest(
         symbol=symbol,
         qty=round(qty, 0),
@@ -218,6 +303,15 @@ def place_limit_bracket_buy(
     If not filled by end of day, Alpaca cancels automatically.
     Use for pullback-to-MA entries where price is already near the target level.
     """
+    if qty <= 0 or entry_price <= 0 or stop_price <= 0 or target_price <= 0:
+        raise ValueError(
+            f"place_limit_bracket_buy {symbol}: invalid qty/entry/stop/target "
+            f"({qty}/{entry_price}/{stop_price}/{target_price})"
+        )
+    if stop_price >= entry_price:
+        raise ValueError(f"place_limit_bracket_buy {symbol}: stop ${stop_price:.2f} must be below entry ${entry_price:.2f}")
+    if target_price <= entry_price:
+        raise ValueError(f"place_limit_bracket_buy {symbol}: target ${target_price:.2f} must exceed entry ${entry_price:.2f}")
     limit_price = round(entry_price * (1 + slippage_pct / 100), 2)
     req = LimitOrderRequest(
         symbol=symbol,
@@ -269,9 +363,11 @@ def place_oca_exit(
     Place a single OCO (One-Cancels-Other) sell order for an existing position.
     When one leg fills, Alpaca automatically cancels the other.
 
-    Both stop_loss and take_profit must be passed explicitly as request objects —
-    Alpaca raises code 40010001 if take_profit.limit_price is missing even when
-    limit_price is set on the parent LimitOrderRequest.
+    Alpaca's API rejects OCO unless BOTH `stop_loss.stop_price` and
+    `take_profit.limit_price` are provided (error 40010001), so both kwargs
+    are required regardless of parent type. The parent is a LimitOrderRequest
+    where the parent's limit_price doubles as the take-profit working price —
+    the take_profit kwarg is the API-mandated sibling spec.
     """
     req = LimitOrderRequest(
         symbol=symbol,
@@ -281,105 +377,52 @@ def place_oca_exit(
         limit_price=round(target_price, 2),
         order_class=OrderClass.OCO,
         stop_loss=StopLossRequest(stop_price=round(stop_price, 2)),
-        take_profit=TakeProfitRequest(limit_price=round(target_price, 2)),  # ← required by Alpaca
+        take_profit=TakeProfitRequest(limit_price=round(target_price, 2)),
     )
     return get_client(mode).submit_order(req)
 
 
-def place_split_bracket_buy(
+def place_stop_loss_sell(
     symbol: str,
     qty: float,
     stop_price: float,
-    t1_price: float,
-    t2_price: float,
     mode: str = "paper",
 ):
     """
-    Place two market bracket orders for a split-lot T1/T2 exit strategy.
-    Lot 1: qty//2 shares — stop=stop_price, take-profit=t1_price.
-    Lot 2: remaining shares — stop=stop_price, take-profit=t2_price.
-    Both stop legs are identical so trailing stop logic treats them uniformly.
-    Raises ValueError if qty < 2 (can't split into two 1-share lots).
+    Place a plain GTC stop-market sell order (no take-profit leg).
+    Used as a PDT-safe fallback when an OCO is rejected due to pattern day
+    trading protection — the position is at least protected on the downside.
     """
-    qty_int = int(round(qty))
-    qty1    = qty_int // 2
-    qty2    = qty_int - qty1
-    if qty1 < 1 or qty2 < 1:
-        raise ValueError(f"qty {qty_int} too small to split into T1/T2 lots (min 2 shares)")
-    client = get_client(mode)
-    o1 = client.submit_order(MarketOrderRequest(
-        symbol=symbol, qty=qty1, side=OrderSide.BUY,
-        time_in_force=TimeInForce.DAY, order_class=OrderClass.BRACKET,
-        stop_loss=StopLossRequest(stop_price=round(stop_price, 2)),
-        take_profit=TakeProfitRequest(limit_price=round(t1_price, 2)),
-    ))
-    o2 = client.submit_order(MarketOrderRequest(
-        symbol=symbol, qty=qty2, side=OrderSide.BUY,
-        time_in_force=TimeInForce.DAY, order_class=OrderClass.BRACKET,
-        stop_loss=StopLossRequest(stop_price=round(stop_price, 2)),
-        take_profit=TakeProfitRequest(limit_price=round(t2_price, 2)),
-    ))
-    return o1, o2
+    req = StopOrderRequest(
+        symbol=symbol,
+        qty=round(qty, 0),
+        side=OrderSide.SELL,
+        time_in_force=TimeInForce.GTC,
+        stop_price=round(stop_price, 2),
+    )
+    return get_client(mode).submit_order(req)
 
 
-def place_split_limit_bracket_buy(
-    symbol: str,
-    qty: float,
-    entry_price: float,
-    stop_price: float,
-    t1_price: float,
-    t2_price: float,
-    slippage_pct: float = 0.5,
-    mode: str = "paper",
-):
-    """
-    Place two DAY limit bracket orders for a split-lot T1/T2 exit strategy.
-    Raises ValueError if qty < 2.
-    """
-    qty_int     = int(round(qty))
-    qty1        = qty_int // 2
-    qty2        = qty_int - qty1
-    if qty1 < 1 or qty2 < 1:
-        raise ValueError(f"qty {qty_int} too small to split into T1/T2 lots (min 2 shares)")
-    limit_price = round(entry_price * (1 + slippage_pct / 100), 2)
-    client      = get_client(mode)
-    o1 = client.submit_order(LimitOrderRequest(
-        symbol=symbol, qty=qty1, side=OrderSide.BUY,
-        time_in_force=TimeInForce.DAY, limit_price=limit_price,
-        order_class=OrderClass.BRACKET,
-        stop_loss=StopLossRequest(stop_price=round(stop_price, 2)),
-        take_profit=TakeProfitRequest(limit_price=round(t1_price, 2)),
-    ))
-    o2 = client.submit_order(LimitOrderRequest(
-        symbol=symbol, qty=qty2, side=OrderSide.BUY,
-        time_in_force=TimeInForce.DAY, limit_price=limit_price,
-        order_class=OrderClass.BRACKET,
-        stop_loss=StopLossRequest(stop_price=round(stop_price, 2)),
-        take_profit=TakeProfitRequest(limit_price=round(t2_price, 2)),
-    ))
-    return o1, o2
+def verify_oca_parent(parent) -> tuple[bool, bool]:
+    """Verify that an OCO parent Order returned from submit_order has both
+    a stop and a limit (take-profit) child. Returns (has_limit, has_stop).
 
-
-def replace_split_oca_exits(
-    symbol: str,
-    qty1: float,
-    qty2: float,
-    new_stop: float,
-    t1_price: float,
-    t2_price: float,
-    mode: str = "paper",
-):
-    """
-    Cancel all exit orders for a split-lot position and re-place two OCOs
-    with an updated stop (trailing stop update). T1 and T2 targets are preserved.
-    """
-    cancelled = cancel_symbol_exit_orders(symbol, mode)
-    if cancelled:
-        cleared = wait_for_orders_cancelled(symbol, mode, timeout=6.0, poll_interval=0.4)
-        if not cleared:
-            logger.warning("replace_split_oca_exits: cancellation timeout for %s", symbol)
-    place_oca_exit(symbol, qty1, new_stop, t1_price, mode)
-    place_oca_exit(symbol, qty2, new_stop, t2_price, mode)
+    Parent layout (see place_oca_exit): parent itself is the stop_limit, and
+    the target lives in `.legs` as the take_profit sibling. We inspect .legs
+    directly because Alpaca's "held" sibling status doesn't reliably appear
+    in status=open queries."""
+    if parent is None:
+        return False, False
+    parent_type = str(getattr(parent, "order_type", "") or getattr(parent, "type", "") or "").lower()
+    has_stop  = "stop" in parent_type
+    has_limit = "limit" in parent_type and "stop" not in parent_type  # parent is stop_limit, not pure limit
+    for leg in (getattr(parent, "legs", None) or []):
+        leg_type = str(getattr(leg, "order_type", "") or getattr(leg, "type", "") or "").lower()
+        if "stop" in leg_type:
+            has_stop = True
+        elif "limit" in leg_type:
+            has_limit = True
+    return has_limit, has_stop
 
 
 def cancel_symbol_exit_orders(symbol: str, mode: str = "paper") -> list[str]:
@@ -408,24 +451,69 @@ def wait_for_orders_cancelled(
     symbol: str,
     mode: str = "paper",
     timeout: float = 15.0,
-    poll_interval: float = 0.4,
+    poll_interval: float = 0.5,
+    order_ids: list | None = None,
 ) -> bool:
     """
-    Poll until no open sell orders remain for a symbol, or timeout elapses.
+    Poll until no active sell orders remain for a symbol, or timeout elapses.
     Returns True if orders are cleared, False if timeout hit.
-    Used after cancel_symbol_exit_orders() to ensure Alpaca has fully
-    processed the cancellation before placing a replacement OCO.
+
+    When order_ids is provided (the IDs returned by cancel_symbol_exit_orders),
+    each order is checked individually via get_order_by_id and considered
+    cleared once it reaches any terminal state — including pending_cancel.
+    This avoids the 10-second timeout that previously occurred because Alpaca
+    transitions cancelled orders through pending_cancel before fully removing
+    them from the open-order list, and pending_cancel orders were still being
+    counted as blocking the placement of the replacement OCO.
+
+    Falls back to scanning the open-order list when no IDs are provided.
     """
+    _TERMINAL = frozenset({
+        "cancelled", "pending_cancel", "expired",
+        "filled", "done_for_day", "stopped", "rejected",
+    })
+    client  = get_client(mode)
     elapsed = 0.0
+
     while elapsed < timeout:
-        open_orders   = get_open_orders_by_symbol(mode)
-        symbol_orders = open_orders.get(symbol, [])
-        sell_orders   = [
-            o for o in symbol_orders
-            if 'sell' in str(getattr(o, 'side', '') or '').lower()
-        ]
-        if not sell_orders:
-            return True
+        if order_ids:
+            # Fast path: check each cancelled order's current status directly.
+            # pending_cancel is safe to treat as done — order will never fill.
+            all_terminal = True
+            for oid in order_ids:
+                try:
+                    o      = client.get_order_by_id(oid)
+                    status = str(getattr(o, 'status', '') or '').lower()
+                    if status not in _TERMINAL:
+                        all_terminal = False
+                        break
+                except Exception:
+                    pass  # order not found → already gone
+            if all_terminal:
+                # Also scan for OCO siblings — Alpaca cascades the cancel
+                # to the sibling leg (different ID, not in order_ids).
+                # The sibling can linger as "held" for a second or two after
+                # the parent reaches pending_cancel.
+                open_orders   = get_open_orders_by_symbol(mode)
+                symbol_orders = open_orders.get(symbol, [])
+                remaining     = [
+                    o for o in symbol_orders
+                    if 'sell' in str(getattr(o, 'side', '') or '').lower()
+                ]
+                if not remaining:
+                    return True
+                # Siblings still settling — fall through to next poll tick
+        else:
+            # Fallback: scan open sell orders for the symbol
+            open_orders   = get_open_orders_by_symbol(mode)
+            symbol_orders = open_orders.get(symbol, [])
+            sell_orders   = [
+                o for o in symbol_orders
+                if 'sell' in str(getattr(o, 'side', '') or '').lower()
+            ]
+            if not sell_orders:
+                return True
+
         time.sleep(poll_interval)
         elapsed += poll_interval
 
@@ -453,14 +541,31 @@ def replace_oca_exit(
     """
     cancelled = cancel_symbol_exit_orders(symbol, mode)
     if cancelled:
-        cleared = wait_for_orders_cancelled(symbol, mode, timeout=6.0, poll_interval=0.4)
+        cleared = wait_for_orders_cancelled(symbol, mode, timeout=6.0, poll_interval=0.5, order_ids=cancelled)
         if not cleared:
             logger.warning(
                 "replace_oca_exit: proceeding despite timeout — "
                 "cancellation may not be fully settled for %s", symbol,
             )
 
-    return place_oca_exit(symbol, qty, new_stop, target_price, mode)
+    # CRITICAL: cancel succeeded; if the replacement place fails, the position
+    # is naked until the next monitor cycle. Retry the placement once before
+    # giving up so transient API errors don't strand a position.
+    last_exc = None
+    for attempt in (1, 2):
+        try:
+            return place_oca_exit(symbol, qty, new_stop, target_price, mode)
+        except Exception as exc:
+            last_exc = exc
+            logger.warning(
+                "replace_oca_exit: place attempt %d failed for %s: %s",
+                attempt, symbol, exc,
+            )
+            time.sleep(0.5)
+    # Both attempts failed — surface to caller so it can re-raise/alert. The
+    # caller's existing `except` block catches and fires the NAKED POSITION
+    # telegram alert.
+    raise last_exc
 
 
 def close_position(symbol: str, mode: str = "paper"):

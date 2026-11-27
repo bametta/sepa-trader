@@ -3,12 +3,50 @@ Position manager: Monday open fills + midweek slot refill with AI analysis.
 Pre-trade gate runs before every buy. Live <$10K accounts use conservative limits.
 """
 import logging
+import pytz
+from datetime import datetime
 from sqlalchemy import text
 from sqlalchemy.orm import Session
-from .database import get_setting, set_setting
+from .database import get_setting, set_setting, get_user_setting as _gus
 from . import alpaca_client as alp
 
+_ET = pytz.timezone("America/New_York")
+
 logger = logging.getLogger(__name__)
+
+
+def _has_consecutive_down_days(symbol: str, days: int = 3) -> bool:
+    """Return True if the stock has closed lower for `days` consecutive sessions.
+
+    Used as a late-stage entry guard: a stock "on a dive" (e.g. 3 red days in a
+    row) should not be entered even if it still carries a valid SEPA signal,
+    because EMA support values lag price action by definition.
+
+    Fails open (returns False) on any data error so stale/missing yf data never
+    hard-blocks an otherwise valid entry — the other EMA and signal guards
+    already provide structural protection.
+    """
+    try:
+        from .strategies.yf_client import fetch_history
+        df = fetch_history(symbol, period_days=days + 5)
+        if df.empty or len(df) < days + 1:
+            return False
+        closes = df["Close"].tail(days + 1).tolist()
+        return all(closes[i] < closes[i - 1] for i in range(1, len(closes)))
+    except Exception:
+        return False
+
+
+def _resolve_admin_uid(db: Session) -> int | None:
+    """Look up the admin user's ID from the DB. Used when a function has no
+    user_id param but needs user-scoped Alpaca credentials."""
+    try:
+        row = db.execute(
+            text("SELECT id FROM users WHERE role='admin' ORDER BY id LIMIT 1")
+        ).fetchone()
+        return row[0] if row else None
+    except Exception:
+        return None
 
 
 def _size_qty(portfolio: float, entry: float, stop: float, risk_pct: float, stop_pct: float) -> float:
@@ -18,41 +56,53 @@ def _size_qty(portfolio: float, entry: float, stop: float, risk_pct: float, stop
     return (portfolio * risk_pct / 100) / stop_dollar
 
 
+def _is_economic(db: Session, qty: float, price: float, user_id: int | None = None) -> bool:
+    """Reject sub-economic orders (e.g. 1 share of a $40 stock when cash
+    starvation collapses sizing). Commissions, slippage, and partial-fill
+    bracket churn make these orders net-negative even on a winning thesis.
+    Floor is configurable via `min_position_dollars` setting; default $500.
+    """
+    try:
+        floor = float(_gus(db, "min_position_dollars", "500", user_id or _resolve_admin_uid(db)) or "500")
+    except (TypeError, ValueError):
+        floor = 500.0
+    return (qty * price) >= floor
+
+
 def _settled_funds_available(acct, portfolio: float, min_cash_pct: float, committed: float = 0.0) -> float:
     """Funds genuinely available to deploy on a new buy.
 
-    Alpaca's `buying_power` includes unsettled proceeds from same-day sales,
-    which can phantom-double the available cash on rebalance days
-    (T+1 settlement, finalized 2024). Prefer settled `cash`, fall back to
-    non-marginable buying power, last resort `buying_power`.
+    Use ONLY settled `cash`. Alpaca's `buying_power` includes margin (2x on
+    margin accounts) and unsettled proceeds, which can phantom-double the
+    available cash and silently fund entries that breach the cash floor.
+    If `cash` is missing/zero, return 0 — that's a fail-closed signal to
+    skip the entry rather than fall through to leveraged buying power.
 
     `committed` is dollars already earmarked by earlier buys in the same
     multi-symbol loop, so we don't repeatedly hand out the same cash.
     """
-    settled = 0.0
-    for attr in ("cash", "non_marginable_buying_power", "buying_power"):
-        try:
-            v = float(getattr(acct, attr) or 0)
-        except (TypeError, ValueError):
-            v = 0.0
-        if v > 0:
-            settled = v
-            break
+    try:
+        settled = float(getattr(acct, "cash", 0) or 0)
+    except (TypeError, ValueError):
+        settled = 0.0
+    if settled <= 0:
+        return 0.0
     buffer  = portfolio * (min_cash_pct / 100)
     return max(0.0, settled - buffer - committed)
 
 
-def _effective_max_positions(db: Session, mode: str) -> int:
+def _effective_max_positions(db: Session, mode: str, user_id: int | None = None) -> int:
     """
     For live accounts under $10K, cap max_positions at 3 regardless of
     what the settings say. Paper accounts always use the settings value.
     """
-    configured = int(get_setting(db, "max_positions", "10"))
+    uid = user_id or _resolve_admin_uid(db)
+    configured = int(_gus(db, "max_positions", "10", uid))
     if mode != "live":
         return configured
     try:
         from .database import get_live_account_limits
-        acct   = alp.get_account(mode)
+        acct   = alp.get_account_for_user(db, uid, mode)
         limits = get_live_account_limits(float(acct.portfolio_value))
         cap    = limits.get("max_positions")
         if cap is not None:
@@ -79,25 +129,101 @@ def _gate(
     mode: str,
     user_id: int | None = None,
 ) -> bool:
-    """Pre-trade AI gate. Returns True if order should proceed. Fails open."""
+    """Pre-trade AI gate. Returns True if order should proceed.
+    Fails open (returns True) on exception — screener-derived picks are
+    pre-vetted; a broken AI connection should not hard-block planned trades.
+    (Contrast with trader.py _gate which fails closed for unplanned entries.)
+
+    Also enforces the daily drawdown halt latch (Apex Pillar 5): if the
+    monitor cycle already tripped the circuit breaker today, block all new
+    entries regardless of caller (Monday open, slot refill, post-close).
+    """
+    # ── Manual kill-switch: block_new_entries ────────────────────────────
+    try:
+        from .database import get_user_setting
+        _uid = user_id or _resolve_admin_uid(db)
+        if (get_user_setting(db, "block_new_entries", "false", user_id=_uid) or "false").lower() == "true":
+            logger.warning(
+                "Pre-trade gate: block_new_entries=true — hard blocking %s [%s]",
+                symbol, mode,
+            )
+            return False
+    except Exception as _bne_exc:
+        logger.warning("Pre-trade gate: block_new_entries check failed (%s) — proceeding", _bne_exc)
+
+    # ── Apex Pillar 5: daily drawdown circuit breaker ─────────────────────
+    try:
+        today_et  = datetime.now(_ET).strftime("%Y-%m-%d")
+        halt_key  = f"drawdown_halt_{mode}_date"
+        prior_halt = get_setting(db, halt_key, "")
+        if prior_halt == today_et:
+            logger.warning(
+                "Pre-trade gate: daily drawdown halt active [%s] — blocking %s",
+                mode, symbol,
+            )
+            return False
+    except Exception as _cb_exc:
+        logger.debug("Pre-trade gate: circuit-breaker check failed (%s) — proceeding", _cb_exc)
+
+    # ── Hard tape block: unfavorable market = no new entries ─────────────
+    # When the broad market is in an unfavorable condition (crashing tape,
+    # elevated VIX, poor breadth) we stop all new buys immediately.
+    # This prevents the system from redeploying cash from stop-outs right
+    # back into more falling stocks on a red-tape day.
+    # Fails open (missing cache = no block) so a stale/missing tape reading
+    # never prevents legitimate entries on a normal day.
+    try:
+        from .trader import _get_tape_context
+        effective_uid = user_id or _resolve_admin_uid(db)
+        tape = _get_tape_context(db, effective_uid)
+        if tape and tape.get("condition", "").lower() == "unfavorable":
+            logger.warning(
+                "Pre-trade gate: tape=UNFAVORABLE — hard blocking %s [%s] "
+                "(no new entries on crash days)", symbol, mode,
+            )
+            return False
+    except Exception as _tape_exc:
+        logger.debug("Pre-trade gate: tape hard-block check failed (%s) — proceeding", _tape_exc)
+
+    # ── Dual Momentum veto: no new equity entries when DM says bonds/cash ────
+    # Reads the latest cached DM evaluation from the DB so there's no live
+    # network call during the gate.  Fails open (missing cache = no veto) so
+    # a first-run or stale cache never blocks legitimate entries.
+    try:
+        from .database import get_setting as _get_setting
+        dm_rec = _get_setting(db, "dm_recommended_symbol", "")
+        if dm_rec in ("AGG", "BIL"):
+            logger.warning(
+                "Pre-trade gate: DM signal=%s (bonds/cash) — blocking new equity entry %s [%s]",
+                dm_rec, symbol, mode,
+            )
+            return False
+    except Exception as _dm_exc:
+        logger.debug("Pre-trade gate: DM veto check failed (%s) — proceeding", _dm_exc)
+
     try:
         from .claude_analyst import pre_trade_analysis, log_pre_trade, get_stored_weekly_plan_analysis
-        stored       = get_stored_weekly_plan_analysis(db, symbol, mode)
-        acct         = alp.get_account(mode)
-        portfolio    = float(acct.portfolio_value)
-        cash         = float(acct.cash)
-        buying_power = float(acct.buying_power)
+        from .trader import _get_tape_context
+        effective_uid = user_id or _resolve_admin_uid(db)
+        stored        = get_stored_weekly_plan_analysis(db, symbol, mode)
+        acct          = alp.get_account_for_user(db, effective_uid, mode)
+        portfolio     = float(acct.portfolio_value)
+        cash          = float(acct.cash)
+        buying_power  = float(acct.buying_power)
+        tape_context  = _get_tape_context(db, effective_uid)
 
         result = pre_trade_analysis(
             db=db, symbol=symbol, side="BUY", qty=qty,
             entry_price=entry, stop_price=stop, target_price=target,
             trigger=trigger, portfolio_value=portfolio,
             cash=cash, buying_power=buying_power, mode=mode,
-            user_id=user_id, stored_analysis=stored,
+            user_id=effective_uid, stored_analysis=stored,
+            tape_context=tape_context,
         )
         log_pre_trade(
             db, symbol, trigger,
             result["verdict"], result["reason"], result["analysis"], mode,
+            user_id=effective_uid,
         )
 
         if not result["proceed"]:
@@ -109,7 +235,17 @@ def _gate(
         return True
 
     except Exception as exc:
-        logger.error("Pre-trade gate error for %s: %s — proceeding.", symbol, exc)
+        # For live accounts an unvetted entry is worse than a missed entry.
+        # Fail CLOSED on live so a broken AI connection never silently bypasses
+        # the gate when real money is at stake.  Paper fails open to keep
+        # practice sessions running during temporary outages.
+        if mode == "live":
+            logger.error(
+                "Pre-trade gate error for %s [live]: %s — BLOCKING (fail-closed on live).",
+                symbol, exc,
+            )
+            return False
+        logger.error("Pre-trade gate error for %s [paper]: %s — proceeding (fail-open on paper).", symbol, exc)
         return True
 
 
@@ -176,76 +312,154 @@ def _place_entry(
     mode: str,
     screener_type: str = "minervini",
     target2: float = 0.0,
+    user_id: int | None = None,
+    committed: float = 0.0,  # dollars already earmarked by earlier orders this cycle
 ) -> str:
     """
     Submit the entry buy using the user-configured order type.
     Returns a short description string for logging.
 
-    When target2 > 0 and qty >= 2, places two bracket orders (split-lot):
-      Lot 1: qty//2 shares with take-profit at target (T1)
-      Lot 2: remaining shares with take-profit at target2 (T2)
-    stop_limit entries cannot carry brackets — split-lot falls back to T1-only
-    for stop_limit order type.
+    Single-OCO model: one stop and one target per position.
+    The bracket exit target uses T2 when available (matching _ensure_exit_orders),
+    so the very first OCO is already correct and the monitor never needs to
+    cancel-replace it on the next cycle just to switch T1→T2.
 
     Settings are split by screener source:
       mv_entry_order_type / mv_entry_slippage_pct  — Minervini/breakout picks
       pb_entry_order_type / pb_entry_slippage_pct  — Pullback-to-MA picks
     """
+    _uid = user_id or _resolve_admin_uid(db)
     if screener_type == "pullback":
-        order_type   = get_setting(db, "pb_entry_order_type",   "limit")
-        slippage_pct = float(get_setting(db, "pb_entry_slippage_pct", "0.5"))
-    else:  # minervini (default)
-        order_type   = get_setting(db, "mv_entry_order_type",   "stop_limit")
-        slippage_pct = float(get_setting(db, "mv_entry_slippage_pct", "1.0"))
+        order_type   = _gus(db, "pb_entry_order_type",   "limit",     _uid)
+        slippage_pct = float(_gus(db, "pb_entry_slippage_pct", "0.5", _uid))
+    elif screener_type == "pead":
+        # PEAD entries are at or near the current market price (gap-day close).
+        # A stop-limit order would be rejected by Alpaca (stop already triggered).
+        # Use limit order — same as Pullback — to capture at the current level.
+        order_type   = "limit"
+        slippage_pct = float(_gus(db, "pb_entry_slippage_pct", "0.5", _uid))
+    else:  # minervini / rs_momentum (default — breakout-style stop-limit)
+        order_type   = _gus(db, "mv_entry_order_type",   "stop_limit", _uid)
+        slippage_pct = float(_gus(db, "mv_entry_slippage_pct", "1.0", _uid))
 
-    has_exits   = stop > 0 and target > 0
-    use_split   = target2 > 0 and int(qty) >= 2 and order_type != "stop_limit"
+    # Hard pre-submit cash guard. Sizing already enforces min_cash_pct on a
+    # snapshot, but slippage and racing fills (other entries within the same
+    # cycle) can push the actual debit above settled cash and quietly draw
+    # margin. Refetch cash now and abort if worst-case cost exceeds it.
+    # Limit/stop-limit: worst case is the limit cap. Market: assume +1% slip.
+    #
+    # CRITICAL: stop-limit orders do NOT reduce acct.cash until triggered.
+    # Without `committed`, every order in the same cycle sees the full cash
+    # balance and passes the guard — all orders fill simultaneously at open
+    # and the account is drawn into margin. The caller must pass the running
+    # dollar total of orders already submitted this cycle so we can subtract
+    # it from live_cash before comparing.
+    try:
+        slip = max(slippage_pct, 1.0) if order_type == "market" else slippage_pct
+        worst_px   = entry * (1 + slip / 100)
+        worst_cost = qty * worst_px
+        live_acct  = alp.get_account_for_user(db, user_id or _resolve_admin_uid(db), mode)
+        live_cash  = float(getattr(live_acct, "cash", 0) or 0)
+        available_cash = live_cash - committed   # subtract already-earmarked funds
+        if worst_cost > available_cash:
+            msg = (
+                f"pre-submit cash guard: worst-case ${worst_cost:.2f} "
+                f"> available cash ${available_cash:.2f} "
+                f"(settled=${live_cash:.2f} committed=${committed:.2f}) "
+                f"— refusing to submit (would draw margin)"
+            )
+            logger.warning("_place_entry %s [%s]: %s", sym, mode, msg)
+            raise RuntimeError(msg)
+    except RuntimeError:
+        raise
+    except Exception as exc:
+        # Failure to fetch cash is itself a fail-closed signal.
+        logger.error("_place_entry %s: cash guard refetch failed: %s — refusing", sym, exc)
+        raise RuntimeError(f"cash guard refetch failed: {exc}")
+
+    has_exits = stop > 0 and target > 0
+
+    # Use T2 as the bracket exit target when available — matches what
+    # _ensure_exit_orders will set on its first cycle, avoiding the
+    # immediate cancel-replace churn (e.g. MTCH: bracket at T1 $39.07
+    # canceled 2 min later and replaced at T2 $41.30).
+    oco_target = target2 if target2 > 0 else target
 
     if order_type == "limit":
         limit_px = round(entry * (1 + slippage_pct / 100), 2)
-        if has_exits and use_split:
-            try:
-                alp.place_split_limit_bracket_buy(sym, qty, entry, stop, target, target2, slippage_pct, mode)
-                qty1 = int(qty) // 2
-                return (f"split limit bracket (lim=${limit_px} stop=${stop:.2f} "
-                        f"T1=${target:.2f}×{qty1}sh T2=${target2:.2f}×{int(qty)-qty1}sh)")
-            except ValueError:
-                pass  # qty too small — fall through to single bracket
-            except Exception as exc:
-                logger.error("_place_entry: split limit bracket FAILED for %s: %s — single bracket fallback", sym, exc)
         if has_exits:
             try:
-                alp.place_limit_bracket_buy(sym, qty, entry, stop, target, slippage_pct, mode)
-                return f"limit bracket (lim=${limit_px} stop=${stop:.2f} tgt=${target:.2f})"
+                alp.place_limit_bracket_buy(sym, qty, entry, stop, oco_target, slippage_pct, mode)
+                return f"limit bracket (lim=${limit_px} stop=${stop:.2f} tgt=${oco_target:.2f})"
             except Exception as exc:
                 logger.error("_place_entry: limit bracket FAILED for %s: %s — market bracket fallback", sym, exc)
-                alp.place_bracket_buy(sym, qty, stop, target, mode)
-                return f"market bracket [limit fallback] (stop=${stop:.2f} tgt=${target:.2f})"
+                alp.place_bracket_buy(sym, qty, stop, oco_target, mode)
+                return f"market bracket [limit fallback] (stop=${stop:.2f} tgt=${oco_target:.2f})"
         else:
             alp.place_limit_buy(sym, qty, limit_px, mode)
             return f"limit buy (lim=${limit_px})"
 
     elif order_type == "stop_limit":
         limit_px = round(entry * (1 + slippage_pct / 100), 2)
-        alp.place_stop_limit_buy(sym, qty, entry, slippage_pct, mode)
-        note = " [T2 exits added post-fill by monitor]" if target2 > 0 else " — exits pending fill"
-        return f"stop-limit (stop=${entry:.2f} lim=${limit_px}){note}"
+        # Pre-flight price check: Alpaca rejects buy stop-limits where the stop
+        # price is at or below the current market price (the breakout already
+        # happened — the stop would trigger instantly at a limit below live price).
+        # If we're already past the entry, fall back to a limit order at limit_px
+        # so we still capture the position rather than hard-failing.
+        try:
+            from .tv_analyzer import analyze
+            live = analyze(sym)
+            live_price = live.get("price") or 0.0
+            if live_price and live_price >= entry:
+                logger.warning(
+                    "_place_entry %s: current price $%.2f already past stop entry $%.2f "
+                    "— stop-limit would be rejected; falling back to limit bracket at $%.2f [%s]",
+                    sym, live_price, entry, limit_px, mode,
+                )
+                # Use limit bracket (not plain limit buy) so stop + target are
+                # attached immediately — position is never left naked.
+                if has_exits:
+                    try:
+                        alp.place_limit_bracket_buy(sym, qty, entry, stop, oco_target, slippage_pct, mode)
+                        return f"limit bracket [stop-limit passed] (lim=${limit_px:.2f} stop=${stop:.2f} tgt=${oco_target:.2f})"
+                    except Exception as _lb_exc:
+                        logger.error(
+                            "_place_entry %s: limit bracket fallback failed (%s) — market bracket last resort [%s]",
+                            sym, _lb_exc, mode,
+                        )
+                        alp.place_bracket_buy(sym, qty, stop, oco_target, mode)
+                        return f"market bracket [stop-limit→bracket fallback] (stop=${stop:.2f} tgt=${oco_target:.2f})"
+                else:
+                    alp.place_limit_buy(sym, qty, limit_px, mode)
+                    return f"limit buy [stop already passed, no exits defined] (lim=${limit_px:.2f})"
+        except Exception as exc:
+            logger.debug("_place_entry %s: price pre-check failed (%s) — proceeding with stop-limit", sym, exc)
+
+        order = alp.place_stop_limit_buy(sym, qty, entry, slippage_pct, mode)
+        # Brief rejection check — catch any remaining immediate rejections.
+        try:
+            import time as _time
+            _time.sleep(0.5)
+            client = alp._get_user_client(db, user_id, mode) or alp.get_client(mode)
+            order_id = str(getattr(order, "id", "") or "")
+            if order_id:
+                refreshed = client.get_order_by_id(order_id)
+                status = str(getattr(refreshed, "status", "") or "").lower()
+                if status in ("rejected", "canceled", "expired"):
+                    raise RuntimeError(
+                        f"Entry order for {sym} was {status} by Alpaca immediately after submission."
+                    )
+        except RuntimeError:
+            raise
+        except Exception:
+            pass  # refresh failed — reconcile will self-heal if needed
+        return f"stop-limit (stop=${entry:.2f} lim=${limit_px}) — exits pending fill"
 
     else:  # "market" or unrecognised
-        if has_exits and use_split:
-            try:
-                alp.place_split_bracket_buy(sym, qty, stop, target, target2, mode)
-                qty1 = int(qty) // 2
-                return (f"split market bracket (stop=${stop:.2f} "
-                        f"T1=${target:.2f}×{qty1}sh T2=${target2:.2f}×{int(qty)-qty1}sh)")
-            except ValueError:
-                pass  # qty too small — fall through to single bracket
-            except Exception as exc:
-                logger.error("_place_entry: split market bracket FAILED for %s: %s — single bracket fallback", sym, exc)
         if has_exits:
             try:
-                alp.place_bracket_buy(sym, qty, stop, target, mode)
-                return f"market bracket (stop=${stop:.2f} tgt=${target:.2f})"
+                alp.place_bracket_buy(sym, qty, stop, oco_target, mode)
+                return f"market bracket (stop=${stop:.2f} tgt=${oco_target:.2f})"
             except Exception as exc:
                 logger.error("_place_entry: market bracket FAILED for %s: %s — plain market buy", sym, exc)
                 alp.place_market_buy(sym, qty, mode)
@@ -255,14 +469,15 @@ def _place_entry(
             return f"market buy"
 
 
-def _count_positions_by_type(db: Session, mode: str, symbols: set) -> tuple[int, int, int]:
+def _count_positions_by_type(db: Session, mode: str, symbols: set) -> tuple[int, int, int, int]:
     """
-    Return (mv_count, pb_count, rs_count) of currently held positions by screener type.
-    Looks up the screener_type from the most recent EXECUTED weekly_plan row.
-    'both' and 'minervini' → mv; 'pullback' → pb; 'rs_momentum' → rs.
+    Return (mv_count, pb_count, rs_count, pead_count) of currently held
+    positions by screener type.  Looks up screener_type from the most recent
+    EXECUTED weekly_plan row for each symbol.
+    'both'/'minervini' → mv; 'pullback' → pb; 'rs_momentum' → rs; 'pead' → pead.
     """
     if not symbols:
-        return 0, 0, 0
+        return 0, 0, 0, 0
     rows = db.execute(
         text("""
             SELECT COALESCE(screener_type, 'minervini') AS stype, COUNT(*) AS cnt
@@ -276,15 +491,17 @@ def _count_positions_by_type(db: Session, mode: str, symbols: set) -> tuple[int,
         """),
         {"syms": tuple(symbols), "mode": mode},
     ).fetchall()
-    mv, pb, rs = 0, 0, 0
+    mv, pb, rs, pead = 0, 0, 0, 0
     for stype, cnt in rows:
         if stype in ("minervini", "both"):
             mv += cnt
         elif stype == "rs_momentum":
             rs += cnt
+        elif stype == "pead":
+            pead += cnt
         else:
             pb += cnt
-    return mv, pb, rs
+    return mv, pb, rs, pead
 
 
 def _get_symbol_screener_type(db: Session, symbol: str, mode: str) -> str:
@@ -312,21 +529,53 @@ def run_monday_open(db: Session, mode: str | None = None):
     """
     if mode is None:
         mode = get_setting(db, "trading_mode", "paper")
+    admin_uid_early = _resolve_admin_uid(db)
     # Use mode-specific auto_execute — live is fail-safe (default off)
     if mode == "live":
-        auto_exec = get_setting(db, "live_auto_execute", "false").lower() == "true"
+        auto_exec = _gus(db, "live_auto_execute", "false", admin_uid_early).lower() == "true"
     else:
-        auto_exec = get_setting(db, "paper_auto_execute", get_setting(db, "auto_execute", "true")).lower() == "true"
+        auto_exec = _gus(db, "paper_auto_execute",
+                         _gus(db, "auto_execute", "true", admin_uid_early),
+                         admin_uid_early).lower() == "true"
     if not auto_exec:
         logger.info("Monday open [%s]: auto_execute off — skipping.", mode)
         return
 
-    max_pos = _effective_max_positions(db, mode)
-    mv_max  = int(get_setting(db, "mv_max_slots", "3") or "3")
-    pb_max  = int(get_setting(db, "pb_max_slots", "2") or "2")
+    # Holiday guard: Alpaca's clock is the source of truth for market hours.
+    # Catches Monday holidays (MLK, Memorial, Labor, Presidents Day, etc.) so
+    # we don't fire BUY orders into a closed market.
+    try:
+        if not alp.get_clock(mode).is_open:
+            logger.info("Monday open [%s]: market closed (holiday?) — skipping.", mode)
+            return
+    except Exception as exc:
+        logger.warning(
+            "Monday open [%s]: market-clock check failed (%s) — skipping to be safe.",
+            mode, exc,
+        )
+        return
+
+    # ── Apex Pillar 5: daily drawdown circuit breaker ─────────────────────
+    try:
+        today_et  = datetime.now(_ET).strftime("%Y-%m-%d")
+        halt_key  = f"drawdown_halt_{mode}_date"
+        if get_setting(db, halt_key, "") == today_et:
+            logger.warning(
+                "Monday open [%s]: daily drawdown halt active — skipping all buys.", mode,
+            )
+            return
+    except Exception as _cb_exc:
+        logger.debug("Monday open: circuit-breaker check failed (%s) — proceeding", _cb_exc)
+
+    admin_uid = admin_uid_early  # already resolved above
+    max_pos   = _effective_max_positions(db, mode, admin_uid)
+    mv_max    = int(_gus(db, "mv_max_slots",   "3", admin_uid) or "3")
+    pb_max    = int(_gus(db, "pb_max_slots",   "2", admin_uid) or "2")
+    rs_max    = int(_gus(db, "rs_max_slots",   "2", admin_uid) or "2")
+    pead_max  = int(_gus(db, "pead_max_slots", "2", admin_uid) or "2")
 
     try:
-        positions = alp.get_positions(mode)
+        positions = alp.get_positions_for_user(db, admin_uid, mode)
     except Exception as exc:
         logger.error("Monday open: could not fetch positions: %s", exc)
         return
@@ -337,14 +586,18 @@ def run_monday_open(db: Session, mode: str | None = None):
         return
 
     held_symbols   = {p.symbol for p in positions}
-    mv_held, pb_held, rs_held = _count_positions_by_type(db, mode, held_symbols)
+    mv_held, pb_held, rs_held, pead_held = _count_positions_by_type(db, mode, held_symbols)
 
-    mv_slots = min(max(0, mv_max - mv_held), max_pos - total_held)
-    pb_slots = min(max(0, pb_max - pb_held), max_pos - total_held - mv_slots)
+    mv_slots   = min(max(0, mv_max   - mv_held),   max_pos - total_held)
+    pb_slots   = min(max(0, pb_max   - pb_held),   max_pos - total_held - mv_slots)
+    rs_slots   = min(max(0, rs_max   - rs_held),   max_pos - total_held - mv_slots - pb_slots)
+    pead_slots = min(max(0, pead_max - pead_held), max_pos - total_held - mv_slots - pb_slots - rs_slots)
 
     logger.info(
-        "Monday open [%s]: held=%d (mv=%d pb=%d rs=%d) | slots: mv=%d pb=%d | max_pos=%d",
-        mode, total_held, mv_held, pb_held, rs_held, mv_slots, pb_slots, max_pos,
+        "Monday open [%s]: held=%d (mv=%d pb=%d rs=%d pead=%d) | "
+        "slots: mv=%d pb=%d rs=%d pead=%d | max_pos=%d",
+        mode, total_held, mv_held, pb_held, rs_held, pead_held,
+        mv_slots, pb_slots, rs_slots, pead_slots, max_pos,
     )
 
     # Fetch Minervini picks (screener_type = 'minervini' or 'both')
@@ -377,23 +630,53 @@ def run_monday_open(db: Session, mode: str | None = None):
         {"slots": pb_slots, "mode": mode},
     ).fetchall() if pb_slots > 0 else []
 
-    rows = list(mv_rows) + list(pb_rows)
+    # Fetch RS Momentum picks (screener_type = 'rs_momentum')
+    rs_rows = db.execute(
+        text("""
+            SELECT symbol, entry_price, stop_price, target1, target2,
+                   screener_type
+            FROM weekly_plan
+            WHERE week_start = (SELECT MAX(week_start) FROM weekly_plan WHERE mode = :mode)
+              AND mode = :mode AND status = 'PENDING'
+              AND screener_type = 'rs_momentum'
+            ORDER BY rank ASC
+            LIMIT :slots
+        """),
+        {"slots": rs_slots, "mode": mode},
+    ).fetchall() if rs_slots > 0 else []
+
+    # Fetch PEAD picks (screener_type = 'pead')
+    pead_rows = db.execute(
+        text("""
+            SELECT symbol, entry_price, stop_price, target1, target2,
+                   screener_type
+            FROM weekly_plan
+            WHERE week_start = (SELECT MAX(week_start) FROM weekly_plan WHERE mode = :mode)
+              AND mode = :mode AND status = 'PENDING'
+              AND screener_type = 'pead'
+            ORDER BY rank ASC
+            LIMIT :slots
+        """),
+        {"slots": pead_slots, "mode": mode},
+    ).fetchall() if pead_slots > 0 else []
+
+    rows = list(mv_rows) + list(pb_rows) + list(rs_rows) + list(pead_rows)
 
     if not rows:
         logger.info("Monday open: no PENDING picks for mode=%s.", mode)
         return
 
     try:
-        acct      = alp.get_account(mode)
+        acct      = alp.get_account_for_user(db, admin_uid, mode)
         portfolio = float(acct.portfolio_value)
     except Exception as exc:
         logger.error("Monday open: could not fetch account: %s", exc)
         return
 
-    risk_pct         = float(get_setting(db, "risk_pct", "2.0"))
-    stop_pct         = float(get_setting(db, "stop_loss_pct", "8.0"))
-    min_cash_pct     = float(get_setting(db, "min_cash_pct",     "10.0") or "10.0")
-    max_position_pct = float(get_setting(db, "max_position_pct", "20.0") or "20.0")
+    risk_pct         = float(_gus(db, "risk_pct",         "2.0",  admin_uid))
+    stop_pct         = float(_gus(db, "stop_loss_pct",    "8.0",  admin_uid))
+    min_cash_pct     = float(_gus(db, "min_cash_pct",     "10.0", admin_uid) or "10.0")
+    max_position_pct = float(_gus(db, "max_position_pct", "20.0", admin_uid) or "20.0")
     held             = {p.symbol for p in positions}
     committed        = 0.0
 
@@ -408,6 +691,116 @@ def run_monday_open(db: Session, mode: str | None = None):
         if sym in held or entry <= 0:
             continue
 
+        # ── Apex Pillar 1: re-evaluate exits with live price action ──────
+        # Screener-computed stops can be 3–5 days old by Monday open.
+        # _compute_fresh_exits derives structurally-anchored levels from
+        # current EMA20/EMA50, so the bracket placed today reflects where
+        # the market actually is — not where it was Thursday evening.
+        # PEAD exception: the stop IS the gap-day low (structural thesis anchor).
+        # Overwriting it with an EMA-derived stop would invalidate the strategy —
+        # skip fresh-exit derivation entirely for PEAD picks.
+        if stype != "pead":
+            try:
+                from .trader import _compute_fresh_exits
+                fresh_stop, fresh_target, basis = _compute_fresh_exits(db, sym, entry)
+                if fresh_stop > 0 and stop > 0 and abs(fresh_stop - stop) / stop > 0.01:
+                    logger.info(
+                        "Monday open: %s fresh stop $%.2f→$%.2f (basis=%s)",
+                        sym, stop, fresh_stop, basis,
+                    )
+                    stop, target = fresh_stop, fresh_target
+                    # Persist so fill_open_slots and the exit guard see the same values
+                    try:
+                        db.execute(
+                            text("""
+                                UPDATE weekly_plan
+                                SET stop_price = :s, target1 = :t
+                                WHERE symbol = :sym AND mode = :mode
+                                  AND week_start = (
+                                      SELECT MAX(week_start) FROM weekly_plan WHERE mode = :mode
+                                  )
+                            """),
+                            {"s": stop, "t": target, "sym": sym, "mode": mode},
+                        )
+                        db.commit()
+                    except Exception as _upd_exc:
+                        logger.warning(
+                            "Monday open: could not persist fresh exits for %s: %s", sym, _upd_exc,
+                        )
+                        db.rollback()
+            except Exception as _fe_exc:
+                logger.warning(
+                    "Monday open: fresh exits failed for %s (%s) — using screener values",
+                    sym, _fe_exc,
+                )
+
+        # ── Live price deviation check ─────────────────────────────────────
+        # Plan entry was computed Thu/Fri. By Monday open the stock may have
+        # gapped significantly. Rules:
+        #
+        #   Gapped UP > max_dev  → skip for ALL types (chasing an extended
+        #                          move / stock has left the setup zone)
+        #   Gapped DOWN > max_dev → skip Minervini & RS (breakout invalidated)
+        #                           allow Pullback (deeper pullback = better entry)
+        #   Within range          → use live price for sizing + order so we
+        #                           don't anchor to a stale number
+        #
+        # Threshold is configurable via entry_max_deviation_pct (default 5%).
+        try:
+            from .tv_analyzer import analyze as _tv_analyze
+            _max_dev = float(_gus(db, "entry_max_deviation_pct", "5.0", admin_uid) or "5.0")
+            _live_tech  = _tv_analyze(sym, db=db) or {}
+            _live_price = float(_live_tech.get("price") or 0)
+            if _live_price > 0 and entry > 0:
+                _dev_pct = (_live_price - entry) / entry * 100
+                if _dev_pct > _max_dev:
+                    logger.info(
+                        "Monday open: skipping %s — gapped UP %.1f%% above plan $%.2f "
+                        "(live=$%.2f, threshold=%.1f%%) [%s]",
+                        sym, _dev_pct, entry, _live_price, _max_dev, mode,
+                    )
+                    continue
+                elif _dev_pct < -_max_dev:
+                    if stype in ("minervini", "both", "rs_momentum", "pead"):
+                        logger.info(
+                            "Monday open: skipping %s — gapped DOWN %.1f%% below plan $%.2f "
+                            "(live=$%.2f) — thesis invalidated [%s]",
+                            sym, abs(_dev_pct), entry, _live_price, mode,
+                        )
+                        continue
+                    # Pullback: a deeper pullback is a better entry — proceed at live price
+                    logger.info(
+                        "Monday open: %s gapped DOWN %.1f%% — Pullback, using live price $%.2f [%s]",
+                        sym, abs(_dev_pct), _live_price, mode,
+                    )
+                # Use live price for sizing and order placement
+                if abs(_dev_pct) > 0.1:
+                    logger.info(
+                        "Monday open: %s plan=$%.2f live=$%.2f (drift=%.1f%%) — using live price [%s]",
+                        sym, entry, _live_price, _dev_pct, mode,
+                    )
+                entry = _live_price
+                # Persist so exit guard and UI read a consistent entry price
+                try:
+                    db.execute(
+                        text("""
+                            UPDATE weekly_plan SET entry_price = :e
+                            WHERE symbol = :sym AND mode = :mode
+                              AND week_start = (
+                                  SELECT MAX(week_start) FROM weekly_plan WHERE mode = :mode
+                              )
+                        """),
+                        {"e": entry, "sym": sym, "mode": mode},
+                    )
+                    db.commit()
+                except Exception as _pe:
+                    logger.warning("Monday open: could not persist live entry for %s: %s", sym, _pe)
+        except Exception as _dev_exc:
+            logger.warning(
+                "Monday open: live price check failed for %s (%s) — using plan entry $%.2f",
+                sym, _dev_exc, entry,
+            )
+
         qty = _size_qty(portfolio, entry, stop, risk_pct, stop_pct)
         # Settlement-aware: cap by settled cash net of running spend
         max_pos_shares = int(portfolio * max_position_pct / 100 / entry) if entry > 0 else 0
@@ -421,17 +814,20 @@ def run_monday_open(db: Session, mode: str | None = None):
         if qty < 1:
             logger.info("Monday open: skipping %s — position size < 1 share (avail=$%.2f).", sym, avail)
             continue
+        if not _is_economic(db, qty, entry, admin_uid):
+            logger.info(
+                "Monday open: skipping %s — sub-economic order (qty=%d × $%.2f < min).",
+                sym, int(qty), entry,
+            )
+            continue
 
-        if not _gate(db, sym, qty, entry, stop, target, "MONDAY_OPEN", mode):
+        gate_trigger = "MONDAY_OPEN_PEAD" if stype == "pead" else "MONDAY_OPEN"
+        if not _gate(db, sym, qty, entry, stop, target, gate_trigger, mode, user_id=admin_uid):
             continue
 
         try:
-            order_desc   = _place_entry(db, sym, qty, entry, stop, target, "MONDAY_OPEN", mode, stype, target2=target2)
-            order_placed = True
+            order_desc = _place_entry(db, sym, qty, entry, stop, target, gate_trigger, mode, stype, target2=target2, user_id=admin_uid, committed=committed)
             logger.info("Monday open: %s qty=%.0f — %s", sym, qty, order_desc)
-
-            if not order_placed:
-                continue
 
             db.execute(
                 text("""
@@ -446,13 +842,23 @@ def run_monday_open(db: Session, mode: str | None = None):
             db.execute(
                 text("""
                     INSERT INTO trade_log (symbol, action, qty, price, trigger, mode)
-                    VALUES (:s, 'BUY', :q, :p, 'MONDAY_OPEN', :m)
+                    VALUES (:s, 'BUY', :q, :p, :trig, :m)
                 """),
-                {"s": sym, "q": qty, "p": entry, "m": mode},
+                {"s": sym, "q": qty, "p": entry, "trig": gate_trigger, "m": mode},
             )
             db.commit()
             held.add(sym)
             committed += qty * entry
+            try:
+                from . import telegram_alerts as tg
+                from .claude_analyst import get_latest_pre_trade
+                v, r = get_latest_pre_trade(db, sym, mode, user_id=admin_uid)
+                tg.alert_trade_sync(
+                    "BUY", sym, qty, entry, gate_trigger, mode,
+                    ai_verdict=v, ai_reason=r,
+                )
+            except Exception:
+                pass
 
         except Exception as exc:
             logger.error("Monday open: buy failed for %s: %s", sym, exc)
@@ -469,8 +875,10 @@ def check_post_close(db: Session, mode: str | None = None):
     if mode is None:
         mode = get_setting(db, "trading_mode", "paper")
 
+    admin_uid = _resolve_admin_uid(db)
+
     try:
-        current = {p.symbol for p in alp.get_positions(mode)}
+        current = {p.symbol for p in alp.get_positions_for_user(db, admin_uid, mode)}
     except Exception as exc:
         logger.error("check_post_close: cannot fetch positions: %s", exc)
         return
@@ -482,22 +890,61 @@ def check_post_close(db: Session, mode: str | None = None):
     ).fetchone()
     prev = set(snap_row[0].split(",")) if snap_row and snap_row[0] else set()
 
-    set_setting(db, snapshot_key, ",".join(sorted(current)))
-    db.commit()
-
     closed = prev - current
     if not closed:
+        # No closures — safe to advance the snapshot now.
+        set_setting(db, snapshot_key, ",".join(sorted(current)))
+        db.commit()
         return
 
     logger.info("[%s] Detected closed positions: %s", mode, closed)
 
+    # Log a SELL row for each newly closed symbol so trade_log reflects the
+    # bracket-OCO exit that fired on Alpaca's side. Without this, BUYs sit in
+    # trade_log forever with no matching SELL and reconcile_db_vs_alpaca
+    # raises false POSITION DRIFT alerts on every monitor cycle.
+    for sym in closed:
+        try:
+            _log_alpaca_side_sell(db, sym, mode)
+        except Exception as exc:
+            logger.error("[%s] failed to log SELL for closed %s: %s", mode, sym, exc)
+
+    # Same-day re-buy guard: stamp the weekly_plan row for every just-closed
+    # symbol as EXECUTED so the AI analysis (claude_analyst.analyze_picks_structured
+    # filters to status=PENDING) and any rescreen later today won't pick the
+    # same name back up. Scoped to the latest week_start in this mode so we
+    # don't mutate prior weeks' plans. Idempotent — already-EXECUTED rows are
+    # untouched. The 8-hour sold_recently cooldown in fill_open_slots remains
+    # as a second line of defence covering manual closes that don't match a
+    # plan row at all.
+    if closed:
+        try:
+            db.execute(
+                text("""
+                    UPDATE weekly_plan SET status = 'EXECUTED'
+                    WHERE week_start = (SELECT MAX(week_start) FROM weekly_plan WHERE mode = :mode)
+                      AND mode   = :mode
+                      AND symbol IN :syms
+                      AND status = 'PENDING'
+                """),
+                {"mode": mode, "syms": tuple(closed)},
+            )
+            db.commit()
+        except Exception as exc:
+            logger.warning(
+                "[%s] same-day re-buy guard: failed to mark closed plan rows EXECUTED: %s",
+                mode, exc,
+            )
+
     # Resolve AI API key: prefer user-setting 'ai_api_key', fall back to legacy 'claude_api_key'
+    admin_uid = None
     try:
         from sqlalchemy import text as _t
         admin_row = db.execute(_t("SELECT id FROM users WHERE role='admin' ORDER BY id LIMIT 1")).fetchone()
         if admin_row:
+            admin_uid = admin_row[0]
             from .database import get_all_user_settings as _gaus
-            _s = _gaus(db, admin_row[0])
+            _s = _gaus(db, admin_uid)
             api_key = _s.get("ai_api_key", "") or _s.get("claude_api_key", "") or get_setting(db, "claude_api_key", "")
         else:
             api_key = get_setting(db, "claude_api_key", "")
@@ -505,10 +952,12 @@ def check_post_close(db: Session, mode: str | None = None):
         api_key = get_setting(db, "claude_api_key", "")
     # Use mode-specific auto_execute — live is fail-safe (default off)
     if mode == "live":
-        auto_exec = get_setting(db, "live_auto_execute", "false").lower() == "true"
+        auto_exec = _gus(db, "live_auto_execute", "false", admin_uid).lower() == "true"
     else:
-        auto_exec = get_setting(db, "paper_auto_execute", get_setting(db, "auto_execute", "true")).lower() == "true"
-    max_pos   = _effective_max_positions(db, mode)
+        auto_exec = _gus(db, "paper_auto_execute",
+                         _gus(db, "auto_execute", "true", admin_uid),
+                         admin_uid).lower() == "true"
+    max_pos   = _effective_max_positions(db, mode, admin_uid)
 
     for sym in closed:
         close_reason, entry_price, close_price = _infer_close_reason(db, sym, mode)
@@ -521,7 +970,7 @@ def check_post_close(db: Session, mode: str | None = None):
         )
 
         if api_key:
-            _run_claude_analysis(db, sym, mode)
+            _run_claude_analysis(db, sym, mode, user_id=admin_uid)
 
         if auto_exec and len(current) < max_pos:
             _refill_slot(
@@ -534,11 +983,18 @@ def check_post_close(db: Session, mode: str | None = None):
                 close_price=close_price,
                 current_positions=current,
                 max_pos=max_pos,
+                user_id=admin_uid,
             )
             try:
-                current = {p.symbol for p in alp.get_positions(mode)}
+                current = {p.symbol for p in alp.get_positions_for_user(db, admin_uid, mode)}
             except Exception:
                 pass
+
+    # Advance the snapshot only AFTER the closed-position loop finishes.
+    # If we crash mid-loop, the next run sees the unchanged `prev` and
+    # re-detects the still-pending closures instead of silently losing them.
+    set_setting(db, snapshot_key, ",".join(sorted(current)))
+    db.commit()
 
 
 def _refill_slot(
@@ -551,6 +1007,7 @@ def _refill_slot(
     close_price: float | None,
     current_positions: set,
     max_pos: int,
+    user_id: int | None = None,
 ):
     """
     Run slot-refill analysis and execute the recommended pick if approved.
@@ -560,12 +1017,15 @@ def _refill_slot(
     """
     from .claude_analyst import analyze_slot_refill, log_analysis
 
-    mv_max = int(get_setting(db, "mv_max_slots", "3") or "3")
-    pb_max = int(get_setting(db, "pb_max_slots", "2") or "2")
-    mv_held, pb_held, rs_held = _count_positions_by_type(db, mode, current_positions)
+    _ruid    = user_id or _resolve_admin_uid(db)
+    mv_max   = int(_gus(db, "mv_max_slots",   "3", _ruid) or "3")
+    pb_max   = int(_gus(db, "pb_max_slots",   "2", _ruid) or "2")
+    rs_max   = int(_gus(db, "rs_max_slots",   "2", _ruid) or "2")
+    pead_max = int(_gus(db, "pead_max_slots", "2", _ruid) or "2")
+    mv_held, pb_held, rs_held, pead_held = _count_positions_by_type(db, mode, current_positions)
 
     try:
-        acct         = alp.get_account(mode)
+        acct         = alp.get_account_for_user(db, _ruid, mode)
         portfolio    = float(acct.portfolio_value)
         cash         = float(acct.cash)
         buying_power = float(acct.buying_power)
@@ -576,24 +1036,37 @@ def _refill_slot(
     held_tuple = tuple(current_positions) if current_positions else ("__none__",)
 
     # Determine which type(s) have open slots
-    mv_available = mv_held < mv_max
-    pb_available = pb_held < pb_max
+    mv_available   = mv_held   < mv_max
+    pb_available   = pb_held   < pb_max
+    rs_available   = rs_held   < rs_max
+    pead_available = pead_held < pead_max
 
     # Build type filter: prefer same type as what closed, fall back if needed
     if closed_stype in ("minervini", "both") and mv_available:
         type_filter = ("minervini", "both")
     elif closed_stype == "pullback" and pb_available:
         type_filter = ("pullback",)
+    elif closed_stype == "rs_momentum" and rs_available:
+        type_filter = ("rs_momentum",)
+    elif closed_stype == "pead" and pead_available:
+        type_filter = ("pead",)
     elif mv_available:
         type_filter = ("minervini", "both")
-        logger.info("Slot refill: no pb slot available — trying mv pick instead")
+        logger.info("Slot refill: no %s slot available — trying mv pick instead", closed_stype)
     elif pb_available:
         type_filter = ("pullback",)
         logger.info("Slot refill: no mv slot available — trying pb pick instead")
+    elif rs_available:
+        type_filter = ("rs_momentum",)
+        logger.info("Slot refill: no mv/pb slot available — trying rs pick instead")
+    elif pead_available:
+        type_filter = ("pead",)
+        logger.info("Slot refill: no mv/pb/rs slot available — trying pead pick instead")
     else:
         logger.info(
-            "Slot refill [%s]: all strategy slots full (mv=%d/%d pb=%d/%d) — skipping",
-            mode, mv_held, mv_max, pb_held, pb_max,
+            "Slot refill [%s]: all strategy slots full "
+            "(mv=%d/%d pb=%d/%d rs=%d/%d pead=%d/%d) — skipping",
+            mode, mv_held, mv_max, pb_held, pb_max, rs_held, rs_max, pead_held, pead_max,
         )
         return
 
@@ -692,7 +1165,7 @@ def _refill_slot(
             )
             return
 
-        _execute_specific_pick(db=db, mode=mode, symbol=recommended, pending_picks=eligible_picks)
+        _execute_specific_pick(db=db, mode=mode, symbol=recommended, pending_picks=eligible_picks, user_id=user_id)
 
     except Exception as exc:
         logger.error(
@@ -710,7 +1183,7 @@ def _refill_slot(
             pass
 
 
-def _execute_specific_pick(db: Session, mode: str, symbol: str, pending_picks: list[dict]):
+def _execute_specific_pick(db: Session, mode: str, symbol: str, pending_picks: list[dict], user_id: int | None = None):
     """Execute a specific symbol from the pending picks list."""
     pick = next((p for p in pending_picks if p["symbol"] == symbol), None)
     if not pick:
@@ -728,15 +1201,16 @@ def _execute_specific_pick(db: Session, mode: str, symbol: str, pending_picks: l
         return
 
     try:
-        acct      = alp.get_account(mode)
+        acct      = alp.get_account_for_user(db, user_id or _resolve_admin_uid(db), mode)
         portfolio = float(acct.portfolio_value)
     except Exception as exc:
         logger.error("Slot refill: account fetch failed: %s", exc)
         return
 
-    risk_pct     = float(get_setting(db, "risk_pct", "2.0"))
-    stop_pct     = float(get_setting(db, "stop_loss_pct", "8.0"))
-    min_cash_pct = float(get_setting(db, "min_cash_pct", "10.0") or "10.0")
+    _esuid   = user_id or _resolve_admin_uid(db)
+    risk_pct     = float(_gus(db, "risk_pct",      "2.0",  _esuid))
+    stop_pct     = float(_gus(db, "stop_loss_pct", "8.0",  _esuid))
+    min_cash_pct = float(_gus(db, "min_cash_pct",  "10.0", _esuid) or "10.0")
     qty          = _size_qty(portfolio, entry, stop, risk_pct, stop_pct)
     avail        = _settled_funds_available(acct, portfolio, min_cash_pct, 0.0)
     if avail > 0 and entry > 0:
@@ -748,11 +1222,12 @@ def _execute_specific_pick(db: Session, mode: str, symbol: str, pending_picks: l
         logger.info("Slot refill: %s position size < 1 share (avail=$%.2f) — skipping.", symbol, avail)
         return
 
-    if not _gate(db, symbol, qty, entry, stop, target, "SLOT_REFILL", mode):
+    refill_trigger = "SLOT_REFILL_PEAD" if stype == "pead" else "SLOT_REFILL"
+    if not _gate(db, symbol, qty, entry, stop, target, refill_trigger, mode, user_id=user_id):
         return
 
     try:
-        order_desc = _place_entry(db, symbol, qty, entry, stop, target, "SLOT_REFILL", mode, stype, target2=target2)
+        order_desc = _place_entry(db, symbol, qty, entry, stop, target, refill_trigger, mode, stype, target2=target2, user_id=user_id)
         logger.info("Slot refill: %s qty=%.0f — %s [%s]", symbol, qty, order_desc, mode)
 
         db.execute(
@@ -768,19 +1243,50 @@ def _execute_specific_pick(db: Session, mode: str, symbol: str, pending_picks: l
         db.execute(
             text("""
                 INSERT INTO trade_log (symbol, action, qty, price, trigger, mode)
-                VALUES (:s, 'BUY', :q, :p, 'SLOT_REFILL', :m)
+                VALUES (:s, 'BUY', :q, :p, :trig, :m)
             """),
-            {"s": symbol, "q": qty, "p": entry, "m": mode},
+            {"s": symbol, "q": qty, "p": entry, "trig": refill_trigger, "m": mode},
         )
         db.commit()
         logger.info("Slot refill complete: opened %s [%s]", symbol, mode)
+        try:
+            from . import telegram_alerts as tg
+            from .claude_analyst import get_latest_pre_trade
+            v, r = get_latest_pre_trade(db, symbol, mode, user_id=user_id)
+            tg.alert_trade_sync(
+                "BUY", symbol, qty, entry, refill_trigger, mode,
+                ai_verdict=v, ai_reason=r,
+            )
+        except Exception:
+            pass
 
     except Exception as exc:
         logger.error("Slot refill buy failed for %s: %s", symbol, exc)
 
 
-def _execute_next_pick(db: Session, mode: str, held: set):
-    """Fallback — execute the next PENDING pick without slot-refill analysis."""
+def _execute_next_pick(db: Session, mode: str, held: set, user_id: int | None = None):
+    """Fallback — execute the next PENDING pick without slot-refill analysis.
+    Respects per-strategy slot limits so a PEAD/RS/mv slot cap is not exceeded
+    even through this fallback path.
+    """
+    # Determine which strategy types still have open slots
+    _npuid   = user_id or _resolve_admin_uid(db)
+    mv_max   = int(_gus(db, "mv_max_slots",   "3", _npuid) or "3")
+    pb_max   = int(_gus(db, "pb_max_slots",   "2", _npuid) or "2")
+    rs_max   = int(_gus(db, "rs_max_slots",   "2", _npuid) or "2")
+    pead_max = int(_gus(db, "pead_max_slots", "2", _npuid) or "2")
+    held_set = held if isinstance(held, set) else set(held)
+    mv_held, pb_held, rs_held, pead_held = _count_positions_by_type(db, mode, held_set)
+    allowed_types = []
+    if mv_held   < mv_max:   allowed_types += ["minervini", "both"]
+    if pb_held   < pb_max:   allowed_types.append("pullback")
+    if rs_held   < rs_max:   allowed_types.append("rs_momentum")
+    if pead_held < pead_max: allowed_types.append("pead")
+    if not allowed_types:
+        logger.info("Post-close fallback [%s]: all strategy slots full — skipping.", mode)
+        return
+
+    allowed_tuple = tuple(set(allowed_types))
     row = db.execute(
         text("""
             SELECT symbol, entry_price, stop_price, target1, target2,
@@ -791,10 +1297,11 @@ def _execute_next_pick(db: Session, mode: str, held: set):
             )
               AND mode = :mode
               AND status = 'PENDING'
+              AND COALESCE(screener_type, 'minervini') = ANY(:types)
             ORDER BY rank ASC
             LIMIT 1
         """),
-        {"mode": mode},
+        {"mode": mode, "types": list(allowed_tuple)},
     ).fetchone()
 
     if not row:
@@ -812,15 +1319,15 @@ def _execute_next_pick(db: Session, mode: str, held: set):
         return
 
     try:
-        acct      = alp.get_account(mode)
+        acct      = alp.get_account_for_user(db, user_id or _resolve_admin_uid(db), mode)
         portfolio = float(acct.portfolio_value)
     except Exception as exc:
         logger.error("Post-close fallback: account fetch failed: %s", exc)
         return
 
-    risk_pct     = float(get_setting(db, "risk_pct", "2.0"))
-    stop_pct     = float(get_setting(db, "stop_loss_pct", "8.0"))
-    min_cash_pct = float(get_setting(db, "min_cash_pct", "10.0") or "10.0")
+    risk_pct     = float(_gus(db, "risk_pct",      "2.0",  _npuid))
+    stop_pct     = float(_gus(db, "stop_loss_pct", "8.0",  _npuid))
+    min_cash_pct = float(_gus(db, "min_cash_pct",  "10.0", _npuid) or "10.0")
     qty          = _size_qty(portfolio, entry, stop, risk_pct, stop_pct)
     avail        = _settled_funds_available(acct, portfolio, min_cash_pct, 0.0)
     if avail > 0 and entry > 0:
@@ -829,12 +1336,20 @@ def _execute_next_pick(db: Session, mode: str, held: set):
         qty = 0
     if qty < 1:
         return
+    if not _is_economic(db, qty, entry, _npuid):
+        logger.info(
+            "Post-close fallback: %s sub-economic (qty=%d × $%.2f < min) — skipping.",
+            sym, int(qty), entry,
+        )
+        return
 
-    if not _gate(db, sym, qty, entry, stop, target, "POST_CLOSE", mode):
+    effective_uid = user_id or _resolve_admin_uid(db)
+    post_close_trigger = "POST_CLOSE_PEAD" if stype == "pead" else "POST_CLOSE"
+    if not _gate(db, sym, qty, entry, stop, target, post_close_trigger, mode, user_id=effective_uid):
         return
 
     try:
-        order_desc = _place_entry(db, sym, qty, entry, stop, target, "POST_CLOSE", mode, stype, target2=target2)
+        order_desc = _place_entry(db, sym, qty, entry, stop, target, post_close_trigger, mode, stype, target2=target2, user_id=effective_uid)
         logger.info("Post-close fallback: %s qty=%.0f — %s", sym, qty, order_desc)
 
         db.execute(
@@ -850,24 +1365,35 @@ def _execute_next_pick(db: Session, mode: str, held: set):
         db.execute(
             text("""
                 INSERT INTO trade_log (symbol, action, qty, price, trigger, mode)
-                VALUES (:s, 'BUY', :q, :p, 'POST_CLOSE', :m)
+                VALUES (:s, 'BUY', :q, :p, :trig, :m)
             """),
-            {"s": sym, "q": qty, "p": entry, "m": mode},
+            {"s": sym, "q": qty, "p": entry, "trig": post_close_trigger, "m": mode},
         )
         db.commit()
         logger.info("Post-close fallback: opened %s [%s]", sym, mode)
+        try:
+            from . import telegram_alerts as tg
+            from .claude_analyst import get_latest_pre_trade
+            v, r = get_latest_pre_trade(db, sym, mode, user_id=effective_uid)
+            tg.alert_trade_sync(
+                "BUY", sym, qty, entry, post_close_trigger, mode,
+                ai_verdict=v, ai_reason=r,
+            )
+        except Exception:
+            pass
 
     except Exception as exc:
         logger.error("Post-close fallback buy failed for %s: %s", sym, exc)
 
 
-def _run_claude_analysis(db: Session, closed_sym: str, mode: str):
+def _run_claude_analysis(db: Session, closed_sym: str, mode: str, user_id: int | None = None):
     try:
         from .claude_analyst import analyze_picks, log_analysis
 
         picks_rows = db.execute(
             text("""
-                SELECT symbol, score, signal, entry_price, stop_price, target1, status, rationale
+                SELECT symbol, score, signal, entry_price, stop_price, target1, status, rationale,
+                       COALESCE(screener_type, 'minervini') AS screener_type
                 FROM weekly_plan
                 WHERE week_start = (
                     SELECT MAX(week_start) FROM weekly_plan WHERE mode = :mode
@@ -895,7 +1421,7 @@ def _run_claude_analysis(db: Session, closed_sym: str, mode: str):
             "reason":      "position closed (stop hit or target reached)",
         }
 
-        analysis = analyze_picks(db, picks, closed_position=closed_ctx)
+        analysis = analyze_picks(db, picks, closed_position=closed_ctx, user_id=user_id, mode=mode)
         log_analysis(db, "post_close", closed_sym, analysis, mode)
         logger.info("Post-close analysis saved for %s [%s].", closed_sym, mode)
 
@@ -923,9 +1449,10 @@ def fill_open_slots(
     Only buys when the current SEPA signal confirms entry (BREAKOUT or PULLBACK).
     Runs the AI pre-trade gate before each order.
     """
-    mv_max  = int(get_setting(db, "mv_max_slots", "3") or "3")
-    pb_max  = int(get_setting(db, "pb_max_slots", "2") or "2")
-    max_pos = _effective_max_positions(db, mode)
+    _fuid   = user_id or _resolve_admin_uid(db)
+    mv_max  = int(_gus(db, "mv_max_slots", "3", _fuid) or "3")
+    pb_max  = int(_gus(db, "pb_max_slots", "2", _fuid) or "2")
+    max_pos = _effective_max_positions(db, mode, _fuid)
 
     total_held   = len(positions)
     held_symbols = {p.symbol for p in positions}
@@ -968,15 +1495,26 @@ def fill_open_slots(
     if total_held >= max_pos:
         return
 
-    rs_max = int(get_setting(db, "rs_max_slots", "2") or "2")
+    rs_max   = int(_gus(db, "rs_max_slots",   "2", _fuid) or "2")
+    pead_max = int(_gus(db, "pead_max_slots", "2", _fuid) or "2")
 
-    mv_held, pb_held, rs_held = _count_positions_by_type(db, mode, held_symbols)
-    mv_slots = max(0, mv_max - mv_held)
-    pb_slots = max(0, pb_max - pb_held)
-    rs_slots = max(0, rs_max - rs_held)
+    mv_held, pb_held, rs_held, pead_held = _count_positions_by_type(db, mode, held_symbols)
+    mv_slots   = max(0, mv_max   - mv_held)
+    pb_slots   = max(0, pb_max   - pb_held)
+    rs_slots   = max(0, rs_max   - rs_held)
+    pead_slots = max(0, pead_max - pead_held)
 
-    if mv_slots == 0 and pb_slots == 0 and rs_slots == 0:
+    if mv_slots == 0 and pb_slots == 0 and rs_slots == 0 and pead_slots == 0:
         logger.debug("fill_open_slots [%s]: all strategy slots full — skipping.", mode)
+        return
+
+    # Account snapshot for settlement-aware sizing inside the loop. Fetching
+    # once and re-using is fine — the loop completes in seconds and Alpaca's
+    # settled-cash field doesn't change mid-cycle absent fills.
+    try:
+        acct = alp.get_account_for_user(db, user_id or _resolve_admin_uid(db), mode)
+    except Exception as exc:
+        logger.error("fill_open_slots [%s]: get_account failed: %s — aborting.", mode, exc)
         return
 
     held_tuple = tuple(held_symbols) if held_symbols else ("__none__",)
@@ -1000,8 +1538,8 @@ def fill_open_slots(
         return
 
     logger.info(
-        "fill_open_slots [%s]: %d PENDING picks | slots mv=%d pb=%d rs=%d | held=%d/%d",
-        mode, len(rows), mv_slots, pb_slots, rs_slots, total_held, max_pos,
+        "fill_open_slots [%s]: %d PENDING picks | slots mv=%d pb=%d rs=%d pead=%d | held=%d/%d",
+        mode, len(rows), mv_slots, pb_slots, rs_slots, pead_slots, total_held, max_pos,
     )
 
     # Build cooldown set: symbols sold within the last 8 hours — never re-enter same day
@@ -1047,29 +1585,186 @@ def fill_open_slots(
         elif stype == "rs_momentum":
             if rs_slots <= 0:
                 continue
+        elif stype == "pead":
+            if pead_slots <= 0:
+                continue
+
+        # PEAD picks: gap-anchored exits are already computed by the screener.
+        # Use the stored stop/target directly — don't re-derive from EMAs.
+        # Apply a tight deviation guard: if price has drifted >5% from plan
+        # entry (gap filled or too extended), skip — the setup is no longer valid.
+        if stype == "pead":
+            signal = "PEAD_DRIFT"
+            try:
+                from .tv_analyzer import analyze as _tv_analyze
+                _pead_tech = _tv_analyze(sym, db=db) or {}
+                _pead_px   = float(_pead_tech.get("price") or 0)
+            except Exception:
+                _pead_px = 0.0
+            price = _pead_px if _pead_px > 0 else entry
+
+            # Gap-fill guard: skip if price dropped below the plan stop (gap filled)
+            if price > 0 and stop > 0 and price <= stop:
+                logger.info(
+                    "fill_open_slots: PEAD %s price=$%.2f <= stop=$%.2f — "
+                    "gap filled, setup invalid [%s]", sym, price, stop, mode,
+                )
+                continue
+
+            # Drift guard: skip if price is >5% above the plan entry (too extended)
+            if price > 0 and entry > 0:
+                _pead_dev = (price - entry) / entry * 100
+                if _pead_dev > 5.0:
+                    logger.info(
+                        "fill_open_slots: PEAD %s price=+%.1f%% above plan entry — "
+                        "too extended to enter safely [%s]", sym, _pead_dev, mode,
+                    )
+                    continue
+
+            # Persist live entry_price so UI / exit guard see the actual fill anchor,
+            # not the stale screener price. Stop & target are intentionally preserved.
+            if price != entry and price > 0:
+                try:
+                    db.execute(
+                        text("""
+                            UPDATE weekly_plan SET entry_price = :e
+                            WHERE symbol = :sym AND mode = :mode
+                              AND week_start = (SELECT MAX(week_start) FROM weekly_plan WHERE mode = :mode)
+                        """),
+                        {"e": price, "sym": sym, "mode": mode},
+                    )
+                    db.commit()
+                    entry = price  # use live price for sizing below
+                except Exception as _pe:
+                    logger.warning("fill_open_slots: PEAD entry_price update failed for %s: %s", sym, _pe)
 
         # RS momentum picks are already in Stage 2 by screener definition —
-        # skip SEPA signal confirmation and buy at current price.
-        if stype == "rs_momentum":
-            price = entry
+        # skip SEPA signal confirmation but still fetch the live price so
+        # sizing and order placement are anchored to the current market, not
+        # the stale screener entry.  Also apply the deviation guard so a pick
+        # that has run too far or gapped down is skipped just like Minervini.
+        elif stype == "rs_momentum":
             signal = "RS_MOMENTUM"
+            try:
+                from .tv_analyzer import analyze as _tv_analyze
+                _rs_tech    = _tv_analyze(sym, db=db) or {}
+                _rs_live_px = float(_rs_tech.get("price") or 0)
+            except Exception:
+                _rs_live_px = 0.0
+            price = _rs_live_px if _rs_live_px > 0 else entry
+
+            # Deviation guard (same thresholds as Monday open)
+            if price > 0 and entry > 0:
+                _rs_max_dev = float(_gus(db, "entry_max_deviation_pct", "5.0", _fuid) or "5.0")
+                _rs_dev_pct = (price - entry) / entry * 100
+                if abs(_rs_dev_pct) > _rs_max_dev:
+                    logger.info(
+                        "fill_open_slots: skipping RS %s — %.1f%% drift from plan "
+                        "(live=$%.2f plan=$%.2f threshold=%.1f%%) [%s]",
+                        sym, _rs_dev_pct, price, entry, _rs_max_dev, mode,
+                    )
+                    continue
+
+            # EMA20 guard: RS picks should stay above short-term trend.
+            # If price is below EMA20 the stock is in a short-term downtrend;
+            # relative-strength picks are thesis-invalid when they stop outperforming.
+            _rs_ema20 = float(_rs_tech.get("ema20") or 0)
+            if _rs_ema20 and price < _rs_ema20:
+                logger.info(
+                    "fill_open_slots: skipping RS %s — price=$%.2f below EMA20=$%.2f "
+                    "(short-term downtrend) [%s]",
+                    sym, price, _rs_ema20, mode,
+                )
+                continue
         else:
             # Confirm current SEPA signal before buying stale screener picks
             result = analyze(sym, db=db)
             signal = result.get("signal", "ERROR")
             price  = result.get("price") or entry
 
-            if signal not in ("BREAKOUT", "PULLBACK_EMA20", "PULLBACK_EMA50", "STAGE2_WATCH"):
+            # Require a precise, high-confidence entry trigger.
+            # STAGE2_WATCH is intentionally excluded — a stock in Stage 2 but
+            # extended above all EMAs with no volume surge or EMA support nearby
+            # is not at a safe entry point, and could easily be in a topping pattern.
+            if signal not in ("BREAKOUT", "PULLBACK_EMA20", "PULLBACK_EMA50"):
                 logger.debug("fill_open_slots: %s signal=%s — skipping.", sym, signal)
+                continue
+
+            # EMA position guard: price must be at or above the relevant EMA level.
+            # The PULLBACK_EMA20/50 signal fires when |price - EMA| ≤ 2-3%, which
+            # includes prices BELOW the EMA (stock declining through support).
+            # Entering below the EMA means buying into a breakdown, not a pullback.
+            _ema20 = float(result.get("ema20") or 0)
+            _ema50 = float(result.get("ema50") or 0)
+            if signal == "PULLBACK_EMA20" and _ema20 and price < _ema20 * 0.99:
+                logger.info(
+                    "fill_open_slots: %s signal=PULLBACK_EMA20 but price=$%.2f is %.1f%% below "
+                    "EMA20=$%.2f — declining through support, not a pullback entry [%s]",
+                    sym, price, (_ema20 - price) / _ema20 * 100, _ema20, mode,
+                )
+                continue
+            if signal == "PULLBACK_EMA50" and _ema50 and price < _ema50 * 0.99:
+                logger.info(
+                    "fill_open_slots: %s signal=PULLBACK_EMA50 but price=$%.2f is %.1f%% below "
+                    "EMA50=$%.2f — declining through support, not a pullback entry [%s]",
+                    sym, price, (_ema50 - price) / _ema50 * 100, _ema50, mode,
+                )
+                continue
+
+            # Plan entry deviation guard (downside only): skip if price has fallen
+            # more than entry_max_deviation_pct below the screener's entry price.
+            # The screened setup was valid at that price — a significant drop since
+            # then means the thesis has deteriorated.
+            _entry_max_dev = float(_gus(db, "entry_max_deviation_pct", "5.0", _fuid) or "5.0")
+            if entry > 0 and price < entry * (1 - _entry_max_dev / 100):
+                logger.info(
+                    "fill_open_slots: %s price=$%.2f declined %.1f%% from plan entry=$%.2f "
+                    "(max=%.1f%%) — setup degraded since screened, skipping [%s]",
+                    sym, price, (entry - price) / entry * 100, entry, _entry_max_dev, mode,
+                )
                 continue
 
         if price <= 0:
             continue
 
+        # Re-evaluate exits at fill time. Screener-time stop/target can be
+        # days/weeks stale by the time a slot opens; price has likely moved
+        # and structural support (EMA20/50) has shifted. Recomputing from
+        # current technicals keeps R:R and risk sizing honest, and ensures
+        # the pre-trade gate sees current numbers — not what the screener
+        # froze on Monday.
+        # PEAD: skip re-evaluation — the gap-day low stop is the thesis anchor.
+        # Replacing it with EMA-derived levels would defeat the whole strategy.
+        if stype != "pead":
+            try:
+                from .trader import _compute_fresh_exits
+                fresh_stop, fresh_target, basis = _compute_fresh_exits(db, sym, price)
+                if fresh_stop > 0 and fresh_target > 0:
+                    logger.info(
+                        "fill_open_slots: re-evaluated %s — basis=%s px=$%.2f stop=$%.2f→$%.2f target=$%.2f→$%.2f",
+                        sym, basis, price, stop, fresh_stop, target, fresh_target,
+                    )
+                    stop, target = fresh_stop, fresh_target
+                    # Persist the refreshed plan so monitor/UI read consistent values.
+                    try:
+                        db.execute(
+                            text("""
+                                UPDATE weekly_plan SET stop_price = :s, target1 = :t, entry_price = :e
+                                WHERE symbol = :sym AND mode = :mode
+                                  AND week_start = (SELECT MAX(week_start) FROM weekly_plan WHERE mode = :mode)
+                            """),
+                            {"s": stop, "t": target, "e": price, "sym": sym, "mode": mode},
+                        )
+                        db.commit()
+                    except Exception as _exc:
+                        logger.warning("fill_open_slots: persist refreshed plan failed for %s: %s", sym, _exc)
+            except Exception as _exc:
+                logger.warning("fill_open_slots: re-evaluation failed for %s — using stored exits: %s", sym, _exc)
+
         qty = _size_qty(portfolio, price, stop, risk_pct, stop_pct)
         # Cap at max_position_pct of portfolio
-        max_position_pct = float(get_setting(db, "max_position_pct", "20.0") or "20.0")
-        min_cash_pct     = float(get_setting(db, "min_cash_pct",     "10.0") or "10.0")
+        max_position_pct = float(_gus(db, "max_position_pct", "20.0", _fuid) or "20.0")
+        min_cash_pct     = float(_gus(db, "min_cash_pct",     "10.0", _fuid) or "10.0")
         if price > 0:
             max_pos_shares  = int(portfolio * max_position_pct / 100 / price)
             if max_pos_shares > 0:
@@ -1085,13 +1780,36 @@ def fill_open_slots(
         if qty < 1:
             logger.info("fill_open_slots: %s qty<1 (price=$%.2f stop=$%.2f) — skipping.", sym, price, stop)
             continue
+        if not _is_economic(db, qty, price, _fuid):
+            logger.info(
+                "fill_open_slots: %s sub-economic (qty=%d × $%.2f < min) — skipping.",
+                sym, int(qty), price,
+            )
+            continue
 
-        if not _gate(db, sym, qty, price, stop, target, f"FILL_{signal}", mode, user_id=user_id):
+        # Consecutive-down-day guard: skip stocks actively declining over multiple
+        # sessions. EMA values lag price action; a stock can still carry a valid
+        # SEPA signal while recording 3+ consecutive lower closes — that is a
+        # "stock on a dive" and not a safe entry regardless of EMA positioning.
+        # Runs last (after sizing) to avoid extra yf calls for already-skipped picks.
+        # Fails open so a yf outage never blocks a correctly-signalled entry.
+        if _has_consecutive_down_days(sym, days=3):
+            logger.info(
+                "fill_open_slots: %s has 3 consecutive down closes — "
+                "actively declining, skipping entry [%s]",
+                sym, mode,
+            )
+            continue
+
+        fill_trigger = "FILL_PEAD" if stype == "pead" else f"FILL_{signal}"
+        if not _gate(db, sym, qty, price, stop, target, fill_trigger, mode, user_id=user_id):
             logger.info("fill_open_slots: %s blocked by pre-trade gate.", sym)
             continue
 
+        order_placed = False
         try:
-            order_desc = _place_entry(db, sym, qty, price, stop, target, f"FILL_{signal}", mode, stype, target2=target2)
+            order_desc = _place_entry(db, sym, qty, price, stop, target, fill_trigger, mode, stype, target2=target2, user_id=user_id, committed=committed)
+            order_placed = True
             logger.info(
                 "fill_open_slots [%s]: opened %s qty=%.0f signal=%s — %s",
                 mode, sym, qty, signal, order_desc,
@@ -1110,25 +1828,580 @@ def fill_open_slots(
                     INSERT INTO trade_log (symbol, action, qty, price, trigger, mode)
                     VALUES (:s, 'BUY', :q, :p, :t, :m)
                 """),
-                {"s": sym, "q": qty, "p": price, "t": f"FILL_{signal}", "m": mode},
+                {"s": sym, "q": qty, "p": price, "t": fill_trigger, "m": mode},
             )
             db.commit()
+            try:
+                from . import telegram_alerts as tg
+                from .claude_analyst import get_latest_pre_trade
+                v, r = get_latest_pre_trade(db, sym, mode, user_id=user_id)
+                tg.alert_trade_sync(
+                    "BUY", sym, qty, price, fill_trigger, mode,
+                    ai_verdict=v, ai_reason=r,
+                )
+            except Exception:
+                pass
 
             committed += qty * price
             held_symbols.add(sym)
             total_held += 1
             if stype in ("minervini", "both"):
-                mv_held  += 1
-                mv_slots -= 1
+                mv_held    += 1
+                mv_slots   -= 1
             elif stype == "rs_momentum":
-                rs_held  += 1
-                rs_slots -= 1
+                rs_held    += 1
+                rs_slots   -= 1
+            elif stype == "pead":
+                pead_held  += 1
+                pead_slots -= 1
             else:
-                pb_held  += 1
-                pb_slots -= 1
+                pb_held    += 1
+                pb_slots   -= 1
 
-            if total_held >= max_pos or (mv_slots == 0 and pb_slots == 0 and rs_slots == 0):
+            if total_held >= max_pos or (
+                mv_slots == 0 and pb_slots == 0 and rs_slots == 0 and pead_slots == 0
+            ):
                 break
 
         except Exception as exc:
-            logger.error("fill_open_slots: buy failed for %s: %s", sym, exc)
+            if order_placed:
+                # Alpaca holds a real position but the DB write failed —
+                # critical: it will be unmanaged (no weekly_plan row to drive
+                # exits/sizing). Reconciliation will catch it next cycle, but
+                # alert immediately so the operator can intervene.
+                logger.error(
+                    "fill_open_slots: ORDER PLACED but DB write failed for %s [%s]: %s",
+                    sym, mode, exc,
+                )
+                try:
+                    db.rollback()
+                except Exception:
+                    pass
+                try:
+                    from . import telegram_alerts as tg
+                    tg.alert_system_error_sync(
+                        f"UNTRACKED POSITION [{mode}] {sym} qty={qty} — order placed, DB log failed",
+                        exc, level="URGENT",
+                    )
+                except Exception:
+                    pass
+            else:
+                logger.error("fill_open_slots: buy failed for %s: %s", sym, exc)
+
+
+# ── Bracket-OCO SELL reconstruction ──────────────────────────────────────────
+
+def _trigger_from_order_type(order_type: str) -> str:
+    """Map an Alpaca order_type to a trade_log trigger label."""
+    t = (order_type or "").lower()
+    if "stop" in t:
+        return "STOP_HIT"     # stop or stop_limit leg of bracket
+    if "limit" in t:
+        return "TARGET_HIT"   # take-profit limit leg of bracket
+    return "MANUAL"           # plain market — manual close or liquidation
+
+
+def _has_sell_after_last_buy(db: Session, sym: str, mode: str) -> bool:
+    """True if trade_log already records a SELL after the most recent BUY for
+    (sym, mode). Used to keep SELL inserts idempotent across retries and
+    backfill runs."""
+    row = db.execute(
+        text("""
+            SELECT 1
+            FROM trade_log s
+            WHERE s.symbol = :s AND s.mode = :m AND s.action = 'SELL'
+              AND s.created_at > COALESCE((
+                  SELECT MAX(created_at) FROM trade_log
+                  WHERE symbol = :s AND mode = :m AND action = 'BUY'
+              ), '1970-01-01'::timestamp)
+            LIMIT 1
+        """),
+        {"s": sym, "m": mode},
+    ).fetchone()
+    return bool(row)
+
+
+def _log_alpaca_side_sell(db: Session, sym: str, mode: str) -> bool:
+    """Reconstruct ALL missing SELL trade_log entries for `sym` by walking
+    Alpaca's filled SELL orders since the last logged BUY. Inserts each fill
+    that is not already recorded (matched by filled_at timestamp), so a split
+    bracket exit (T1 then T2) becomes two trade_log rows at the actual T1/T2
+    fill prices instead of one row at the most-recent fill price.
+
+    Returns True if any new row was inserted.
+    """
+    last_buy_at = db.execute(
+        text("""
+            SELECT MAX(created_at) FROM trade_log
+            WHERE symbol = :s AND mode = :m AND action = 'BUY'
+        """),
+        {"s": sym, "m": mode},
+    ).scalar()
+
+    # Phantom-BUY guard: if the DB has a BUY row but Alpaca has NO filled BUY
+    # order for this symbol, the original entry order expired/cancelled
+    # without filling. Delete the phantom row(s) — there's nothing to "sell".
+    #
+    # CRITICAL: also check for OPEN buy orders. An order placed but not yet
+    # filled (status=new/accepted/partially_filled) has no closed-history
+    # entry yet, so find_recent_fills returns empty. Deleting the DB row
+    # in that window orphans the trade_log when the order finally fills.
+    buy_fills = alp.find_recent_fills(mode, sym, "BUY", days=90)
+    open_buys: list = []
+    try:
+        for o in alp.get_open_orders(mode):
+            if (getattr(o, "symbol", "") or "").upper() != sym.upper():
+                continue
+            side = str(getattr(o, "side", "") or "").lower()
+            if "buy" in side:
+                open_buys.append(o)
+    except Exception as exc:
+        logger.warning("phantom-guard: open-order check failed for %s: %s", sym, exc)
+        # Fail safe: if we can't verify, do NOT delete.
+        open_buys = [object()]  # truthy sentinel
+
+    if not buy_fills and not open_buys:
+        deleted = db.execute(
+            text("""
+                DELETE FROM trade_log
+                WHERE id IN (
+                    SELECT t.id FROM trade_log t
+                    WHERE t.symbol = :s AND t.mode = :m AND t.action = 'BUY'
+                      AND NOT EXISTS (
+                          SELECT 1 FROM trade_log s
+                          WHERE s.symbol = t.symbol AND s.mode = t.mode
+                            AND s.action = 'SELL' AND s.created_at > t.created_at
+                      )
+                )
+            """),
+            {"s": sym, "m": mode},
+        ).rowcount
+        if deleted:
+            db.commit()
+            logger.warning(
+                "[%s] %s: phantom BUY row(s) deleted (%d) — original entry "
+                "order never filled (likely an expired stop-limit).",
+                mode, sym, deleted,
+            )
+            return True
+        # Fall through if nothing deleted — shouldn't happen but be safe.
+
+    fills = alp.find_recent_fills(mode, sym, "SELL", days=365)
+    if not fills:
+        # No SELL order exists — most often this means the position was
+        # closed by a corporate action (merger, spinoff, delisting) rather
+        # than a trade. Fall back to /account/activities and synthesize a
+        # SELL row so reconciliation drift clears.
+        # 365d window: paper positions can sit closed-but-unreconciled for
+        # months between sessions; 90d was too short and surfaced as
+        # persistent POSITION DRIFT alerts that no fix could clear.
+        activities = alp.find_position_close_activity(mode, sym, days=365)
+        if activities:
+            inserted = 0
+            for act in activities:
+                ts = act.get("timestamp")
+                qty = act.get("qty") or 0
+                price = act.get("price") or 0
+                act_type = act.get("activity_type") or "CORP_ACTION"
+                if qty <= 0:
+                    continue
+                db.execute(
+                    text("""
+                        INSERT INTO trade_log (symbol, action, qty, price, trigger, mode, created_at)
+                        VALUES (:s, 'SELL', :q, :p, :t, :m, COALESCE(NULLIF(:ts,'')::timestamptz, NOW()))
+                    """),
+                    {"s": sym, "q": qty, "p": price,
+                     "t": f"CORPORATE_ACTION:{act_type}", "m": mode, "ts": ts or ""},
+                )
+                inserted += 1
+                logger.info(
+                    "[%s] reconstructed SELL via corporate action: %s qty=%s @ %s "
+                    "(type=%s, %s)", mode, sym, qty, price, act_type,
+                    act.get("description", ""),
+                )
+            if inserted:
+                db.commit()
+                return True
+        # Last resort: nothing to reconstruct from. Before deleting, RE-VERIFY
+        # the symbol genuinely isn't in Alpaca — guards against transient API
+        # outages where get_positions returned a partial list earlier in the
+        # reconcile cycle. If still absent, delete the unmatched BUY row(s)
+        # so drift clears permanently.
+        try:
+            current_syms = {p.symbol.upper() for p in alp.get_positions_for_user(db, _resolve_admin_uid(db), mode)}
+        except Exception as exc:
+            logger.warning(
+                "[%s] %s: cannot re-verify Alpaca positions (%s) — leaving "
+                "orphaned BUY in DB; will retry next cycle.", mode, sym, exc,
+            )
+            return False
+        if sym.upper() in current_syms:
+            logger.info(
+                "[%s] %s: re-check shows position IS in Alpaca after all — "
+                "skipping cleanup, drift will resolve next cycle.", mode, sym,
+            )
+            return False
+
+        deleted = db.execute(
+            text("""
+                DELETE FROM trade_log
+                WHERE symbol = :s AND mode = :m AND action = 'BUY'
+                  AND NOT EXISTS (
+                      SELECT 1 FROM trade_log s
+                      WHERE s.symbol = :s AND s.mode = :m
+                        AND s.action = 'SELL'
+                        AND s.created_at > trade_log.created_at
+                  )
+            """),
+            {"s": sym, "m": mode},
+        ).rowcount
+        if deleted:
+            db.commit()
+            logger.warning(
+                "[%s] %s: orphaned BUY row(s) deleted (%d) — Alpaca shows no "
+                "position and no SELL fills/corp actions in last 365d. "
+                "trade_log now matches broker state.",
+                mode, sym, deleted,
+            )
+            return True
+
+        logger.warning(
+            "[%s] %s: no Alpaca history found and no BUY row to delete — "
+            "drift state inconsistent. Investigate manually.", mode, sym,
+        )
+        return False
+
+    # Filter to fills that occurred after the most recent BUY
+    if last_buy_at is not None:
+        fills = [
+            f for f in fills
+            if getattr(f, "filled_at", None) and f.filled_at > last_buy_at
+        ]
+    if not fills:
+        return False
+
+    # Skip any fill whose timestamp already exists in trade_log (idempotent
+    # against repeated calls — e.g. monitor + manual reconcile in same cycle).
+    existing_ts = {
+        r[0] for r in db.execute(
+            text("""
+                SELECT created_at FROM trade_log
+                WHERE symbol = :s AND mode = :m AND action = 'SELL'
+                  AND created_at > COALESCE(:since, '1970-01-01'::timestamp)
+            """),
+            {"s": sym, "m": mode, "since": last_buy_at},
+        ).fetchall()
+    }
+
+    inserted = 0
+    for fill in fills:
+        ts = getattr(fill, "filled_at", None)
+        if ts is None or ts in existing_ts:
+            continue
+        try:
+            price = float(fill.filled_avg_price or 0)
+            qty   = float(fill.filled_qty or 0)
+        except (TypeError, ValueError):
+            price, qty = 0.0, 0.0
+        trigger = _trigger_from_order_type(str(getattr(fill, "order_type", "") or ""))
+        db.execute(
+            text("""
+                INSERT INTO trade_log (symbol, action, qty, price, trigger, mode, created_at)
+                VALUES (:s, 'SELL', :q, :p, :t, :m, :ts)
+            """),
+            {"s": sym, "q": qty, "p": price, "t": trigger, "m": mode, "ts": ts},
+        )
+        inserted += 1
+        logger.info(
+            "[%s] reconstructed SELL: %s qty=%s @ %s (trigger=%s, filled_at=%s)",
+            mode, sym, qty, price, trigger, ts,
+        )
+
+    if inserted:
+        db.commit()
+    return inserted > 0
+
+
+def backfill_missing_sells(db: Session, mode: str) -> dict:
+    """One-shot recovery: for every symbol that the DB still treats as open
+    (BUY without later SELL) but that Alpaca no longer holds, query Alpaca's
+    closed-order history and insert the missing SELL row.
+
+    Safe to run repeatedly — `_log_alpaca_side_sell` is idempotent.
+    """
+    try:
+        alpaca_syms = {p.symbol for p in alp.get_positions_for_user(db, _resolve_admin_uid(db), mode)}
+    except Exception as exc:
+        logger.error("backfill_missing_sells [%s]: alpaca fetch failed: %s", mode, exc)
+        return {"backfilled": [], "skipped": [], "error": str(exc)}
+
+    rows = db.execute(
+        text("""
+            SELECT symbol
+            FROM trade_log t
+            WHERE mode = :mode AND action = 'BUY'
+              AND created_at >= NOW() - INTERVAL '60 days'
+              AND NOT EXISTS (
+                  SELECT 1 FROM trade_log s
+                  WHERE s.symbol = t.symbol AND s.mode = t.mode
+                    AND s.action = 'SELL' AND s.created_at > t.created_at
+              )
+        """),
+        {"mode": mode},
+    ).fetchall()
+    candidates = {r[0] for r in rows} - alpaca_syms
+
+    backfilled, skipped = [], []
+    for sym in sorted(candidates):
+        try:
+            if _log_alpaca_side_sell(db, sym, mode):
+                backfilled.append(sym)
+            else:
+                skipped.append(sym)
+        except Exception as exc:
+            logger.error("backfill_missing_sells [%s] %s: %s", mode, sym, exc)
+            skipped.append(sym)
+    if backfilled:
+        logger.info("backfill_missing_sells [%s]: backfilled=%s skipped=%s",
+                    mode, backfilled, skipped)
+    return {"backfilled": backfilled, "skipped": skipped}
+
+
+# ── DB ↔ Alpaca position reconciliation ──────────────────────────────────────
+
+_RECONCILE_LAST_ALERT: dict[str, float] = {}
+_RECONCILE_COOLDOWN_SEC = 3600  # don't re-alert the same drift more than 1×/hour
+
+
+def reconcile_db_vs_alpaca(db: Session, mode: str, user_id: int | None = None) -> dict:
+    """Compare live Alpaca positions against the DB's view of intended state.
+
+    Source of DB truth: BUY trade_log entries from the past 30 days that have
+    no later SELL entry for the same symbol+mode. This catches:
+      • symbol held in Alpaca but never logged (manual order, missed log)
+      • symbol logged as bought but missing in Alpaca (SELL leg lost, manual close)
+
+    Quantity drift is intentionally NOT alerted — _reconcile_partial_fills
+    handles that. We only flag set-membership mismatches.
+
+    Alerts via Telegram URGENT, deduped by (mode, drift-signature) for
+    `_RECONCILE_COOLDOWN_SEC` so a persistent drift doesn't spam the channel.
+    Returns a dict with `drift`, `missing_in_alpaca`, `unexpected_in_alpaca`.
+    """
+    import time
+    from . import telegram_alerts as tg
+
+    _ruid = user_id or _resolve_admin_uid(db)
+    try:
+        alpaca_syms = {p.symbol for p in alp.get_positions_for_user(db, _ruid, mode)}
+    except Exception as exc:
+        logger.error("reconcile_db_vs_alpaca [%s]: alpaca fetch failed: %s", mode, exc)
+        return {"drift": False, "error": str(exc)}
+
+    # Self-heal: try to reconstruct any missing SELL rows from Alpaca order
+    # history before measuring drift. Bracket-OCO exits (stop / target) close
+    # the position on Alpaca's side without the bot ever submitting a SELL,
+    # so trade_log can fall behind without this step.
+    try:
+        backfill_missing_sells(db, mode)
+    except Exception as exc:
+        logger.warning("reconcile_db_vs_alpaca [%s]: backfill failed: %s", mode, exc)
+
+    try:
+        rows = db.execute(
+            text("""
+                SELECT symbol
+                FROM trade_log t
+                WHERE mode = :mode
+                  AND action = 'BUY'
+                  AND created_at >= NOW() - INTERVAL '30 days'
+                  AND NOT EXISTS (
+                      SELECT 1 FROM trade_log s
+                      WHERE s.symbol = t.symbol
+                        AND s.mode   = t.mode
+                        AND s.action = 'SELL'
+                        AND s.created_at > t.created_at
+                  )
+            """),
+            {"mode": mode},
+        ).fetchall()
+        db_syms = {r[0] for r in rows}
+    except Exception as exc:
+        logger.error("reconcile_db_vs_alpaca [%s]: db fetch failed: %s", mode, exc)
+        return {"drift": False, "error": str(exc)}
+
+    missing_in_alpaca   = sorted(db_syms - alpaca_syms)   # DB thinks open, broker says no
+    unexpected_in_alpaca = sorted(alpaca_syms - db_syms)  # broker holds, DB has no record
+
+    # Self-heal missing_in_alpaca: DB has a BUY record but Alpaca has no position.
+    # This happens when an entry order was rejected or expired after the BUY was
+    # logged — the plan stays EXECUTED and the slot is stuck forever.
+    # For each missing symbol: check whether Alpaca actually filled a BUY.
+    # If no fill exists → the order was rejected/expired → revert plan to PENDING
+    # and delete the phantom BUY so the slot can be refilled next cycle.
+    if missing_in_alpaca:
+        phantom_healed: list[str] = []
+        for sym in list(missing_in_alpaca):
+            try:
+                buy_fills = alp.find_recent_fills(mode, sym, "BUY", days=7)
+            except Exception:
+                buy_fills = []
+            if buy_fills:
+                # A real fill exists — position may have been closed manually or
+                # the reconcile window is stale. Leave the alert as-is.
+                continue
+
+            # Check for an open/pending BUY order (stop-limit not yet triggered).
+            # If one exists the position simply hasn't opened yet — do NOT revert
+            # the plan to PENDING or we'll place a second entry on the next cycle.
+            try:
+                open_buys = [
+                    o for o in alp.get_open_orders_by_symbol(mode).get(sym, [])
+                    if 'buy' in str(getattr(o, 'side', '') or '').lower()
+                    and str(getattr(o, 'status', '') or '').lower()
+                    not in ('canceled', 'filled', 'expired', 'rejected')
+                ]
+            except Exception:
+                open_buys = []
+            if open_buys:
+                logger.debug(
+                    "reconcile [%s]: %s — no position yet but open BUY order exists "
+                    "(stop-limit pending trigger). Skipping revert.",
+                    mode, sym,
+                )
+                continue
+
+            # No fill and no open order → entry was rejected/expired. Revert plan + purge phantom BUY.
+            try:
+                db.execute(
+                    text("""
+                        UPDATE weekly_plan SET status = 'PENDING'
+                        WHERE symbol = :sym AND mode = :mode
+                          AND week_start = (
+                              SELECT MAX(week_start) FROM weekly_plan WHERE mode = :mode
+                          )
+                          AND status = 'EXECUTED'
+                    """),
+                    {"sym": sym, "mode": mode},
+                )
+                # Remove the phantom BUY row(s) that have no subsequent SELL
+                db.execute(
+                    text("""
+                        DELETE FROM trade_log
+                        WHERE symbol = :sym AND mode = :mode AND action = 'BUY'
+                          AND created_at >= NOW() - INTERVAL '7 days'
+                          AND NOT EXISTS (
+                              SELECT 1 FROM trade_log s
+                              WHERE s.symbol  = trade_log.symbol
+                                AND s.mode    = trade_log.mode
+                                AND s.action  = 'SELL'
+                                AND s.created_at > trade_log.created_at
+                          )
+                    """),
+                    {"sym": sym, "mode": mode},
+                )
+                db.commit()
+                phantom_healed.append(sym)
+                logger.warning(
+                    "reconcile [%s]: %s — no Alpaca fill found, entry was rejected/expired. "
+                    "Reverted plan to PENDING and purged phantom BUY.",
+                    mode, sym,
+                )
+            except Exception as exc:
+                logger.error("reconcile [%s]: self-heal for %s failed: %s", mode, sym, exc)
+                try:
+                    db.rollback()
+                except Exception:
+                    pass
+        if phantom_healed:
+            missing_in_alpaca = sorted(set(missing_in_alpaca) - set(phantom_healed))
+
+    # Self-heal unexpected_in_alpaca: positions Alpaca shows that have no DB
+    # BUY row. Reconstruct the BUY from the actual filled-order history (or
+    # current position state as fallback) so trade_log reflects truth.
+    if unexpected_in_alpaca:
+        try:
+            alpaca_pos_by_sym = {p.symbol: p for p in alp.get_positions_for_user(db, _ruid, mode)}
+        except Exception as exc:
+            logger.warning("reconcile: position fetch for backfill failed: %s", exc)
+            alpaca_pos_by_sym = {}
+        recovered: list = []
+        for sym in unexpected_in_alpaca:
+            buy_fills = []
+            try:
+                buy_fills = alp.find_recent_fills(mode, sym, "BUY", days=90)
+            except Exception:
+                pass
+            pos = alpaca_pos_by_sym.get(sym)
+            if buy_fills:
+                # Use the most recent BUY fill — captures actual entry price/qty.
+                latest = buy_fills[-1]
+                try:
+                    qty = float(getattr(latest, "filled_qty", 0) or 0)
+                    px  = float(getattr(latest, "filled_avg_price", 0) or 0)
+                    ts  = getattr(latest, "filled_at", None)
+                except (TypeError, ValueError):
+                    qty, px, ts = 0.0, 0.0, None
+            elif pos is not None:
+                # Fallback: use current Alpaca position avg entry / qty.
+                try:
+                    qty = float(getattr(pos, "qty", 0) or 0)
+                    px  = float(getattr(pos, "avg_entry_price", 0) or 0)
+                    ts  = None
+                except (TypeError, ValueError):
+                    qty, px, ts = 0.0, 0.0, None
+            else:
+                continue
+            if qty <= 0 or px <= 0:
+                continue
+            try:
+                db.execute(
+                    text("""
+                        INSERT INTO trade_log
+                            (symbol, action, qty, price, trigger, mode, created_at)
+                        VALUES
+                            (:s, 'BUY', :q, :p, 'RECONCILE_BACKFILL', :m,
+                             COALESCE(:ts, NOW()))
+                    """),
+                    {"s": sym, "q": qty, "p": px, "m": mode, "ts": ts},
+                )
+                recovered.append(sym)
+            except Exception as exc:
+                logger.error("reconcile: backfill BUY failed for %s: %s", sym, exc)
+        if recovered:
+            db.commit()
+            logger.warning(
+                "reconcile [%s]: backfilled BUY rows for %s — drift cleared.",
+                mode, recovered,
+            )
+            unexpected_in_alpaca = sorted(set(unexpected_in_alpaca) - set(recovered))
+
+    if not missing_in_alpaca and not unexpected_in_alpaca:
+        return {"drift": False, "missing_in_alpaca": [], "unexpected_in_alpaca": []}
+
+    signature = f"{mode}|{','.join(missing_in_alpaca)}|{','.join(unexpected_in_alpaca)}"
+    now = time.time()
+    last = _RECONCILE_LAST_ALERT.get(signature, 0)
+    if now - last >= _RECONCILE_COOLDOWN_SEC:
+        _RECONCILE_LAST_ALERT[signature] = now
+        body_lines = [f"*POSITION DRIFT* [{mode.upper()}]", ""]
+        if missing_in_alpaca:
+            body_lines.append(f"DB-tracked but not in Alpaca: `{', '.join(missing_in_alpaca)}`")
+        if unexpected_in_alpaca:
+            body_lines.append(f"Alpaca holds but no DB record: `{', '.join(unexpected_in_alpaca)}`")
+        body_lines.append("")
+        body_lines.append("Investigate before next entry cycle.")
+        try:
+            tg.send_sync("\n".join(body_lines), level="URGENT")
+        except Exception:
+            pass
+
+    logger.warning(
+        "reconcile_db_vs_alpaca [%s]: drift detected — missing_in_alpaca=%s unexpected_in_alpaca=%s",
+        mode, missing_in_alpaca, unexpected_in_alpaca,
+    )
+    return {
+        "drift": True,
+        "missing_in_alpaca":   missing_in_alpaca,
+        "unexpected_in_alpaca": unexpected_in_alpaca,
+    }

@@ -37,6 +37,7 @@ _RS_COLS = [
     "Perf.6M",
     "Perf.Y",      # TradingView uses Perf.Y for 1-year, not Perf.1Y
     "sector",
+    "industry",
     "exchange",
 ]
 
@@ -114,6 +115,57 @@ def _resolve_excluded(cfg_sectors: list[str]) -> set[str]:
     return resolved
 
 
+# TV groups oilfield-services / drillers under "Industrial Services", not
+# Energy Minerals — so a user excluding "Energy" still sees BKR/SLB/HAL etc
+# slip through the sector filter. This industry-level set catches the energy
+# cluster regardless of TV's parent sector. Names are TV-native.
+_ENERGY_INDUSTRIES = {
+    "oilfield services/equipment",
+    "oil & gas production",
+    "integrated oil",
+    "oil refining/marketing",
+    "oil & gas pipelines",
+    "contract drilling",
+    "coal",
+}
+
+_GICS_TO_TV_INDUSTRIES: dict[str, set[str]] = {
+    "energy":         _ENERGY_INDUSTRIES,
+    "basic materials": {"coal"},
+}
+
+
+# Reverse map: TV-native sector → GICS umbrella label.
+# Built from _GICS_TO_TV so it's always consistent with the forward map.
+# Used by the per-sector cap so "Electronic Technology" + "Technology Services"
+# both count toward the same "technology" bucket instead of being treated as
+# two independent sectors.
+_TV_TO_GICS: dict[str, str] = {}
+for _gics, _tv_set in _GICS_TO_TV.items():
+    for _tv in _tv_set:
+        _TV_TO_GICS[_tv] = _gics
+# Sectors that have no GICS mapping keep their TV name as the cap bucket.
+
+
+def gics_label(tv_sector: str) -> str:
+    """Return the GICS umbrella label for a TV-native sector name, or the
+    lowercased TV name itself if no mapping exists."""
+    return _TV_TO_GICS.get(tv_sector.strip().lower(), tv_sector.strip().lower())
+
+
+def _resolve_excluded_industries(cfg_sectors: list[str]) -> set[str]:
+    """For each user-listed sector, return the set of TV industries that
+    should also be blocked. Catches symbols that TV places under a different
+    parent sector (e.g. oilfield services living under Industrial Services
+    when the user excluded Energy). Lowercase TV industry names."""
+    resolved: set[str] = set()
+    for name in cfg_sectors:
+        lower = name.strip().lower()
+        if lower in _GICS_TO_TV_INDUSTRIES:
+            resolved |= _GICS_TO_TV_INDUSTRIES[lower]
+    return resolved
+
+
 def _rs_score(v: dict) -> float:
     """IBD-weighted RS score from TV performance columns."""
     p1m = v.get("Perf.1M") or 0.0
@@ -139,10 +191,11 @@ def get_rs_settings(db: Session, user_id: int) -> dict:
         "price_max":       float(_s("rs_price_max",       0.0)),    # 0 = no ceiling
         "avg_vol_min":     float(_s("rs_avg_vol_min",     500_000)),
         "market_cap_min":  float(_s("rs_market_cap_min",  500_000_000)),
-        "min_percentile":  float(_s("rs_min_percentile",  70.0)),   # top 30%
+        "min_percentile":  float(_s("rs_min_percentile",  75.0)),   # top 25%
         "require_stage2":  _s("rs_require_stage2", "true") == "true",
         "max_extension":   float(_s("rs_max_extension",   15.0)),   # % above EMA50
         "top_n":           int(  _s("rs_top_n",           5)),
+        # Sector exclusion — per-strategy, comma-separated TV sector names.
         "excluded_sectors": [
             s.strip()
             for s in _s("rs_excluded_sectors", ",".join(_DEFAULT_EXCLUDED_SECTORS)).split(",")
@@ -288,25 +341,46 @@ def run_rs_screener(
         )
 
     # Resolve GICS names (from settings UI) → TV sector names; also accepts TV names directly
-    excluded_tv = _resolve_excluded(cfg["excluded_sectors"])
-    allowed_exchanges = cfg["exchanges"]
+    excluded_tv         = _resolve_excluded(cfg["excluded_sectors"])
+    excluded_industries = _resolve_excluded_industries(cfg["excluded_sectors"])
+    allowed_exchanges   = cfg["exchanges"]
 
-    logger.info("RS screener: excluded TV sectors: %s", excluded_tv)
+    logger.info("RS screener: excluded TV sectors: %s | industries: %s", excluded_tv, excluded_industries)
 
     # ── Pass 2: Local scoring and filtering ───────────────────────────────────
+    # NOTE: Re-apply ALL hard filters locally — fetch_rs_universe (fast-path
+    # caller) deliberately omits price_max / stage2 / extension to share its
+    # universe with other screeners, so we cannot rely on the server-side
+    # filter list having enforced them.
     scored: list[dict] = []
     drop_counts = {"exchange": 0, "no_sector": 0, "excluded_sector": 0,
+                   "price_min": 0, "price_max": 0, "avg_vol": 0, "market_cap": 0,
                    "extension": 0, "stage2_emas": 0, "low_rs": 0}
 
     for sym, v in tv_data.items():
-        price  = v.get("close")                or 0.0
-        ema50  = v.get("EMA50")                or 0.0
-        ema200 = v.get("EMA200")               or 0.0
-        sector = (v.get("sector") or "").strip()
-        exch   = (v.get("exchange") or "").strip().upper()
+        price   = v.get("close")                  or 0.0
+        ema50   = v.get("EMA50")                  or 0.0
+        ema200  = v.get("EMA200")                 or 0.0
+        avg_vol = v.get("average_volume_30d_calc") or 0.0
+        mcap    = v.get("market_cap_basic")       or 0.0
+        sector   = (v.get("sector") or "").strip()
+        industry = (v.get("industry") or "").strip()
+        exch     = (v.get("exchange") or "").strip().upper()
 
         if allowed_exchanges and exch not in allowed_exchanges:
             drop_counts["exchange"] += 1
+            continue
+        if cfg["price_min"] > 0 and price < cfg["price_min"]:
+            drop_counts["price_min"] += 1
+            continue
+        if cfg["price_max"] > 0 and price > cfg["price_max"]:
+            drop_counts["price_max"] += 1
+            continue
+        if cfg["avg_vol_min"] > 0 and avg_vol < cfg["avg_vol_min"]:
+            drop_counts["avg_vol"] += 1
+            continue
+        if cfg["market_cap_min"] > 0 and mcap < cfg["market_cap_min"]:
+            drop_counts["market_cap"] += 1
             continue
         if excluded_tv:
             if not sector:
@@ -315,6 +389,9 @@ def run_rs_screener(
             if sector.lower() in excluded_tv:
                 drop_counts["excluded_sector"] += 1
                 continue
+        if excluded_industries and industry.lower() in excluded_industries:
+            drop_counts["excluded_sector"] += 1
+            continue
         # Stage 2 must be enforced locally now that the broad fetcher skips
         # the EMA50>EMA200 / close>EMA50 server-side filters.
         if cfg["require_stage2"]:
@@ -355,7 +432,7 @@ def run_rs_screener(
     if account_value is None:
         try:
             from . import alpaca_client as alp
-            acct = alp.get_account(mode)
+            acct = alp.get_account_for_user(db, user_id, mode)
             account_value = float(acct.portfolio_value)
         except Exception as exc:
             logger.error("RS screener: cannot fetch account value: %s", exc)
@@ -380,8 +457,8 @@ def run_rs_screener(
         if stop_distance <= 0:
             continue
 
-        target1 = round(price * (1 + 2 * stop_pct / 100), 2)   # 2R
-        target2 = round(price * (1 + 3 * stop_pct / 100), 2)   # 3R
+        target1 = round(price + 2 * stop_distance, 2)            # true 2R
+        target2 = round(price + 3 * stop_distance, 2)            # true 3R
 
         # Risk-based position sizing, capped at max_position_pct
         risk_dollars = account_value * risk_pct / 100
@@ -419,6 +496,7 @@ def run_rs_screener(
             "status":        "PENDING",
             "mode":          mode,
             "screener_type": "rs_momentum",
+            "sector":        (v.get("sector") or "").strip(),
         })
 
     logger.info(

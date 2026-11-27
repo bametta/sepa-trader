@@ -18,6 +18,7 @@ export default function PositionCard({ pos }) {
   const [editExits, setEditExits] = useState(false)
   const [stop,      setStop]      = useState('')
   const [target,    setTarget]    = useState('')
+  const [target2,   setTarget2]   = useState('')
   const [saving,    setSaving]    = useState(false)
   const [placing,   setPlacing]   = useState(false)
   const [exitMsg,   setExitMsg]   = useState(null)
@@ -28,6 +29,19 @@ export default function PositionCard({ pos }) {
   const urgent        = pos.signal === 'NO_SETUP'
   const breakout      = pos.signal === 'BREAKOUT'
   const hasPlanLevels = pos.stop_price || pos.target1
+
+  // Days-held counter — colours based on proximity to the time-stop limit
+  const daysHeld     = pos.days_held   // trading days, may be null if no BUY in trade_log
+  const tsLimit      = pos.time_stop_days  // null when feature is disabled
+  const daysColor    = (() => {
+    if (daysHeld == null) return null
+    if (tsLimit == null)  return 'text-slate-500 border-slate-600/40 bg-slate-800/40'
+    const ratio = daysHeld / tsLimit
+    if (ratio >= 1)    return 'text-red-400   border-red-500/50   bg-red-500/10   animate-pulse'
+    if (ratio >= 0.75) return 'text-amber-400 border-amber-500/40 bg-amber-500/10'
+    if (ratio >= 0.5)  return 'text-yellow-400 border-yellow-500/30 bg-yellow-500/8'
+    return 'text-slate-500 border-slate-600/40 bg-slate-800/40'
+  })()
 
   const isHistoricalPlan = (() => {
     if (!pos.plan_week) return false
@@ -43,24 +57,27 @@ export default function PositionCard({ pos }) {
     : null
 
   function openExitForm() {
-    if (!editExits) { setStop(fmt(pos.stop_price)); setTarget(fmt(pos.target1)) }
+    if (!editExits) { setStop(fmt(pos.stop_price)); setTarget(fmt(pos.target1)); setTarget2(fmt(pos.target2)) }
     setEditExits(e => !e)
     setExitMsg(null)
   }
 
   function validate() {
-    const s = parseFloat(stop), t = parseFloat(target)
+    const s = parseFloat(stop), t = parseFloat(target), t2 = parseFloat(target2)
     if (!s || !t || s <= 0 || t <= 0) { setExitMsg({ type: 'error', text: 'Enter valid stop and target prices.' }); return null }
     if (t <= s)                        { setExitMsg({ type: 'error', text: 'Target must be above stop.' }); return null }
-    if (s >= pos.entry_price)          { setExitMsg({ type: 'error', text: 'Stop must be below entry.' }); return null }
-    return { s, t }
+    const livePrice = pos.current_price || pos.entry_price
+    if (s >= livePrice)                { setExitMsg({ type: 'error', text: 'Stop must be below current price.' }); return null }
+    if (target2 && !isNaN(t2) && t2 <= t) { setExitMsg({ type: 'error', text: 'T2 must be above T1.' }); return null }
+    return { s, t, t2: (target2 && !isNaN(t2) && t2 > 0) ? t2 : null }
   }
 
   async function handleSaveOnly() {
     const vals = validate(); if (!vals) return
     setSaving(true); setExitMsg(null)
     try {
-      await axios.patch(`/api/positions/${pos.symbol}/exits?stop=${vals.s}&target=${vals.t}`)
+      const t2param = vals.t2 ? `&target2=${vals.t2}` : ''
+      await axios.patch(`/api/positions/${pos.symbol}/exits?stop=${vals.s}&target=${vals.t}${t2param}`)
       setExitMsg({ type: 'ok', text: 'Saved — OCO will be placed on next monitor cycle.' })
       setEditExits(false); qc.invalidateQueries('positions')
     } catch (err) {
@@ -72,7 +89,8 @@ export default function PositionCard({ pos }) {
     const vals = validate(); if (!vals) return
     setPlacing(true); setExitMsg(null)
     try {
-      await axios.post(`/api/positions/${pos.symbol}/place-exits?stop=${vals.s}&target=${vals.t}`)
+      const t2param = vals.t2 ? `&target2=${vals.t2}` : ''
+      await axios.post(`/api/positions/${pos.symbol}/place-exits?stop=${vals.s}&target=${vals.t}${t2param}`)
       setExitMsg({ type: 'ok', text: `OCO placed — stop $${vals.s.toFixed(2)}, target $${vals.t.toFixed(2)}.` })
       setEditExits(false); qc.invalidateQueries('positions')
     } catch (err) {
@@ -104,7 +122,28 @@ export default function PositionCard({ pos }) {
       {/* Header */}
       <div className="flex items-start justify-between gap-2">
         <div>
-          <div className="text-xl font-bold text-slate-100 tracking-tight num">{pos.symbol}</div>
+          <div className="flex items-center gap-2">
+            <div className="text-xl font-bold text-slate-100 tracking-tight num">{pos.symbol}</div>
+            {pos.screener_type === 'pead' && (
+              <span
+                title="Post-Earnings Announcement Drift — entered after an earnings gap-up"
+                className="text-[9px] font-bold uppercase tracking-widest px-1.5 py-0.5 rounded border leading-none bg-violet-500/12 border-violet-500/30 text-violet-300"
+              >
+                PEAD
+              </span>
+            )}
+            {daysHeld != null && (
+              <span
+                title={tsLimit
+                  ? `Held ${daysHeld} of ${tsLimit} trading days — time stop at ${tsLimit}d`
+                  : `Held ${daysHeld} trading day${daysHeld !== 1 ? 's' : ''}`}
+                className={`text-[10px] font-semibold px-1.5 py-0.5 rounded border leading-none num ${daysColor}`}
+              >
+                {daysHeld}d
+                {tsLimit && <span className="opacity-50">/{tsLimit}</span>}
+              </span>
+            )}
+          </div>
           <div className="text-xs text-slate-500 mt-0.5 num">{pos.qty} sh @ {usd(pos.entry_price)}</div>
         </div>
         <SignalBadge signal={pos.signal} />
@@ -169,7 +208,7 @@ export default function PositionCard({ pos }) {
         <EmaRow label="52W Hi" value={pos.week52_high} current={pos.current_price} noColor />
       </div>
 
-      {/* Score bar */}
+      {/* Score bar — PEAD uses /8 with a lower passing bar (min 3); others use /8 too */}
       <div>
         <div className="flex justify-between label mb-2">
           <span>Stage 2 Score</span>
@@ -177,11 +216,18 @@ export default function PositionCard({ pos }) {
         </div>
         <div className="h-1.5 bg-white/5 rounded-full overflow-hidden">
           <div
-            className={`h-full rounded-full transition-all duration-700 ${
-              pos.score >= 7 ? 'bg-gradient-to-r from-emerald-500 to-emerald-400' :
-              pos.score >= 5 ? 'bg-gradient-to-r from-amber-500 to-yellow-400' :
-                               'bg-gradient-to-r from-red-600 to-red-500'
-            }`}
+            className={`h-full rounded-full transition-all duration-700 ${(() => {
+              if (pos.screener_type === 'pead') {
+                // PEAD min passing score is 3/8 — amber starts at 3, green at 6
+                return pos.score >= 6 ? 'bg-gradient-to-r from-emerald-500 to-emerald-400'
+                     : pos.score >= 3 ? 'bg-gradient-to-r from-amber-500 to-yellow-400'
+                     :                  'bg-gradient-to-r from-red-600 to-red-500'
+              }
+              // Standard SEPA score thresholds (out of 8)
+              return pos.score >= 7 ? 'bg-gradient-to-r from-emerald-500 to-emerald-400'
+                   : pos.score >= 5 ? 'bg-gradient-to-r from-amber-500 to-yellow-400'
+                   :                  'bg-gradient-to-r from-red-600 to-red-500'
+            })()}`}
             style={{ width: `${(pos.score / 8) * 100}%` }}
           />
         </div>
@@ -228,11 +274,12 @@ export default function PositionCard({ pos }) {
               {[
                 { label: 'Stop Price', val: stop, set: setStop, focus: 'focus:border-red-400/50' },
                 { label: 'Target (T1)', val: target, set: setTarget, focus: 'focus:border-emerald-400/50' },
-              ].map(({ label, val, set, focus }) => (
+                { label: 'Target (T2)', val: target2, set: setTarget2, focus: 'focus:border-emerald-400/30', placeholder: 'optional' },
+              ].map(({ label, val, set, focus, placeholder }) => (
                 <div key={label} className="flex flex-col gap-1">
                   <label className="label">{label}</label>
                   <input
-                    type="number" step="0.01" placeholder="0.00"
+                    type="number" step="0.01" placeholder={placeholder || '0.00'}
                     value={val} onChange={e => set(e.target.value)}
                     className={`w-28 px-2.5 py-1.5 text-xs rounded-lg bg-white/[0.04] text-slate-200 border border-white/10 outline-none transition-colors num ${focus}`}
                   />
@@ -258,12 +305,6 @@ export default function PositionCard({ pos }) {
                 </button>
               )}
             </div>
-
-            {pos.target2 && (
-              <p className="text-[10px] text-slate-600">
-                T2 from plan: <span className="text-emerald-400 num">${pos.target2.toFixed(2)}</span> — use for scaled exit
-              </p>
-            )}
           </div>
         )}
 

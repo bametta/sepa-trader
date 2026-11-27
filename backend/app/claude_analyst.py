@@ -15,6 +15,73 @@ from .database import get_setting, get_user_setting
 
 logger = logging.getLogger(__name__)
 
+
+def _apply_executed_guard(
+    db: Session,
+    mode: str,
+    user_id: int | None,
+    picks: list[dict],
+) -> None:
+    """Stamp weekly_plan rows EXECUTED for any symbol we already hold or have
+    BUY/SELL'd today, then mirror the change onto the in-memory picks list.
+
+    Called from analyze_picks_structured so a manual /analysis/run reflects
+    live broker state even when no rescreen has happened since the last fill
+    or close. Idempotent and best-effort — on Alpaca outage, falls back to
+    the trade_log set so today's activity is still respected.
+    """
+    held: set[str] = set()
+    try:
+        from . import alpaca_client as alp
+        held = {p.symbol for p in alp.get_positions_for_user(db, user_id, mode)}
+    except Exception as exc:
+        logger.warning(
+            "_apply_executed_guard: Alpaca positions unreachable for mode=%s: %s",
+            mode, exc,
+        )
+
+    traded_today: set[str] = set()
+    try:
+        traded_today = {
+            r[0] for r in db.execute(
+                text("""SELECT DISTINCT symbol FROM trade_log
+                        WHERE action IN ('BUY', 'SELL') AND mode = :mode
+                          AND created_at >= CURRENT_DATE"""),
+                {"mode": mode},
+            ).fetchall()
+        }
+    except Exception as exc:
+        logger.debug("_apply_executed_guard: trade_log lookup failed: %s", exc)
+
+    to_stamp = held | traded_today
+    if not to_stamp:
+        return
+
+    try:
+        db.execute(
+            text("""
+                UPDATE weekly_plan SET status = 'EXECUTED'
+                WHERE week_start = (
+                    SELECT MAX(week_start) FROM weekly_plan
+                    WHERE mode = :mode AND user_id IS NOT DISTINCT FROM :uid
+                )
+                  AND mode   = :mode
+                  AND user_id IS NOT DISTINCT FROM :uid
+                  AND symbol IN :syms
+                  AND status = 'PENDING'
+            """),
+            {"mode": mode, "uid": user_id, "syms": tuple(to_stamp)},
+        )
+        db.commit()
+    except Exception as exc:
+        db.rollback()
+        logger.warning("_apply_executed_guard: DB update failed: %s", exc)
+
+    for p in picks:
+        if p.get("symbol") in to_stamp and str(p.get("status", "")).upper() == "PENDING":
+            p["status"] = "EXECUTED"
+
+
 # ── Alpaca news fetcher ───────────────────────────────────────────────────────
 
 def _fetch_alpaca_news(
@@ -283,15 +350,68 @@ Breadth   : {f"{breadth}% sector ETFs above 50MA" if breadth is not None else 'N
 Note: Tape is context only — it does not override position-sizing rules. A CAUTION/UNFAVORABLE tape warrants a WARN unless rules are clearly violated (ABORT).
 """
 
-    is_rs = "rs_momentum" in (trigger or "").lower()
-    min_rr    = 1.2 if is_rs else 2.0
-    rs_rr_note = " (RS Momentum strategy uses EMA50 structural stops — minimum is 1.2x)" if is_rs else ""
+    is_rs   = "rs_momentum" in (trigger or "").lower()
+    is_pead = "pead" in (trigger or "").lower()
+    min_rr     = 1.2 if is_rs else (1.5 if is_pead else 2.0)
+    rs_rr_note = (
+        " (RS Momentum strategy uses EMA50 structural stops — minimum is 1.2x)" if is_rs
+        else " (PEAD strategy uses gap-day-low stop — minimum is 1.5x; gap-anchored stops are tighter than SEPA stops)" if is_pead
+        else ""
+    )
 
-    symbol_news = _fetch_alpaca_news([symbol], db, user_id, mode=mode).get(symbol, [])
+    # Expand news window to 7 days for gate — insider-related news can lag.
+    # Limit to 5 headlines to stay concise in the prompt.
+    symbol_news = _fetch_alpaca_news([symbol], db, user_id, mode=mode, hours=168, limit=5).get(symbol, [])
     news_block  = (
-        "\n--- RECENT NEWS (last 48h) ---\n" + "\n".join(f"• {h}" for h in symbol_news)
+        "\n--- RECENT NEWS (last 7 days) ---\n" + "\n".join(f"• {h}" for h in symbol_news)
         if symbol_news else ""
     )
+
+    # SEC Form 4 insider activity (last 30 days)
+    try:
+        from .insider_checker import fetch_insider_activity, format_for_prompt as _fmt_insider
+        _insider = fetch_insider_activity(symbol, days=30)
+        insider_block = _fmt_insider(symbol, _insider)
+    except Exception as _ins_exc:
+        logger.debug("pre_trade_analysis: insider fetch failed for %s: %s", symbol, _ins_exc)
+        insider_block = ""
+
+    # Earnings proximity + volume confirmation
+    # PEAD entries enter AFTER an earnings gap — the earnings risk is a tailwind,
+    # not a threat.  Reframe the earnings block and suppress the ABORT rule.
+    is_pead = "pead" in (trigger or "").lower()
+    try:
+        from .market_checks import (
+            get_earnings_proximity, format_earnings_for_prompt,
+            get_volume_confirmation, format_volume_for_prompt,
+        )
+        _earnings = get_earnings_proximity(symbol, db)
+        if is_pead:
+            days_ago = _earnings.get("days_since")
+            if days_ago is not None:
+                earnings_block = (
+                    f"\n--- EARNINGS (POST-EVENT CONTEXT) — {symbol} ---\n"
+                    f"Earnings reported ~{days_ago} day(s) ago. This is a PEAD entry — "
+                    f"the earnings event is a catalyst, not a risk. "
+                    f"Evaluate whether the gap-up is still intact, not whether to avoid earnings.\n"
+                )
+            else:
+                # PEAD screener confirmed a gap-up; earnings cache may be stale.
+                # Treat as post-event rather than unknown risk.
+                earnings_block = (
+                    f"\n--- EARNINGS (POST-EVENT CONTEXT) — {symbol} ---\n"
+                    f"This is a PEAD entry — an earnings gap-up was detected by the screener. "
+                    f"The earnings event is a catalyst, not a risk. "
+                    f"Evaluate whether the gap-up is intact, not the earnings proximity.\n"
+                )
+        else:
+            earnings_block = format_earnings_for_prompt(symbol, _earnings)
+        _volume      = get_volume_confirmation(symbol)
+        volume_block = format_volume_for_prompt(symbol, _volume)
+    except Exception as _mc_exc:
+        logger.debug("pre_trade_analysis: market_checks failed for %s: %s", symbol, _mc_exc)
+        earnings_block = ""
+        volume_block   = ""
 
     # Carry the weekly-plan verdict forward so this gate doesn't contradict it
     stored_block = ""
@@ -343,11 +463,26 @@ Account tier:    {account_tier}
 3. Trade cost must not exceed buying power. Cost: ${trade_cost:,.2f}, BP: ${buying_power:,.2f}
 4. Single position must not exceed {max_position_pct}% of portfolio. Current: {pct_of_portfolio:.1f}%
 5. Cash after trade must remain >= {min_cash_pct}% of portfolio. After trade: {cash_after_pct:.1f}%
-{news_block}
-Use WARN for borderline cases (R:R within 0.3 of minimum, size near the limit).
-If recent news reveals earnings miss, guidance cut, FDA rejection, or major legal/regulatory risk — use WARN or ABORT even if position sizing rules pass.
-Use ABORT only for clear rule violations.
-Use PROCEED when all rules pass."""
+{news_block}{insider_block}{earnings_block}{volume_block}
+--- DECISION GUIDANCE ---
+Use PROCEED when all rules pass and no red flags exist.
+Use WARN for borderline cases: R:R within 0.3 of minimum, size near limits, or mild caution signals.
+Use ABORT for clear rule violations OR any of the following fundamental red flags:
+  • Cluster insider selling: ≥2 distinct directors/officers sold in the last 30 days
+  • Single insider disposed >$500k in the last 30 days with no apparent 10b5-1 plan
+  • Recent earnings miss, guidance cut, FDA rejection, or active SEC/DOJ investigation
+  • Material adverse news within the last 7 days that invalidates the technical setup
+  • Earnings ≤5 trading days away — gap risk from the binary event cannot be stopped out of
+Note on insider selling: Routine 10b5-1 plan sales (pre-scheduled, disclosed in filings) are less
+concerning than spontaneous open-market disposals. Weight heavily if multiple officers sell
+simultaneously or if a CEO/CFO liquidates a large portion of their stake with no plan on record.
+Note on earnings proximity: Use ABORT when earnings are ≤5 trading days away (high risk). Use WARN
+when 6-10 trading days away — position may still be open at the event; flag it so the trader can
+decide whether to size down or set an exit before the announcement.
+{"EXCEPTION — PEAD entries: this trade is triggered by a recent earnings gap-up. The earnings event has already happened and is the catalyst, not the risk. Do NOT abort because of the recent past earnings report. Evaluate instead: is the gap still intact? Is the stock trading above the gap-day low?" if is_pead else ""}
+Note on volume: Volume confirms conviction. Use WARN (not ABORT alone) when volume is below_avg
+(ratio < 0.8×) — low volume on a breakout suggests weak institutional participation and raises
+the probability of a failed move. Strong volume (≥1.5×) is a positive signal worth noting."""
 
     try:
         text = _call_ai(db, prompt, max_tokens=256, user_id=user_id)
@@ -364,22 +499,23 @@ Use PROCEED when all rules pass."""
         return _parse_pre_trade_response(text.strip())
 
     except Exception as exc:
-        # Transient API error — warn but allow trade to continue so a
-        # temporary outage doesn't freeze all automated trading.
-        logger.error("pre_trade_analysis failed for %s: %s", symbol, exc)
+        # Transient API error — block the trade. Real money is at stake;
+        # an unvetted entry during an AI outage is worse than a missed entry.
+        logger.error("pre_trade_analysis failed for %s: %s — BLOCKING", symbol, exc)
         return {
-            "proceed":  True,
-            "verdict":  "WARN",
-            "reason":   f"AI analysis error — proceeding with caution: {str(exc)[:80]}",
-            "warnings": [f"Pre-trade AI error (trade allowed): {str(exc)[:80]}"],
+            "proceed":  False,
+            "verdict":  "ABORT",
+            "reason":   f"AI analysis error — trade blocked: {str(exc)[:80]}",
+            "warnings": [f"Pre-trade AI error (trade blocked): {str(exc)[:80]}"],
             "analysis": "",
         }
 
 
 def _parse_pre_trade_response(text: str) -> dict:
-    verdict  = "PROCEED"
-    reason   = ""
+    verdict  = "ABORT"  # fail-closed: malformed/missing VERDICT blocks the trade
+    reason   = "VERDICT line missing or unparseable — defaulting to ABORT"
     warnings = []
+    found_verdict = False
 
     for line in text.splitlines():
         line = line.strip()
@@ -387,12 +523,16 @@ def _parse_pre_trade_response(text: str) -> dict:
             v = line.split(":", 1)[1].strip().upper()
             if v in ("PROCEED", "WARN", "ABORT"):
                 verdict = v
+                found_verdict = True
         elif line.startswith("REASON:"):
             reason = line.split(":", 1)[1].strip()
         elif line.startswith("WARNINGS:"):
             w = line.split(":", 1)[1].strip()
             if w.lower() != "none":
                 warnings = [x.strip() for x in w.split(",") if x.strip()]
+
+    if not found_verdict:
+        warnings.append("AI response missing VERDICT line — defaulted to ABORT")
 
     return {
         "proceed":  verdict in ("PROCEED", "WARN"),
@@ -427,6 +567,39 @@ def log_pre_trade(
         },
     )
     db.commit()
+
+
+def get_latest_pre_trade(
+    db: Session, symbol: str, mode: str, user_id: int | None = None,
+) -> tuple[str, str]:
+    """Return (verdict, reason) of the most recent pre_trade_* row for this
+    symbol/mode/user. Empty strings if no row found. Used to enrich the
+    Telegram fill alert with the gate's decision rationale."""
+    try:
+        row = db.execute(
+            text("""
+                SELECT analysis FROM ai_analysis_log
+                WHERE symbol = :sym AND mode = :mode
+                  AND trigger LIKE 'pre_trade_%'
+                  AND (:uid IS NULL OR user_id = :uid)
+                ORDER BY created_at DESC LIMIT 1
+            """),
+            {"sym": symbol, "mode": mode, "uid": user_id},
+        ).fetchone()
+    except Exception as exc:
+        logger.debug("get_latest_pre_trade failed (non-fatal): %s", exc)
+        return "", ""
+    if not row or not row[0]:
+        return "", ""
+    verdict, reason = "", ""
+    for line in str(row[0]).splitlines():
+        if line.startswith("VERDICT:") and not verdict:
+            verdict = line.split(":", 1)[1].strip()
+        elif line.startswith("REASON:") and not reason:
+            reason = line.split(":", 1)[1].strip()
+        if verdict and reason:
+            break
+    return verdict, reason
 
 
 # ── Slot-refill analysis ──────────────────────────────────────────────────────
@@ -617,7 +790,12 @@ def analyze_picks(db: Session, picks: list[dict], closed_position: dict | None =
         rr = round((t1 - ep) / (ep - sp), 2) if ep > sp > 0 and t1 > ep else "N/A"
         src = p.get("screener_type", "minervini")
         score_raw = p.get("score", "?")
-        score_str = f"RS-pct={score_raw}/99" if src == "rs_momentum" else f"score={score_raw}/6"
+        if src == "rs_momentum":
+            score_str = f"RS-pct={score_raw}/99"
+        elif src == "pead":
+            score_str = f"SEPA-score={score_raw}/8"
+        else:
+            score_str = f"score={score_raw}/6"
         lines.append(
             f"{i}. {p['symbol']}  {score_str}  signal={p.get('signal','?')}"
             f"  entry=${ep:.2f}  stop=${sp:.2f}  t1=${t1:.2f}  R:R={rr}"
@@ -632,6 +810,7 @@ def analyze_picks(db: Session, picks: list[dict], closed_position: dict | None =
         "Rules: consider score, R:R ratio, signal quality, and any recent news.\n"
         "If news reveals an earnings miss, guidance cut, FDA rejection, or legal/regulatory risk, flag it.\n"
         "RS Momentum picks use EMA50 structural stops — R:R ≥1.2 is acceptable for them.\n"
+        "PEAD picks (Post-Earnings Drift) enter after an earnings gap-up — the earnings event is a catalyst. R:R ≥1.5 is acceptable. Do NOT flag past earnings as a risk for PEAD picks.\n"
         "Output the numbered list only — no preamble, no extra text."
     )
 
@@ -733,6 +912,14 @@ def analyze_picks_structured(
 
     import json as _json
 
+    # Reconcile EXECUTED status against live broker state right before AI runs.
+    # _save_plan does the same at screener time, but a manual /analysis/run
+    # several hours later sees stale plan rows — positions opened or closed in
+    # the interim still showed as PENDING. Stamp them now so neither the AI
+    # nor the operator wastes a slot re-analysing a name we already hold or
+    # just closed today.
+    _apply_executed_guard(db, mode, user_id, picks)
+
     pending = [p for p in picks if str(p.get("status", "")).upper() == "PENDING"]
     if not pending:
         return []
@@ -749,16 +936,19 @@ def analyze_picks_structured(
         rr   = round((t1 - ep) / (ep - sp), 2) if ep > sp > 0 and t1 > ep else "N/A"
         src  = p.get("screener_type", "minervini")
         src_label = {
-            "minervini":  "Minervini/SEPA",
-            "pullback":   "Pullback-to-MA (PPST+EMA)",
+            "minervini":   "Minervini/SEPA",
+            "pullback":    "Pullback-to-MA (PPST+EMA)",
             "rs_momentum": "RS Momentum (IBD-style)",
-            "both":       "Both screeners",
+            "both":        "Both screeners",
+            "pead":        "PEAD (Post-Earnings Drift)",
         }.get(src, src)
         score_raw = p.get("score", "?")
         if src == "rs_momentum":
             score_str = f"RS-percentile={score_raw}/99 (plan rank, not SEPA score)"
+        elif src == "pead":
+            score_str = f"SEPA-score={score_raw}/8"
         else:
-            score_str = f"SEPA-score={score_raw}/6"
+            score_str = f"SEPA-score={score_raw}/8"
         pick_lines.append(
             f"{i}. [{p['symbol']}]  source={src_label}  {score_str}"
             f"  signal={p.get('signal','?')}"

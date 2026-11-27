@@ -6,6 +6,7 @@ from ..database import get_db, get_current_user, get_all_user_settings
 from ..config import settings as global_settings
 from .. import alpaca_client as alp
 from ..utils import sf as _sf
+from ..crypto import decrypt as _dec
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/account", tags=["account"])
@@ -34,8 +35,8 @@ def _resolve_alpaca_client(user_settings: dict, mode: str, is_admin: bool = Fals
     if not key or not secret:
         raise HTTPException(status_code=400, detail="alpaca_credentials_missing")
     logger.info(
-        "_resolve_alpaca_client: mode=%s paper=%s key_prefix=%s secret_len=%d",
-        mode, paper, key[:6] if key else "NONE", len(secret) if secret else 0,
+        "_resolve_alpaca_client: mode=%s paper=%s credentials=set",
+        mode, paper,
     )
     return alp.get_client_for_keys(key, secret, paper)
 
@@ -74,9 +75,14 @@ def _fetch_account_data(client, name: str, mode: str) -> dict | None:
                 logger.warning("_fetch_account_data(%s, %s): positions fallback failed: %s", name, mode, pos_exc)
                 total_pl = 0.0
 
+        # Build a stable deposit key: "paper_main", "live_main", "live_dual_momentum" etc.
+        slug = name.lower().replace(" ", "_")
+        deposit_key = f"total_deposited_{mode}_{slug}"
+
         return {
             "name":              name,
             "mode":              mode,
+            "deposit_key":       deposit_key,
             "portfolio_value":   _sf(acct.portfolio_value, 0.0),
             "cash":              _sf(acct.cash, 0.0),
             "buying_power":      _sf(acct.buying_power, 0.0),
@@ -105,10 +111,12 @@ def accounts_overview(
     is_admin     = current_user["role"] == "admin"
     user_settings = get_all_user_settings(db, uid)
 
-    # Strategy configs with potentially separate keys
+    # Strategy configs with potentially separate keys.
+    # Each strategy has one row per trading_mode; load both and pick the
+    # row matching the mode we're rendering inside the loop below.
     strategy_rows = db.execute(
         text("""
-            SELECT strategy_name,
+            SELECT strategy_name, trading_mode,
                    alpaca_paper_key, alpaca_paper_secret,
                    alpaca_live_key,  alpaca_live_secret
             FROM strategy_config
@@ -130,17 +138,24 @@ def accounts_overview(
             main_client = _resolve_alpaca_client(user_settings, mode, is_admin)
             data = _fetch_account_data(main_client, "Main", mode)
             if data:
+                data["total_deposited"] = float(user_settings.get(data["deposit_key"]) or 0)
                 result[mode].append(data)
         except HTTPException:
             pass  # credentials not configured for this mode
 
         # ── Strategy accounts (only if they have DEDICATED keys) ──────────────
         for row in strategy_rows:
-            strat_name, pk, ps, lk, ls = row
+            strat_name, row_mode, pk, ps, lk, ls = row
+            if row_mode != mode:
+                continue
             if mode == "paper":
-                key, secret = pk, ps
+                enc_key, enc_secret = pk, ps
             else:
-                key, secret = lk, ls
+                enc_key, enc_secret = lk, ls
+
+            # Stored credentials are encrypted at rest — decrypt before use.
+            key    = _dec(enc_key or "")
+            secret = _dec(enc_secret or "")
 
             # Skip if no dedicated keys or same as main account credentials
             main_key = user_settings.get(f"alpaca_{mode}_key", "")
@@ -152,6 +167,7 @@ def accounts_overview(
                 label  = STRATEGY_LABELS.get(strat_name, strat_name.replace("_", " ").title())
                 data   = _fetch_account_data(client, label, mode)
                 if data:
+                    data["total_deposited"] = float(user_settings.get(data["deposit_key"]) or 0)
                     result[mode].append(data)
             except Exception as exc:
                 logger.warning("accounts_overview: strategy %s [%s]: %s", strat_name, mode, exc)
@@ -180,3 +196,22 @@ def account(
         "day_pnl":         day_pnl,
         "day_pnl_pct":     (day_pnl / last_equity * 100) if last_equity else 0.0,
     }
+
+
+@router.patch("/deposits")
+def update_total_deposited(
+    body: dict,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Save deposited capital for a specific account (keyed by deposit_key)."""
+    from ..database import set_user_setting
+    amount      = body.get("total_deposited")
+    deposit_key = body.get("deposit_key", "total_deposited_paper_main")
+    if amount is None or not isinstance(amount, (int, float)) or amount < 0:
+        raise HTTPException(400, "total_deposited must be a non-negative number")
+    # Validate key format to prevent arbitrary setting writes
+    if not deposit_key.startswith("total_deposited_"):
+        raise HTTPException(400, "invalid deposit_key")
+    set_user_setting(db, deposit_key, str(float(amount)), current_user["id"])
+    return {"deposit_key": deposit_key, "total_deposited": float(amount)}

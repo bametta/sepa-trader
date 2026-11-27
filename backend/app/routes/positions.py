@@ -35,6 +35,7 @@ def _resolve_alpaca_client(user_settings: dict, mode: str, is_admin: bool = Fals
 
 @router.get("")
 def positions(current_user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
+    from datetime import datetime, timezone
     user_settings = get_all_user_settings(db, current_user["id"])
     mode   = user_settings.get("trading_mode", "paper")
     client = _resolve_alpaca_client(user_settings, mode, is_admin=current_user["role"] == "admin")
@@ -48,7 +49,8 @@ def positions(current_user: dict = Depends(get_current_user), db: Session = Depe
     plan_rows = db.execute(
         text("""
             SELECT DISTINCT ON (symbol)
-                symbol, stop_price, target1, target2, week_start
+                symbol, stop_price, target1, target2, week_start,
+                COALESCE(screener_type, 'minervini') AS screener_type
             FROM weekly_plan
             WHERE symbol = ANY(:syms)
               AND mode = :mode
@@ -60,13 +62,88 @@ def positions(current_user: dict = Depends(get_current_user), db: Session = Depe
 
     plan_map = {
         r[0]: {
-            "stop_price": sf(r[1]),
-            "target1":    sf(r[2]),
-            "target2":    sf(r[3]),
-            "plan_week":  str(r[4]) if r[4] else None,
+            "stop_price":    sf(r[1]),
+            "target1":       sf(r[2]),
+            "target2":       sf(r[3]),
+            "plan_week":     str(r[4]) if r[4] else None,
+            "screener_type": r[5],
         }
         for r in plan_rows
     }
+
+    # Batch-fetch the most recent BUY timestamp for each held symbol so we
+    # can show "days held" without a per-position query.
+    buy_rows = db.execute(
+        text("""
+            SELECT DISTINCT ON (symbol)
+                symbol, created_at
+            FROM trade_log
+            WHERE symbol = ANY(:syms)
+              AND mode   = :mode
+              AND action = 'BUY'
+            ORDER BY symbol, created_at DESC
+        """),
+        {"syms": symbols, "mode": mode},
+    ).fetchall()
+
+    now_utc = datetime.now(timezone.utc)
+    buy_map: dict[str, int] = {}
+    for sym, created_at in buy_rows:
+        if created_at is None:
+            continue
+        if created_at.tzinfo is None:
+            created_at = created_at.replace(tzinfo=timezone.utc)
+        cal_days     = (now_utc - created_at).days
+        trading_days = int(cal_days * 5 / 7)   # same approximation as _check_time_stops
+        buy_map[sym] = max(trading_days, 0)
+
+    # Pull time-stop threshold from user_settings (already fetched above) so
+    # the UI colour ramp reflects whatever the user has set in Settings.
+    try:
+        time_stop_days = int(user_settings.get("time_stop_days", "10") or "10")
+    except (TypeError, ValueError):
+        time_stop_days = 10
+
+    # Silently reconcile weekly_plan.position_size to the actual fill quantity.
+    # The screener estimates position_size at scan time; by entry time prices and
+    # portfolio values may differ enough (30-50%) to make the estimate stale.
+    # Keeping it stale triggers false "double entry" alerts in the monitor.
+    # We only update rows where the delta is significant (>10% off) so small
+    # natural drift doesn't create unnecessary DB writes every fetch.
+    for p in raw:
+        actual_qty = int(float(p.qty or 0))
+        if actual_qty <= 0:
+            continue
+        try:
+            stale_row = db.execute(
+                text("""
+                    SELECT position_size FROM weekly_plan
+                    WHERE symbol = :sym AND mode = :mode
+                      AND status = 'EXECUTED'
+                    ORDER BY week_start DESC LIMIT 1
+                """),
+                {"sym": p.symbol, "mode": mode},
+            ).fetchone()
+            if stale_row and stale_row[0]:
+                planned = int(float(stale_row[0]))
+                if planned > 0 and abs(actual_qty - planned) / planned > 0.1:
+                    db.execute(
+                        text("""
+                            UPDATE weekly_plan
+                            SET position_size = :qty
+                            WHERE symbol = :sym AND mode = :mode
+                              AND status = 'EXECUTED'
+                              AND week_start = (
+                                  SELECT MAX(week_start) FROM weekly_plan
+                                  WHERE symbol = :sym AND mode = :mode
+                                    AND status = 'EXECUTED'
+                              )
+                        """),
+                        {"qty": actual_qty, "sym": p.symbol, "mode": mode},
+                    )
+                    db.commit()
+        except Exception:
+            pass  # non-critical — monitor will retry next cycle
 
     out = []
     for p in raw:
@@ -90,7 +167,10 @@ def positions(current_user: dict = Depends(get_current_user), db: Session = Depe
             "target1":         plan.get("target1"),
             "target2":         plan.get("target2"),
             "plan_week":       plan.get("plan_week"),
+            "screener_type":   plan.get("screener_type", "minervini"),
             "mode":            mode,
+            "days_held":       buy_map.get(p.symbol),   # trading days since BUY fill
+            "time_stop_days":  time_stop_days if time_stop_days > 0 else None,
         })
     return out
 
@@ -104,7 +184,7 @@ def close(symbol: str, current_user: dict = Depends(get_current_user), db: Sessi
     return {"status": "closed", "symbol": symbol.upper()}
 
 
-def _upsert_plan_exits(db: Session, symbol: str, stop: float, target: float, mode: str, user_id: int):
+def _upsert_plan_exits(db: Session, symbol: str, stop: float, target: float, mode: str, user_id: int, target2: float | None = None):
     """Upsert stop/target into the current week's plan for a given mode and user."""
     existing = db.execute(
         text("""
@@ -120,33 +200,48 @@ def _upsert_plan_exits(db: Session, symbol: str, stop: float, target: float, mod
     ).fetchone()
 
     if existing:
-        db.execute(
-            text("""
-                UPDATE weekly_plan
-                SET stop_price = :stop, target1 = :target
-                WHERE symbol = :sym
-                  AND mode = :mode
-                  AND user_id = :uid
-                  AND week_start = (
-                      SELECT MAX(week_start) FROM weekly_plan WHERE mode = :mode AND user_id = :uid
-                  )
-            """),
-            {"stop": stop, "target": target, "sym": symbol, "mode": mode, "uid": user_id},
-        )
+        if target2 is not None:
+            db.execute(
+                text("""
+                    UPDATE weekly_plan
+                    SET stop_price = :stop, target1 = :target, target2 = :target2
+                    WHERE symbol = :sym
+                      AND mode = :mode
+                      AND user_id = :uid
+                      AND week_start = (
+                          SELECT MAX(week_start) FROM weekly_plan WHERE mode = :mode AND user_id = :uid
+                      )
+                """),
+                {"stop": stop, "target": target, "target2": target2, "sym": symbol, "mode": mode, "uid": user_id},
+            )
+        else:
+            db.execute(
+                text("""
+                    UPDATE weekly_plan
+                    SET stop_price = :stop, target1 = :target
+                    WHERE symbol = :sym
+                      AND mode = :mode
+                      AND user_id = :uid
+                      AND week_start = (
+                          SELECT MAX(week_start) FROM weekly_plan WHERE mode = :mode AND user_id = :uid
+                      )
+                """),
+                {"stop": stop, "target": target, "sym": symbol, "mode": mode, "uid": user_id},
+            )
     else:
         db.execute(
             text("""
                 INSERT INTO weekly_plan
-                    (week_start, symbol, rank, score, entry_price, stop_price, target1, status, mode, user_id)
+                    (week_start, symbol, rank, score, entry_price, stop_price, target1, target2, status, mode, user_id)
                 VALUES (
                     COALESCE(
                         (SELECT MAX(week_start) FROM weekly_plan WHERE mode = :mode AND user_id = :uid),
                         CURRENT_DATE
                     ),
-                    :sym, 99, 0, 0, :stop, :target, 'EXECUTED', :mode, :uid
+                    :sym, 99, 0, 0, :stop, :target, :target2, 'EXECUTED', :mode, :uid
                 )
             """),
-            {"sym": symbol, "stop": stop, "target": target, "mode": mode, "uid": user_id},
+            {"sym": symbol, "stop": stop, "target": target, "target2": target2, "mode": mode, "uid": user_id},
         )
     db.commit()
 
@@ -156,18 +251,19 @@ def set_exit_levels(
     symbol: str,
     stop: float = Query(..., gt=0),
     target: float = Query(..., gt=0),
+    target2: float | None = Query(None, gt=0),
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
     """
-    Save stop/target to the plan. Exit guard detects the change on
+    Save stop/target (and optional T2) to the plan. Exit guard detects the change on
     the next monitor cycle and replaces the OCO automatically.
     """
     symbol        = symbol.upper()
     user_settings = get_all_user_settings(db, current_user["id"])
     mode          = user_settings.get("trading_mode", "paper")
-    _upsert_plan_exits(db, symbol, stop, target, mode, current_user["id"])
-    return {"status": "ok", "symbol": symbol, "stop": stop, "target": target, "mode": mode}
+    _upsert_plan_exits(db, symbol, stop, target, mode, current_user["id"], target2=target2)
+    return {"status": "ok", "symbol": symbol, "stop": stop, "target": target, "target2": target2, "mode": mode}
 
 
 @router.post("/{symbol}/place-exits")
@@ -175,6 +271,7 @@ def place_exits_now(
     symbol: str,
     stop: float = Query(..., gt=0),
     target: float = Query(..., gt=0),
+    target2: float | None = Query(None, gt=0),
     current_user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -194,7 +291,7 @@ def place_exits_now(
     client        = _resolve_alpaca_client(user_settings, mode, is_admin=current_user["role"] == "admin")
 
     # Step 1 — persist to plan
-    _upsert_plan_exits(db, symbol, stop, target, mode, current_user["id"])
+    _upsert_plan_exits(db, symbol, stop, target, mode, current_user["id"], target2=target2)
 
     # Step 2 — confirm position is still open
     positions = client.get_all_positions()

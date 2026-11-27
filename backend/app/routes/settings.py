@@ -19,7 +19,9 @@ EDITABLE_KEYS = {
     "screener_universe",
     "screener_price_min", "screener_price_max", "screener_top_n",
     "screener_min_score", "screener_vol_surge_pct", "screener_ema20_pct", "screener_ema50_pct",
-    "screener_excluded_sectors",
+    "screener_max_ema200_ext_pct", "screener_max_ema50_ext_pct",
+    "screener_universe_size",
+    "screener_excluded_sectors", "mv_excluded_sectors",
     "screener_auto_run",
     "screener_schedule_day", "screener_schedule_time",       # legacy (single day/time)
     "screener_schedule_days", "screener_schedule_times",     # Minervini multi-day / multi-time
@@ -63,6 +65,43 @@ EDITABLE_KEYS = {
     "ira_rebalance_threshold_pct",  # drift % before auto-rebalance fires
     "ira_cash_buffer_pct",      # % of portfolio held as cash buffer
     "ira_etf_universe",         # comma-separated ETF tickers override
+    # PEAD screener settings
+    "pead_max_slots",
+    "pead_screener_enabled",
+    "pead_lookback_days",
+    "pead_gap_min_pct",
+    "pead_vol_ratio_min",
+    "pead_max_drift_pct",
+    "pead_min_rr",
+    "pead_min_sepa_score",
+    "pead_top_n",
+    "pead_screener_auto_run",
+    "pead_screener_schedule_days",
+    "pead_screener_schedule_times",
+    # Plan diversity / merge settings
+    "screener_min_rr", "max_picks_per_sector",
+    # Cash floor
+    "block_on_warn", "tv_excluded_sectors",
+    # Daily drawdown halt
+    "daily_drawdown_halt_pct",
+    # Minervini screener — slot 2 schedule
+    "screener_schedule_days_2", "screener_schedule_times_2",
+    # Pullback screener — slot 2 schedule
+    "pb_screener_schedule_days_2", "pb_screener_schedule_times_2",
+    # RS Momentum screener — schedule (all slots)
+    "rs_screener_auto_run",
+    "rs_screener_schedule_days", "rs_screener_schedule_times",
+    "rs_screener_schedule_days_2", "rs_screener_schedule_times_2",
+    # Combined screener (runs all 3 strategies in one TV API call)
+    "combined_screener_auto_run",
+    "combined_screener_schedule_days", "combined_screener_schedule_times",
+    "combined_screener_schedule_days_2", "combined_screener_schedule_times_2",
+    # Apex system — loss prevention
+    "time_stop_days",           # trading days before time stop fires (0 = disabled)
+    "time_stop_max_gain_pct",   # close if unrealized < this % after N days
+    "min_position_dollars",     # minimum notional for sub-economic order guard
+    "entry_max_deviation_pct",  # max % drift from plan entry before skipping buy
+    "block_new_entries",        # manual kill-switch: "true" blocks all new buys
 }
 
 

@@ -80,6 +80,7 @@ _PB_COLS = [
     "Perf.1M",
     "Perf.3M",
     "sector",                       # Used for sector exclusion filter
+    "industry",                     # Used for industry-level exclusion (e.g. oilfield services under Industrial Services)
 ]
 
 # Sectors excluded by default — commodity/defensive/low-growth sectors that
@@ -107,10 +108,25 @@ _TV_HEADERS = {
 
 def get_pb_settings(db: Session, user_id: int) -> dict:
     """Load all pullback screener settings with defaults."""
+    from .rs_screener import (
+        _resolve_excluded as _rs_resolve,
+        _resolve_excluded_industries as _rs_resolve_industries,
+    )
+
     def _s(key, default):
         return get_user_setting(db, key, str(default), user_id)
 
+    excluded_raw = [
+        s.strip()
+        for s in _s("pb_excluded_sectors", DEFAULT_EXCLUDED_SECTORS).split(",")
+        if s.strip()
+    ]
+
     return {
+        # Set of LOWERCASE TV sector names — used by _local_refinement for the
+        # actual exclusion check. Settings UI accepts either GICS or TV names.
+        "_resolved_excluded":            _rs_resolve(excluded_raw),
+        "_resolved_excluded_industries": _rs_resolve_industries(excluded_raw),
         "price_min":           float(_s("pb_price_min",           10.0)),
         "price_max":           float(_s("pb_price_max",           200.0)),
         # EMA ladder — each step is independently togglable
@@ -146,15 +162,78 @@ def get_pb_settings(db: Session, user_id: int) -> dict:
             for e in _s("pb_exchanges", "NYSE,NASDAQ").split(",")
             if e.strip()
         ],
-        # Sector exclusion — comma-separated TV sector names to block
-        "excluded_sectors": [
-            s.strip()
-            for s in _s("pb_excluded_sectors", DEFAULT_EXCLUDED_SECTORS).split(",")
-            if s.strip()
-        ],
+        # Raw user-entered exclusion list (kept for display / rationale).
+        # _resolved_excluded above is what _local_refinement actually checks.
+        "excluded_sectors": excluded_raw,
         # Minimum YoY revenue growth % (0 = disabled)
         "min_revenue_growth": float(_s("pb_min_revenue_growth", "0")),
     }
+
+
+# ── Pre-fetch fast path ───────────────────────────────────────────────────────
+
+def _filter_mega_for_pullback(mega_data: dict[str, dict], cfg: dict) -> list[dict]:
+    """Apply all pullback filter logic locally to pre-fetched mega-scan data.
+
+    Mirrors the server-side conditions from _build_tv_filters plus the local
+    refinement from _local_refinement. Used when mega_data is pre-fetched by
+    run_both_screeners so the pullback screener can skip its own TV call entirely.
+    """
+    candidates = []
+    for sym, v in mega_data.items():
+        close   = v.get("close")   or 0.0
+        e20     = v.get("EMA20")   or 0.0
+        e50     = v.get("EMA50")   or 0.0
+        e100    = v.get("EMA100")  or 0.0
+        e200    = v.get("EMA200")  or 0.0
+        rsi     = v.get("RSI")     or 0.0
+        adx     = v.get("ADX")     or 0.0
+        avg_vol = v.get("average_volume_30d_calc") or 0.0
+        mcap    = v.get("market_cap_basic") or 0.0
+        perf3m  = v.get("Perf.3M") or 0.0
+        exch    = (v.get("exchange") or "").strip().upper()
+
+        # Price range
+        if cfg["price_min"] > 0 and close < cfg["price_min"]:
+            continue
+        if cfg["price_max"] > 0 and close > cfg["price_max"]:
+            continue
+        # Exchange
+        if cfg.get("exchanges") and exch not in cfg["exchanges"]:
+            continue
+        # EMA ladder (mirrors _build_tv_filters conditions)
+        if cfg["price_above_ema20"] and (not e20 or close <= e20):
+            continue
+        if cfg["ema20_above_ema50"] and (not e50 or e20 <= e50):
+            continue
+        if cfg["ema50_above_ema100"] and (not e100 or e50 <= e100):
+            continue
+        if cfg["ema100_above_ema200"] and (not e200 or e100 <= e200):
+            continue
+        # RSI reset zone
+        if rsi < cfg["rsi_min"] or rsi > cfg["rsi_max"]:
+            continue
+        # Volume / market cap
+        if cfg["avg_vol_min"] > 0 and avg_vol < cfg["avg_vol_min"]:
+            continue
+        if cfg["market_cap_min"] > 0 and mcap < cfg["market_cap_min"]:
+            continue
+        # ADX
+        if cfg["adx_min"] > 0 and adx < cfg["adx_min"]:
+            continue
+        # 3-month performance
+        if perf3m < cfg["perf_3m_min"]:
+            continue
+        # Local refinement: rel_vol, EMA50 proximity, EMA spread, 52W high, sectors
+        c = _local_refinement(sym, v, cfg)
+        if c is not None:
+            candidates.append(c)
+
+    logger.info(
+        "Pullback [mega fast-path]: %d of %d symbols passed all filters",
+        len(candidates), len(mega_data),
+    )
+    return candidates
 
 
 # ── Main entry point ──────────────────────────────────────────────────────────
@@ -164,6 +243,7 @@ def run_pullback_screener(
     mode: str = None,
     user_id: int = None,
     account_value: float = None,
+    prefetched_mega: dict | None = None,
 ) -> list[dict]:
     """
     Run the Pullback-to-MA screener.
@@ -175,39 +255,36 @@ def run_pullback_screener(
 
     cfg = get_pb_settings(db, user_id)
 
-    # Universe: same as Minervini screener by default
-    universe_raw = get_user_setting(db, "screener_universe", "", user_id)
-    from .screener import DEFAULT_UNIVERSE
-    universe = (
-        [s.strip().upper() for s in universe_raw.split(",") if s.strip()]
-        if universe_raw else DEFAULT_UNIVERSE
-    )
-
     # ── Pass 1: TradingView filter ────────────────────────────────────────────
-    # Option B: user has named a saved TV screener → use it directly
-    tv_screener_name = get_user_setting(db, "pb_tv_screener_name", "", user_id).strip()
-    tv_user = get_user_setting(db, "tv_username", "", user_id)
-    tv_pass = get_user_setting(db, "tv_password", "", user_id)
-
-    if tv_screener_name and tv_user and tv_pass:
+    if prefetched_mega:
+        # Fast path: caller already fetched the full exchange universe — apply
+        # all pullback filters locally, skipping a separate TV HTTP call.
         logger.info(
-            "Pullback screener [Option B]: using saved TV screener '%s'", tv_screener_name
+            "Pullback screener [mega fast-path]: filtering %d pre-fetched symbols",
+            len(prefetched_mega),
         )
-        candidates = _tv_filter_saved_screener(tv_screener_name, tv_user, tv_pass, cfg)
-        if candidates is None:
-            # Fallback to Option A when saved screener fetch fails
-            logger.warning(
-                "Saved TV screener '%s' failed — falling back to server-side filter scan.",
-                tv_screener_name,
-            )
-            candidates = _adaptive_ema_serverside(cfg)
+        candidates = _filter_mega_for_pullback(prefetched_mega, cfg)
     else:
-        # Option A: send filter conditions to TV's scanner, let TV do the filtering
-        logger.info(
-            "Pullback screener [Option A]: server-side TV filter scan (universe=%d symbols)",
-            len(universe),
-        )
-        candidates = _adaptive_ema_serverside(cfg)
+        # Option B: user has named a saved TV screener → use it directly
+        tv_screener_name = get_user_setting(db, "pb_tv_screener_name", "", user_id).strip()
+        tv_user = get_user_setting(db, "tv_username", "", user_id)
+        tv_pass = get_user_setting(db, "tv_password", "", user_id)
+
+        if tv_screener_name and tv_user and tv_pass:
+            logger.info(
+                "Pullback screener [Option B]: using saved TV screener '%s'", tv_screener_name
+            )
+            candidates = _tv_filter_saved_screener(tv_screener_name, tv_user, tv_pass, cfg)
+            if candidates is None:
+                logger.warning(
+                    "Saved TV screener '%s' failed — falling back to server-side filter scan.",
+                    tv_screener_name,
+                )
+                candidates = _adaptive_ema_serverside(cfg)
+        else:
+            # Option A: send filter conditions to TV's scanner, let TV do the filtering
+            logger.info("Pullback screener [Option A]: server-side TV filter scan")
+            candidates = _adaptive_ema_serverside(cfg)
 
     logger.info("Pullback screener: %d candidates after TV filter", len(candidates))
 
@@ -249,10 +326,16 @@ def run_pullback_screener(
 
     for rank, c in enumerate(top, 1):
         price    = float(c["price"])
-        stop     = round(price * (1 - stop_pct / 100), 4)
-        target1  = round(price * (1 + stop_pct * 2 / 100), 4)
-        target2  = round(price * (1 + stop_pct * 3 / 100), 4)
+        e50      = float(c.get("ema50") or 0.0)
+        # Stop at EMA50 − 1 % buffer (structural invalidation for the pullback thesis).
+        # Fall back to a flat stop_pct below price when EMA50 is unavailable.
+        stop     = round(e50 * 0.99, 2) if e50 > 0 else round(price * (1 - stop_pct / 100), 4)
         stop_d   = price - stop
+        if stop_d <= 0:
+            continue
+        # Targets at true 2R and 3R of the actual stop distance
+        target1  = round(price + 2 * stop_d, 4)
+        target2  = round(price + 3 * stop_d, 4)
         risk_sh  = int(risk_dollars / stop_d) if stop_d > 0 else 0
         max_sh   = int((account_value * max_pos / 100) / price) if price > 0 else 0
         shares   = min(risk_sh, max_sh)
@@ -306,6 +389,7 @@ def run_pullback_screener(
             "mode":          mode,
             "screener_type": "pullback",
             "tv_chart_url": f"https://www.tradingview.com/chart/?symbol={c['symbol']}",
+            "sector":        (c.get("sector") or "").strip(),
         })
 
     logger.info(
@@ -455,10 +539,20 @@ def _local_refinement(sym: str, v: dict, cfg: dict) -> dict | None:
     if w52_high and abs(pct_from_52wh) > cfg["52w_high_pct_max"]:
         return None
 
-    # Sector exclusion — block commodity/defensive/low-growth sectors
-    sector = (v.get("sector") or "").strip()
-    if cfg.get("excluded_sectors") and sector and sector in cfg["excluded_sectors"]:
+    # Sector exclusion — block commodity/defensive/low-growth sectors.
+    # Settings can use either GICS names ("Energy", "Consumer Defensive") or
+    # TV names ("Energy Minerals", "Consumer Non-Durables"). _resolved_excluded
+    # (precomputed in cfg) is a set of lowercase TV sector names; the TV column
+    # is capitalised so we must lower-case before comparing.
+    sector   = (v.get("sector") or "").strip()
+    industry = (v.get("industry") or "").strip()
+    excluded_tv         = cfg.get("_resolved_excluded") or set()
+    excluded_industries = cfg.get("_resolved_excluded_industries") or set()
+    if excluded_tv and sector and sector.lower() in excluded_tv:
         logger.debug("Pullback: %s skipped — excluded sector (%s)", sym, sector)
+        return None
+    if excluded_industries and industry and industry.lower() in excluded_industries:
+        logger.debug("Pullback: %s skipped — excluded industry (%s)", sym, industry)
         return None
 
     # Earnings date from TV (Unix timestamp → date, or None if unavailable)
@@ -896,7 +990,11 @@ def _score_candidates(
                         continue
                 else:
                     days_to_earnings = (next_earn - today).days
-                    if 0 <= days_to_earnings < cfg["earnings_days_min"]:
+                    # Block when next earnings is within the buffer window.
+                    # Negative values (stale/past dates from upstream) are also
+                    # blocked — a "next earnings" date that's already in the
+                    # past means the data is unreliable.
+                    if days_to_earnings < cfg["earnings_days_min"]:
                         logger.debug(
                             "Pullback: %s skipped — earnings in %d days (min=%d)",
                             sym, days_to_earnings, cfg["earnings_days_min"],

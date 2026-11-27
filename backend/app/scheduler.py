@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 from datetime import datetime
 
@@ -11,7 +12,20 @@ from .database import SessionLocal, get_setting, set_setting
 from .trader import run_monitor
 
 logger = logging.getLogger(__name__)
-scheduler = AsyncIOScheduler()
+scheduler = AsyncIOScheduler(
+    job_defaults={
+        # Prevent overlap of the same job (already APScheduler default, set
+        # explicitly so a future config change can't accidentally relax it).
+        "max_instances": 1,
+        # If the scheduler stalls or restarts, collapse all missed firings of
+        # an every-minute job into one — don't let a backlog avalanche the
+        # monitor or screener watchdogs.
+        "coalesce": True,
+        # Skip a missed job if it's >60s late by the time APScheduler gets to
+        # it — a stale "monday open at 9:35" should not fire at 10:30.
+        "misfire_grace_time": 60,
+    }
+)
 
 _ET = pytz.timezone("America/New_York")
 
@@ -21,25 +35,64 @@ async def _run_monitor_for_mode(admin_uid: int | None, mode: str) -> None:
     Runs the full monitor cycle (trailing stops → exit guard → slot fill) for
     one specific mode.  Uses an independent DB session so paper and live can
     run concurrently without sharing a connection.
+
+    check_post_close and reconcile_db_vs_alpaca are offloaded to a thread-pool
+    executor so they never block the asyncio event loop (each makes multiple
+    Alpaca API calls that could take 30-60 s).  APScheduler's max_instances=1
+    would otherwise see the watchdog still "running" on the next minute tick
+    and skip it — causing the "monitor not running every minute" symptom.
     """
+    from .position_manager import check_post_close, reconcile_db_vs_alpaca
+
     db = SessionLocal()
     try:
         result = await run_monitor(db, user_id=admin_uid, mode=mode)
-        if isinstance(result, dict) and result.get("status") == "error":
-            logger.error("Watchdog [%s]: monitor error — %s", mode, result.get("error"))
-        else:
-            logger.info(
-                "Watchdog [%s]: monitor done — portfolio=$%.0f positions=%d",
-                mode,
-                result.get("portfolio", 0),
-                len(result.get("results", [])),
-            )
-        from .position_manager import check_post_close
-        check_post_close(db, mode=mode)
     except Exception as exc:
         logger.error("Watchdog [%s]: monitor failed — %s", mode, exc, exc_info=True)
+        return
     finally:
         db.close()
+
+    if isinstance(result, dict) and result.get("status") == "error":
+        logger.error("Watchdog [%s]: monitor error — %s", mode, result.get("error"))
+        # Skip post-close and reconcile when the monitor itself errored
+        # (bad credentials, network failure, etc.) to avoid cascading errors.
+        return
+
+    logger.info(
+        "Watchdog [%s]: monitor done — portfolio=$%.0f positions=%d",
+        mode,
+        result.get("portfolio", 0) if isinstance(result, dict) else 0,
+        result.get("positions", 0) if isinstance(result, dict) else 0,
+    )
+
+    loop = asyncio.get_event_loop()
+
+    # check_post_close — own DB session, runs in thread pool
+    def _post_close():
+        _db = SessionLocal()
+        try:
+            check_post_close(_db, mode=mode)
+        except Exception as exc:
+            logger.error("Watchdog [%s]: check_post_close failed — %s", mode, exc)
+        finally:
+            _db.close()
+
+    # reconcile_db_vs_alpaca — own DB session, runs in thread pool
+    def _reconcile():
+        _db = SessionLocal()
+        try:
+            reconcile_db_vs_alpaca(_db, mode=mode, user_id=admin_uid)
+        except Exception as exc:
+            logger.error("Watchdog [%s]: reconciliation failed — %s", mode, exc)
+        finally:
+            _db.close()
+
+    await asyncio.gather(
+        loop.run_in_executor(None, _post_close),
+        loop.run_in_executor(None, _reconcile),
+        return_exceptions=True,
+    )
 
 
 async def _monitor_watchdog():
@@ -76,8 +129,25 @@ async def _monitor_watchdog():
         if now_et.weekday() > 4:
             logger.debug("Watchdog: weekend — skipping.")
             return
-        if not (9 <= now_et.hour < 16):
-            logger.debug("Watchdog: outside market hours (%s ET) — skipping.", now_et.strftime("%H:%M"))
+        # Market opens at 9:30 ET — don't fire before then.
+        # Firing at 9:00 would burn monitor_last_run on a closed market,
+        # delaying the first real cycle to 9:30 and wasting the Apex sync.
+        market_open_et = now_et.hour > 9 or (now_et.hour == 9 and now_et.minute >= 30)
+        if not (market_open_et and now_et.hour < 16):
+            logger.debug("Watchdog: outside trading hours (%s ET) — skipping.", now_et.strftime("%H:%M"))
+            return
+
+        # Pre-market OCO refresh fires at 9:28 and calls _ensure_exit_orders
+        # sequentially for every position — it can take 4-6 minutes to finish.
+        # If the watchdog fires at 9:30 while the refresh is still running, both
+        # call _ensure_exit_orders concurrently → OCO cancel/replace race that
+        # leaves positions with wrong targets for one or two cycles.
+        # Block the watchdog for the 9:28–9:37 window so the refresh can
+        # complete cleanly before the regular monitor cycle starts.
+        if now_et.hour == 9 and 28 <= now_et.minute <= 37:
+            logger.debug(
+                "Watchdog: pre-market refresh window (9:28–9:37 ET) — deferring to avoid OCO race."
+            )
             return
 
         interval = int(merged.get("monitor_interval_minutes", "30") or "30")
@@ -119,6 +189,79 @@ async def _monitor_watchdog():
     )
 
 
+async def _premarket_exit_refresh():
+    """
+    Fires at 9:28 ET Mon–Fri.
+    Refreshes all OCO exit orders for both paper and live before the market
+    opens. This ensures OCO targets reflect the current plan (T2, not T1)
+    so the software-managed T1 partial exit can work correctly on the open.
+    Without this, an OCO placed before the T2-targeting code change fires at
+    T1 price the instant the market opens — selling the full position before
+    the first monitor cycle has a chance to replace it.
+    """
+    db = SessionLocal()
+    try:
+        admin_row = db.execute(
+            text("SELECT id FROM users WHERE role = 'admin' ORDER BY id LIMIT 1")
+        ).fetchone()
+        if not admin_row:
+            return
+        admin_uid = admin_row[0]
+    finally:
+        db.close()
+
+    for mode in ("paper", "live"):
+        db = SessionLocal()
+        try:
+            from . import alpaca_client as alp
+            from .trader import _ensure_exit_orders
+            from .database import get_all_user_settings as _gaus, get_user_setting as _gus
+
+            merged = _gaus(db, admin_uid)
+            # Only refresh if auto_execute is on for this mode
+            auto_key = "live_auto_execute" if mode == "live" else "paper_auto_execute"
+            default  = "false" if mode == "live" else "true"   # live is opt-in; paper is opt-out
+            if merged.get(auto_key, default) != "true":
+                continue
+
+            # Guard: skip live refresh when no live credentials are configured.
+            # Avoids a noisy ERROR on every pre-market refresh for users who
+            # only run paper mode — the 401 from Alpaca is not an error, just
+            # "not set up yet".
+            if mode == "live":
+                live_key = _gus(db, "alpaca_live_key", "", admin_uid)
+                if not live_key:
+                    logger.debug(
+                        "Pre-market OCO refresh [live]: no live API key configured — skipping"
+                    )
+                    continue
+
+            positions    = alp.get_positions_for_user(db, admin_uid, mode)
+            open_orders  = alp.get_open_orders_by_symbol_for_user(db, admin_uid, mode)
+
+            if not positions:
+                continue
+
+            logger.info(
+                "Pre-market OCO refresh [%s]: checking %d position(s)",
+                mode, len(positions),
+            )
+            _ensure_exit_orders(db, positions, open_orders, mode, user_id=admin_uid)
+            logger.info("Pre-market OCO refresh [%s]: done", mode)
+
+        except Exception as exc:
+            exc_str = str(exc).lower()
+            if "unauthorized" in exc_str or '"401"' in exc_str or "401" in exc_str:
+                logger.warning(
+                    "Pre-market OCO refresh [%s]: Alpaca API returned unauthorized — "
+                    "verify API key and secret in Settings → Alpaca", mode,
+                )
+            else:
+                logger.error("Pre-market OCO refresh [%s] failed: %s", mode, exc)
+        finally:
+            db.close()
+
+
 async def _monday_open_job():
     """
     Fires once on Monday at 9:35 ET.
@@ -141,52 +284,86 @@ async def _monday_open_job():
             db.close()
 
 
+def _check_schedule_slots(db, prefix: str, now_et) -> str | None:
+    """
+    Check whether either schedule slot (primary or secondary) matches now_et.
+    Returns the run_key (YYYY-MM-DD HH:MM) if a slot fires and hasn't run yet,
+    or None if nothing should run.
+
+    Primary slot  : {prefix}_schedule_days  + {prefix}_schedule_times
+    Secondary slot: {prefix}_schedule_days_2 + {prefix}_schedule_times_2
+
+    Both slots share the same last-run key ({prefix}_last_auto_run) so a run
+    from either slot blocks the other for the same minute.
+    """
+    current_hm  = now_et.strftime("%H:%M")
+    current_day = now_et.weekday()
+    run_key     = now_et.strftime("%Y-%m-%d %H:%M")
+
+    last_run_key = f"{prefix}_last_auto_run"
+    if get_setting(db, last_run_key, "") == run_key:
+        return None  # already fired this minute
+
+    def _slot_matches(days_key: str, times_key: str, days_legacy_key: str | None, times_legacy_key: str | None) -> bool:
+        days_raw = get_setting(db, days_key, "").strip()
+        if days_raw:
+            try:
+                days = {int(d.strip()) for d in days_raw.split(",") if d.strip().isdigit()}
+            except ValueError:
+                return False
+        elif days_legacy_key:
+            try:
+                days = {int(get_setting(db, days_legacy_key, "-1"))}
+            except ValueError:
+                return False
+        else:
+            return False
+
+        if current_day not in days:
+            return False
+
+        times_raw = get_setting(db, times_key, "").strip()
+        if times_raw:
+            times = {t.strip() for t in times_raw.split(",") if t.strip()}
+        elif times_legacy_key:
+            t = get_setting(db, times_legacy_key, "").strip()
+            times = {t} if t else set()
+        else:
+            return False
+
+        return current_hm in times
+
+    slot1 = _slot_matches(
+        f"{prefix}_schedule_days",   f"{prefix}_schedule_times",
+        f"{prefix}_schedule_day" if prefix == "screener" else None,
+        f"{prefix}_schedule_time" if prefix == "screener" else None,
+    )
+    slot2 = _slot_matches(
+        f"{prefix}_schedule_days_2", f"{prefix}_schedule_times_2",
+        None, None,
+    )
+
+    if slot1 or slot2:
+        return run_key
+    return None
+
+
 async def _screener_watchdog():
     """
-    Runs every minute. Fires the screener when all conditions are met:
-      1. screener_auto_run == "true"
-      2. current ET weekday is in screener_schedule_days (comma-separated 0–6)
-         Falls back to legacy screener_schedule_day (single int) if not set.
-      3. current ET HH:MM is in screener_schedule_times (comma-separated)
-         Falls back to legacy screener_schedule_time if not set.
-    Tracks last run per slot (YYYY-MM-DD HH:MM) to prevent double-firing.
+    Runs every minute. Fires the Minervini screener when either schedule
+    slot matches (primary or secondary). Supports two independent day+time
+    pairs — e.g. weekdays at 16:30 and Sunday at 20:00.
+    Tracks last run per minute to prevent double-firing.
     """
     db = SessionLocal()
+    run_key = None
     try:
         if get_setting(db, "screener_auto_run", "true") != "true":
             return
 
-        now_et = datetime.now(_ET)
-
-        # ── Days: multi (new) → single legacy fallback ────────────────────────
-        days_raw = get_setting(db, "screener_schedule_days", "").strip()
-        if days_raw:
-            try:
-                schedule_days = {int(d.strip()) for d in days_raw.split(",") if d.strip().isdigit()}
-            except ValueError:
-                schedule_days = set()
-        else:
-            try:
-                schedule_days = {int(get_setting(db, "screener_schedule_day", "6"))}
-            except ValueError:
-                schedule_days = {6}
-
-        if now_et.weekday() not in schedule_days:
-            return
-
-        # ── Times: multi (new) → single legacy fallback ───────────────────────
-        times_raw = get_setting(db, "screener_schedule_times", "").strip()
-        if times_raw:
-            schedule_times = {t.strip() for t in times_raw.split(",") if t.strip()}
-        else:
-            schedule_times = {get_setting(db, "screener_schedule_time", "20:00")}
-
-        current_hm = now_et.strftime("%H:%M")
-        if current_hm not in schedule_times:
-            return
-
-        run_key = now_et.strftime("%Y-%m-%d %H:%M")
-        if get_setting(db, "screener_last_auto_run", "") == run_key:
+        now_et  = datetime.now(_ET)
+        run_key = _check_schedule_slots(db, "screener", now_et)
+        if not run_key:
             return
 
         set_setting(db, "screener_last_auto_run", run_key)
@@ -230,42 +407,18 @@ async def _screener_watchdog():
 
 async def _pb_screener_watchdog():
     """
-    Runs every minute. Fires the Pullback screener when all conditions are met:
-      1. pb_screener_auto_run == "true"
-      2. current ET weekday is in pb_screener_schedule_days (comma-separated 0–6)
-      3. current ET HH:MM is in pb_screener_schedule_times (comma-separated)
-    Tracks last run per slot (YYYY-MM-DD HH:MM) to prevent double-firing.
+    Fires every minute. Runs the Pullback screener when either schedule slot
+    matches (primary or secondary). Supports two independent day+time pairs.
     """
     db = SessionLocal()
+    run_key = None
     try:
         if get_setting(db, "pb_screener_auto_run", "true") != "true":
             return
 
-        now_et = datetime.now(_ET)
-
-        days_raw = get_setting(db, "pb_screener_schedule_days", "").strip()
-        if days_raw:
-            try:
-                schedule_days = {int(d.strip()) for d in days_raw.split(",") if d.strip().isdigit()}
-            except ValueError:
-                schedule_days = set()
-        else:
-            return  # no schedule configured — skip
-
-        if now_et.weekday() not in schedule_days:
-            return
-
-        times_raw = get_setting(db, "pb_screener_schedule_times", "").strip()
-        if not times_raw:
-            return  # no times configured — skip
-
-        schedule_times = {t.strip() for t in times_raw.split(",") if t.strip()}
-        current_hm = now_et.strftime("%H:%M")
-        if current_hm not in schedule_times:
-            return
-
-        run_key = now_et.strftime("%Y-%m-%d %H:%M")
-        if get_setting(db, "pb_screener_last_auto_run", "") == run_key:
+        now_et  = datetime.now(_ET)
+        run_key = _check_schedule_slots(db, "pb_screener", now_et)
+        if not run_key:
             return
 
         set_setting(db, "pb_screener_last_auto_run", run_key)
@@ -301,6 +454,118 @@ async def _pb_screener_watchdog():
         try:
             from . import telegram_alerts as tg
             tg.alert_system_error_sync("Pullback screener (scheduled)", exc)
+        except Exception:
+            pass
+    finally:
+        db2.close()
+
+
+async def _rs_screener_watchdog():
+    """
+    Fires every minute. Runs the RS Momentum screener when either schedule slot
+    matches (primary or secondary). Supports two independent day+time pairs.
+    """
+    db = SessionLocal()
+    run_key = None
+    try:
+        if get_setting(db, "rs_screener_auto_run", "true") != "true":
+            return
+
+        now_et  = datetime.now(_ET)
+        run_key = _check_schedule_slots(db, "rs_screener", now_et)
+        if not run_key:
+            return
+
+        set_setting(db, "rs_screener_last_auto_run", run_key)
+        set_setting(db, "screener_status", "running")
+        set_setting(db, "screener_error",  "")
+        db.commit()
+
+    finally:
+        db.close()
+
+    db2 = SessionLocal()
+    try:
+        from .rs_screener import run_rs_screener
+        from sqlalchemy import text as _text
+        admin_row = db2.execute(
+            _text("SELECT id FROM users WHERE role = 'admin' ORDER BY id LIMIT 1")
+        ).fetchone()
+        admin_id = admin_row[0] if admin_row else None
+
+        logger.info("Scheduled RS Momentum screener starting (%s ET)…", run_key)
+        plan = run_rs_screener(db2, user_id=admin_id)
+        set_setting(db2, "screener_status", "done")
+        set_setting(db2, "screener_count",  str(len(plan)))
+        logger.info("Scheduled RS Momentum screener done. %d stocks selected.", len(plan))
+    except Exception as exc:
+        logger.error("Scheduled RS Momentum screener failed: %s", exc)
+        db3 = SessionLocal()
+        try:
+            set_setting(db3, "screener_status", "error")
+            set_setting(db3, "screener_error",  str(exc)[:500])
+        finally:
+            db3.close()
+        try:
+            from . import telegram_alerts as tg
+            tg.alert_system_error_sync("RS Momentum screener (scheduled)", exc)
+        except Exception:
+            pass
+    finally:
+        db2.close()
+
+
+async def _combined_screener_watchdog():
+    """
+    Fires every minute. Runs all three screeners (Minervini + Pullback + RS)
+    in a single TV API call when either schedule slot matches.
+    Configured via combined_screener_schedule_days/times (slots 1 & 2).
+    This is the recommended primary weekly plan generator.
+    """
+    db = SessionLocal()
+    run_key = None
+    try:
+        if get_setting(db, "combined_screener_auto_run", "true") != "true":
+            return
+
+        now_et  = datetime.now(_ET)
+        run_key = _check_schedule_slots(db, "combined_screener", now_et)
+        if not run_key:
+            return
+
+        set_setting(db, "combined_screener_last_auto_run", run_key)
+        set_setting(db, "screener_status", "running")
+        set_setting(db, "screener_error",  "")
+        db.commit()
+
+    finally:
+        db.close()
+
+    db2 = SessionLocal()
+    try:
+        from .screener import run_both_screeners
+        from sqlalchemy import text as _text
+        admin_row = db2.execute(
+            _text("SELECT id FROM users WHERE role = 'admin' ORDER BY id LIMIT 1")
+        ).fetchone()
+        admin_id = admin_row[0] if admin_row else None
+
+        logger.info("Scheduled combined screener starting (%s ET)…", run_key)
+        results = run_both_screeners(db2, user_id=admin_id)
+        set_setting(db2, "screener_status", "done")
+        set_setting(db2, "screener_count",  str(len(results)))
+        logger.info("Scheduled combined screener done. %d stocks selected.", len(results))
+    except Exception as exc:
+        logger.error("Scheduled combined screener failed: %s", exc)
+        db3 = SessionLocal()
+        try:
+            set_setting(db3, "screener_status", "error")
+            set_setting(db3, "screener_error",  str(exc)[:500])
+        finally:
+            db3.close()
+        try:
+            from . import telegram_alerts as tg
+            tg.alert_system_error_sync("Combined screener (scheduled)", exc)
         except Exception:
             pass
     finally:
@@ -491,22 +756,49 @@ async def _dm_watchdog():
     now_et   = datetime.now(_ET)
     today    = now_et.strftime("%Y-%m-%d")
 
+    # Holiday + half-day guard. The DM rotation submits MOC orders, which
+    # Alpaca rejects after the per-day MOC cutoff (~10 min before the close).
+    # On a half-day the market closes at 13:00 ET, so this 15:30 ET fire is
+    # already past the cutoff and submitting would silently fail. Use
+    # Alpaca's clock as the source of truth — handles holidays, half-days,
+    # and DST in one shot.
+    try:
+        from . import alpaca_client as alp
+        clock = alp.get_clock("paper")
+        if not clock.is_open:
+            logger.info("DM watchdog: market closed (holiday?) — skipping.")
+            return
+        next_close = clock.next_close
+        if next_close is not None:
+            # next_close is a datetime; compute remaining minutes
+            try:
+                remaining_min = (next_close - datetime.now(next_close.tzinfo)).total_seconds() / 60
+            except Exception:
+                remaining_min = None
+            if remaining_min is not None and remaining_min < 20:
+                logger.info(
+                    "DM watchdog: only %.1f min until close (likely half-day) "
+                    "— past MOC cutoff, skipping.", remaining_min,
+                )
+                return
+    except Exception as exc:
+        logger.warning(
+            "DM watchdog: market-clock check failed (%s) — skipping to be safe.", exc,
+        )
+        return
+
     db = SessionLocal()
     try:
         from sqlalchemy import text as _text
         from .database import get_user_setting, set_user_setting
 
+        # Per-mode rows: each (user, mode) is evaluated independently using
+        # that mode's own settings JSONB. Settings used to live in
+        # user_settings (one shared copy across modes) — now they're scoped
+        # to each row's `settings` field.
         rows = db.execute(_text("""
-            SELECT sc.user_id, sc.auto_execute,
-                   COALESCE(us_day.value,  '1')        AS eval_day,
-                   COALESCE(us_freq.value, 'monthly')  AS frequency,
-                   COALESCE(us_vix.value,  '30')       AS vix_threshold,
-                   COALESCE(us_dd.value,   '10')       AS spy_drawdown_threshold
+            SELECT sc.user_id, sc.trading_mode, sc.auto_execute, sc.settings
             FROM strategy_config sc
-            LEFT JOIN user_settings us_day  ON us_day.user_id  = sc.user_id AND us_day.key  = 'dm_eval_day'
-            LEFT JOIN user_settings us_freq ON us_freq.user_id = sc.user_id AND us_freq.key = 'dm_eval_frequency'
-            LEFT JOIN user_settings us_vix  ON us_vix.user_id  = sc.user_id AND us_vix.key  = 'dm_vix_threshold'
-            LEFT JOIN user_settings us_dd   ON us_dd.user_id   = sc.user_id AND us_dd.key   = 'dm_spy_drawdown_threshold'
             WHERE sc.strategy_name = 'dual_momentum'
               AND sc.is_active = true
         """)).fetchall()
@@ -514,15 +806,19 @@ async def _dm_watchdog():
         if not rows:
             return
 
-        for user_id, auto_execute, eval_day_str, frequency, vix_thr_str, dd_thr_str in rows:
+        for user_id, row_mode, auto_execute, settings_json in rows:
+            cfg = settings_json if isinstance(settings_json, dict) else (json.loads(settings_json or "{}"))
             try:
-                eval_day        = max(1,   min(28,  int(eval_day_str   or "1")))
-                vix_threshold   = max(15,  min(80,  float(vix_thr_str  or "30")))
-                spy_drawdown    = max(3,   min(30,  float(dd_thr_str   or "10")))
-            except ValueError:
-                eval_day, vix_threshold, spy_drawdown = 1, 30.0, 10.0
+                eval_day      = max(1,   min(28,  int(cfg.get("eval_day", 1) or 1)))
+                frequency     = cfg.get("eval_frequency", "monthly")
+                vix_threshold = max(15,  min(80,  float(cfg.get("vix_threshold", 30) or 30)))
+                spy_drawdown  = max(3,   min(30,  float(cfg.get("spy_drawdown_threshold", 10) or 10)))
+            except (ValueError, TypeError):
+                eval_day, frequency, vix_threshold, spy_drawdown = 1, "monthly", 30.0, 10.0
 
-            last_eval_date = get_user_setting(db, "dm_last_eval_date", "", user_id)
+            # Last-eval markers are per-(user, mode) so paper and live track
+            # independently (paper can re-eval without affecting live).
+            last_eval_date = get_user_setting(db, f"dm_last_eval_date_{row_mode}", "", user_id)
 
             # ── A: Scheduled frequency ────────────────────────────────────────
             scheduled = False
@@ -547,7 +843,7 @@ async def _dm_watchdog():
                 else:
                     scheduled = True
             else:  # monthly
-                last_month = get_user_setting(db, "dm_last_eval_month", "", user_id)
+                last_month = get_user_setting(db, f"dm_last_eval_month_{row_mode}", "", user_id)
                 this_month = now_et.strftime("%Y-%m")
                 scheduled  = (last_month != this_month) and (now_et.day >= eval_day)
 
@@ -561,8 +857,9 @@ async def _dm_watchdog():
 
             reason = cb_reason if cb_triggered else f"{frequency} schedule"
 
-            # Always follow the user's global trading mode
-            mode = get_user_setting(db, "trading_mode", "paper", user_id)
+            # Use the row's own trading_mode — paper rows eval against paper
+            # account, live rows against live, regardless of UI's current view.
+            mode = row_mode
 
             # Bug #6: check dedicated keys BEFORE running evaluation
             from .routes.strategies import _dm_has_dedicated_keys
@@ -637,6 +934,17 @@ async def _dm_watchdog():
                 signal["trigger"] = reason
                 _save_signal(db, user_id, STRATEGY_DM, signal, ai_decision, mode)
 
+                # Cache the recommended symbol so the pre-trade gate can veto
+                # new equity entries without a live network call (fail-open if
+                # DM has never run or DB write fails).
+                try:
+                    from .database import set_setting as _set_global
+                    _set_global(db, "dm_recommended_symbol", signal.get("recommended_symbol", ""))
+                    db.commit()
+                except Exception as _dm_cache_exc:
+                    db.rollback()
+                    logger.debug("DM eval: failed to cache dm_recommended_symbol: %s", _dm_cache_exc)
+
                 logger.info("DM eval complete: user %d → %s [%s] (trigger: %s)",
                             user_id, ai_decision.get("decision"),
                             signal.get("recommended_symbol"), reason)
@@ -651,12 +959,131 @@ async def _dm_watchdog():
         db.close()
 
 
+async def _pead_screener_watchdog():
+    """
+    Fires every minute. Runs the PEAD screener when the configured schedule
+    slot matches. Schedule is controlled via pead_screener_schedule_days/times
+    settings (default Mon–Fri at 17:00 ET, shortly after market close).
+    """
+    db = SessionLocal()
+    run_key = None
+    admin_uid = None
+    try:
+        # Resolve admin user first so we can read user-scoped settings
+        admin_row = db.execute(
+            text("SELECT id FROM users WHERE role='admin' ORDER BY id LIMIT 1")
+        ).fetchone()
+        admin_uid = admin_row[0] if admin_row else None
+
+        # Check both the master enable toggle (pead_screener_enabled) and the
+        # auto-run schedule toggle (pead_screener_auto_run) — both must be true.
+        # Use user-scoped settings so the toggle in SettingsPanel is respected.
+        # Logic matches _load_pead_settings: disabled only when explicitly set to
+        # "false" or "0"; default "true" (unset) means enabled.
+        from .database import get_user_setting as _gus
+        if _gus(db, "pead_screener_enabled",  "true", admin_uid) in ("false", "0"):
+            return
+        if _gus(db, "pead_screener_auto_run", "true", admin_uid) in ("false", "0"):
+            return
+
+        now_et  = datetime.now(_ET)
+        run_key = _check_schedule_slots(db, "pead_screener", now_et)
+        if not run_key:
+            return
+
+        set_setting(db, "pead_screener_last_auto_run", run_key)
+        set_setting(db, "screener_status", "running")
+        set_setting(db, "screener_phase",  "PEAD: scanning for gaps…")
+        set_setting(db, "screener_error",  "")
+        db.commit()
+
+    finally:
+        db.close()
+
+    if not run_key:
+        return
+
+    if admin_uid is None:
+        logger.warning("PEAD screener: no admin user found — skipping.")
+        return
+
+    db2 = SessionLocal()
+    try:
+        from .pead_screener import scan_pead_opportunities
+        from .database import get_user_setting
+
+        total_picks = 0
+        had_error   = False
+        for mode in ("paper", "live"):
+            try:
+                if mode == "live":
+                    live_key = get_user_setting(db2, "alpaca_live_key", "", admin_uid)
+                    if not live_key:
+                        continue
+
+                logger.info("Scheduled PEAD screener starting [%s] (%s ET)…", mode, run_key)
+                picks = scan_pead_opportunities(db2, mode, user_id=admin_uid)
+                logger.info("Scheduled PEAD screener [%s]: %d picks saved.", mode, len(picks))
+                total_picks += len(picks)
+
+                if picks:
+                    try:
+                        from . import telegram_alerts as tg
+                        tg.send_sync(
+                            f"*PEAD Screener* [{mode.upper()}] — {len(picks)} setup(s) found\n\n"
+                            + "\n".join(
+                                f"• *{p['symbol']}*  gap +{p['gap_pct']*100:.1f}%  "
+                                f"vol {p['volume_ratio']:.1f}×  "
+                                f"R:R {p['rr']:.1f}×  stop ${p['stop_price']:.2f}"
+                                for p in picks
+                            ),
+                            level="INFO",
+                        )
+                    except Exception:
+                        pass
+
+            except Exception as exc:
+                had_error = True
+                logger.error("Scheduled PEAD screener [%s] failed: %s", mode, exc)
+
+        final_status = "error" if had_error and total_picks == 0 else "done"
+        set_setting(db2, "screener_status", final_status)
+        set_setting(db2, "screener_phase",  f"PEAD done — {total_picks} setup(s) found.")
+        db2.commit()
+
+    except Exception as exc:
+        logger.error("Scheduled PEAD screener failed: %s", exc)
+        try:
+            set_setting(db2, "screener_status", "error")
+            set_setting(db2, "screener_error",  str(exc)[:500])
+            db2.commit()
+        except Exception:
+            pass
+        try:
+            from . import telegram_alerts as tg
+            tg.alert_system_error_sync("PEAD screener (scheduled)", exc)
+        except Exception:
+            pass
+    finally:
+        db2.close()
+
+
 def start_scheduler():
     # Watchdog fires every minute — interval is controlled by monitor_interval_minutes setting
     scheduler.add_job(
         _monitor_watchdog,
         CronTrigger(minute="*"),
         id="sepa_monitor",
+        replace_existing=True,
+    )
+
+    # Mon–Fri 9:28 AM ET — refresh all OCO exit orders before the market opens.
+    # Ensures OCO targets reflect the current plan (T2, not T1) so the
+    # software-managed T1 partial exit works correctly from the first tick.
+    scheduler.add_job(
+        _premarket_exit_refresh,
+        CronTrigger(day_of_week="mon-fri", hour=9, minute=28, timezone="America/New_York"),
+        id="premarket_exit_refresh",
         replace_existing=True,
     )
 
@@ -683,6 +1110,24 @@ def start_scheduler():
         _pb_screener_watchdog,
         CronTrigger(minute="*"),
         id="pb_screener_watchdog",
+        replace_existing=True,
+    )
+
+    # Watchdog checks every minute whether it's time to run the RS Momentum screener
+    # (uses rs_screener_schedule_days/times settings)
+    scheduler.add_job(
+        _rs_screener_watchdog,
+        CronTrigger(minute="*"),
+        id="rs_screener_watchdog",
+        replace_existing=True,
+    )
+
+    # Watchdog for the combined screener (all 3 strategies, single TV call)
+    # (uses combined_screener_schedule_days/times settings)
+    scheduler.add_job(
+        _combined_screener_watchdog,
+        CronTrigger(minute="*"),
+        id="combined_screener_watchdog",
         replace_existing=True,
     )
 
@@ -716,6 +1161,16 @@ def start_scheduler():
         _ira_watchdog,
         CronTrigger(day_of_week="mon-fri", hour=10, minute=30, timezone="America/New_York"),
         id="ira_watchdog",
+        replace_existing=True,
+    )
+
+    # PEAD screener watchdog — fires every minute, schedule controlled by
+    # pead_screener_schedule_days / pead_screener_schedule_times settings.
+    # Default: Mon–Fri at 17:00 ET (shortly after market close).
+    scheduler.add_job(
+        _pead_screener_watchdog,
+        CronTrigger(minute="*"),
+        id="pead_screener_watchdog",
         replace_existing=True,
     )
 

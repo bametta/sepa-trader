@@ -1,9 +1,21 @@
+import logging
 import httpx
 from .config import settings
 
+logger = logging.getLogger(__name__)
+
+_warned_unconfigured = False
+
 
 def _build_request(message: str, level: str) -> tuple[str, dict] | None:
+    global _warned_unconfigured
     if not settings.telegram_bot_token or not settings.telegram_chat_id:
+        if not _warned_unconfigured:
+            logger.warning(
+                "Telegram alerts disabled: bot token or chat_id not configured. "
+                "Operator will not receive URGENT/OPPORTUNITY notifications."
+            )
+            _warned_unconfigured = True
         return None
     emoji = {"URGENT": "🚨", "OPPORTUNITY": "🟢", "INFO": "ℹ️"}.get(level, "📊")
     text  = f"{emoji} *SEPA Monitor*\n\n{message}"
@@ -20,8 +32,12 @@ async def send(message: str, level: str = "INFO") -> bool:
     try:
         async with httpx.AsyncClient(timeout=10) as client:
             r = await client.post(url, json=data)
-            return r.status_code == 200
-    except Exception:
+            if r.status_code != 200:
+                logger.error("Telegram send failed [%s]: HTTP %s — %s", level, r.status_code, r.text[:200])
+                return False
+            return True
+    except Exception as exc:
+        logger.error("Telegram send exception [%s]: %s", level, exc)
         return False
 
 
@@ -35,8 +51,12 @@ def send_sync(message: str, level: str = "INFO") -> bool:
     try:
         with httpx.Client(timeout=10) as client:
             r = client.post(url, json=data)
-            return r.status_code == 200
-    except Exception:
+            if r.status_code != 200:
+                logger.error("Telegram send_sync failed [%s]: HTTP %s — %s", level, r.status_code, r.text[:200])
+                return False
+            return True
+    except Exception as exc:
+        logger.error("Telegram send_sync exception [%s]: %s", level, exc)
         return False
 
 
@@ -56,12 +76,47 @@ async def alert_breakout(symbols: list[str], mode: str):
     )
 
 
-async def alert_trade(action: str, symbol: str, qty: float, price: float, trigger: str, mode: str):
-    await send(
+async def alert_trade(
+    action: str,
+    symbol: str,
+    qty: float,
+    price: float,
+    trigger: str,
+    mode: str,
+    ai_verdict: str | None = None,
+    ai_reason: str | None = None,
+):
+    body = (
         f"*TRADE EXECUTED* [{mode.upper()}]\n\n"
-        f"Action: `{action}`\nSymbol: `{symbol}`\nQty: `{qty}`\nPrice: `${price:.2f}`\nTrigger: `{trigger}`",
-        level="INFO",
+        f"Action: `{action}`\nSymbol: `{symbol}`\nQty: `{qty}`\nPrice: `${price:.2f}`\nTrigger: `{trigger}`"
     )
+    if ai_verdict:
+        body += f"\n\n*AI gate:* `{ai_verdict}`"
+        if ai_reason:
+            body += f"\n_{ai_reason[:200]}_"
+    await send(body, level="INFO")
+
+
+def alert_trade_sync(
+    action: str,
+    symbol: str,
+    qty: float,
+    price: float,
+    trigger: str,
+    mode: str,
+    ai_verdict: str | None = None,
+    ai_reason: str | None = None,
+) -> bool:
+    """Sync trade alert for non-async call sites (monitor loop, position_manager)."""
+    body = (
+        f"*TRADE EXECUTED* [{mode.upper()}]\n\n"
+        f"Action: `{action}`\nSymbol: `{symbol}`\nQty: `{qty}`\nPrice: `${price:.2f}`\nTrigger: `{trigger}`"
+    )
+    if ai_verdict:
+        body += f"\n\n*AI gate:* `{ai_verdict}`"
+        if ai_reason:
+            body += f"\n_{ai_reason[:200]}_"
+    return send_sync(body, level="INFO")
 
 
 def alert_system_error_sync(context: str, error: str | Exception, level: str = "URGENT") -> bool:

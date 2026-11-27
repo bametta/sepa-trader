@@ -2,10 +2,11 @@ import { useState, useEffect, useRef } from 'react'
 import { useQuery, useQueryClient } from 'react-query'
 import {
   fetchWeeklyPlan, fetchWeeklyDD, forceRefreshDD, fetchScreenerStatus,
-  runScreener, runMinerviniScreener, runPullbackScreener,
+  runScreener, runMinerviniScreener, runPullbackScreener, runRsScreener, runPeadScreener,
   exportWatchlist, updatePlanStatus,
   fetchAnalyses, runAnalysis, fetchSettings,
   fetchWeeklyNews,
+  forceBuySymbol,
 } from '../api/client'
 import TapeCheck from './TapeCheck'
 
@@ -14,6 +15,8 @@ const SIGNAL_STYLE = {
   PULLBACK_EMA20: 'bg-cyan-500/20 text-cyan-300 border border-cyan-500/30',
   PULLBACK_EMA50: 'bg-blue-500/20 text-blue-300 border border-blue-500/30',
   STAGE2_WATCH:   'bg-yellow-500/20 text-yellow-300 border border-yellow-500/30',
+  RS_MOMENTUM:    'bg-teal-500/20 text-teal-300 border border-teal-500/30',
+  PEAD_DRIFT:     'bg-violet-500/20 text-violet-300 border border-violet-500/30',
   NO_SETUP:       'bg-red-500/20 text-red-400 border border-red-500/30',
 }
 
@@ -42,9 +45,11 @@ function pctColor(n) {
 }
 
 const SCREENER_BADGE = {
-  minervini: { label: 'Minervini',      cls: 'bg-indigo-500/15 text-indigo-300 border border-indigo-500/20' },
-  pullback:  { label: 'Pullback MA',    cls: 'bg-cyan-500/15   text-cyan-300   border border-cyan-500/20'   },
-  both:      { label: 'Both screeners', cls: 'bg-violet-500/15 text-violet-300 border border-violet-500/20' },
+  minervini:   { label: 'Minervini',      cls: 'bg-indigo-500/15 text-indigo-300 border border-indigo-500/20' },
+  pullback:    { label: 'Pullback MA',    cls: 'bg-cyan-500/15   text-cyan-300   border border-cyan-500/20'   },
+  both:        { label: 'Both screeners', cls: 'bg-violet-500/15 text-violet-300 border border-violet-500/20' },
+  rs_momentum: { label: 'RS Momentum',   cls: 'bg-teal-500/15   text-teal-300   border border-teal-500/20'   },
+  pead:        { label: 'PEAD',          cls: 'bg-violet-500/15 text-violet-300 border border-violet-500/25' },
 }
 
 export default function WeeklyPlan() {
@@ -246,22 +251,22 @@ export default function WeeklyPlan() {
             {syncing ? 'Exporting…' : '↓ TV Watchlist'}
           </button>
 
-          {/* Dropdown-style split run button */}
+          {/* Split run button: Run All + individual screeners */}
           <div className="flex rounded-lg overflow-hidden border border-accent/30">
             <button
               onClick={handleRunScreener}
               disabled={running}
               className="px-3 py-1.5 text-sm font-medium bg-accent hover:bg-indigo-500 text-white disabled:opacity-50 transition-colors flex items-center gap-2"
-              title="Run both screeners"
+              title="Run all three screeners (Minervini + Pullback + RS Momentum)"
             >
               {running && <span className="inline-block w-3 h-3 border-2 border-white border-t-transparent rounded-full animate-spin" />}
-              {running ? 'Scanning…' : 'Run Both'}
+              {running ? 'Scanning…' : 'Run All'}
             </button>
             <button
               onClick={async () => { setRunning(true); setMsg(null); setElapsed(0); try { await runMinerviniScreener(); refetchStatus() } catch(e) { setRunning(false); setMsg(e?.response?.data?.detail || 'Failed'); setMsgType('error') } }}
               disabled={running}
               className="px-2 py-1.5 text-xs font-medium bg-accent/70 hover:bg-indigo-600 text-white/80 disabled:opacity-50 transition-colors border-l border-white/10"
-              title="Run Minervini only"
+              title="Run Minervini (SEPA) only"
             >MIN</button>
             <button
               onClick={async () => { setRunning(true); setMsg(null); setElapsed(0); try { await runPullbackScreener(); refetchStatus() } catch(e) { setRunning(false); setMsg(e?.response?.data?.detail || 'Failed'); setMsgType('error') } }}
@@ -269,6 +274,18 @@ export default function WeeklyPlan() {
               className="px-2 py-1.5 text-xs font-medium bg-cyan-700/80 hover:bg-cyan-600 text-white/80 disabled:opacity-50 transition-colors border-l border-white/10"
               title="Run Pullback-to-MA only"
             >PB</button>
+            <button
+              onClick={async () => { setRunning(true); setMsg(null); setElapsed(0); try { await runRsScreener(); refetchStatus() } catch(e) { setRunning(false); setMsg(e?.response?.data?.detail || 'Failed'); setMsgType('error') } }}
+              disabled={running}
+              className="px-2 py-1.5 text-xs font-medium bg-emerald-700/80 hover:bg-emerald-600 text-white/80 disabled:opacity-50 transition-colors border-l border-white/10"
+              title="Run RS Momentum only"
+            >RS</button>
+            <button
+              onClick={async () => { setRunning(true); setMsg(null); setElapsed(0); try { await runPeadScreener(); refetchStatus() } catch(e) { setRunning(false); setMsg(e?.response?.data?.detail || 'Failed'); setMsgType('error') } }}
+              disabled={running}
+              className="px-2 py-1.5 text-xs font-medium bg-violet-700/80 hover:bg-violet-600 text-white/80 disabled:opacity-50 transition-colors border-l border-white/10"
+              title="Run PEAD (Post-Earnings Drift) screener only"
+            >PEAD</button>
           </div>
         </div>
       </div>
@@ -346,6 +363,7 @@ export default function WeeklyPlan() {
               ddLoading={ddLoading}
               news={newsMap[row.symbol] || []}
               onStatusChange={handleStatus}
+              onForceBuy={() => qc.invalidateQueries('weeklyPlan')}
               tvLayoutId={tvLayoutId}
             />
           ))}
@@ -395,10 +413,28 @@ const AI_DECISION_META = {
   SKIP:    { label: 'Skip',    cls: 'bg-red-500/20     text-red-300     border border-red-500/30'     },
 }
 
-function PlanCard({ row, dd, ddLoading, news = [], onStatusChange, tvLayoutId }) {
+function PlanCard({ row, dd, ddLoading, news = [], onStatusChange, onForceBuy, tvLayoutId }) {
   const [expanded, setExpanded]   = useState(false)
   const [ddOpen, setDdOpen]       = useState(false)
   const [newsOpen, setNewsOpen]   = useState(false)
+  const [buying, setBuying]       = useState(false)
+  const [buyResult, setBuyResult] = useState(null)   // { ok, msg }
+
+  const handleForceBuy = async () => {
+    if (!window.confirm(`Force buy ${row.symbol} at $${Number(row.entry_price).toFixed(2)}?\nThis bypasses the position cap but still runs the AI gate.`)) return
+    setBuying(true)
+    setBuyResult(null)
+    try {
+      const res = await forceBuySymbol(row.symbol)
+      setBuyResult({ ok: true, msg: `Placed: ${res.order} (${res.qty} sh)` })
+      if (onForceBuy) onForceBuy(row.symbol)
+    } catch (err) {
+      const detail = err?.response?.data?.detail || err?.message || 'Unknown error'
+      setBuyResult({ ok: false, msg: detail })
+    } finally {
+      setBuying(false)
+    }
+  }
 
   const tvUrl = tvLayoutId
     ? `https://www.tradingview.com/chart/${tvLayoutId}/?symbol=${row.symbol}`
@@ -443,7 +479,7 @@ function PlanCard({ row, dd, ddLoading, news = [], onStatusChange, tvLayoutId })
             {row.screener_type === 'rs_momentum' ? (
               <span>RS <strong className="text-slate-200">{row.score}th</strong></span>
             ) : (
-              <span>Score <strong className="text-slate-200">{row.score}/6</strong></span>
+              <span>Score <strong className="text-slate-200">{row.score}/8</strong></span>
             )}
             <span>Entry <strong className="text-slate-200">${Number(row.entry_price).toFixed(2)}</strong></span>
             <span>Stop <strong className="text-red-400">${Number(row.stop_price).toFixed(2)}</strong></span>
@@ -483,7 +519,7 @@ function PlanCard({ row, dd, ddLoading, news = [], onStatusChange, tvLayoutId })
             <p className="text-xs text-slate-400 leading-relaxed">{row.rationale}</p>
           )}
 
-          <div className="flex gap-2 pt-1">
+          <div className="flex flex-wrap gap-2 pt-1 items-center">
             {['PENDING', 'EXECUTED', 'PARTIAL', 'SKIPPED'].map(s => (
               <button
                 key={s}
@@ -495,7 +531,23 @@ function PlanCard({ row, dd, ddLoading, news = [], onStatusChange, tvLayoutId })
                 {s}
               </button>
             ))}
+
+            {row.status === 'PENDING' && (
+              <button
+                onClick={handleForceBuy}
+                disabled={buying}
+                className="text-xs px-3 py-1 rounded-md font-semibold bg-amber-500/20 text-amber-300 border border-amber-500/30 hover:bg-amber-500/35 disabled:opacity-50 disabled:cursor-not-allowed transition-colors ml-auto"
+              >
+                {buying ? 'Placing…' : 'Force Buy'}
+              </button>
+            )}
           </div>
+
+          {buyResult && (
+            <p className={`text-xs px-2 py-1 rounded-md ${buyResult.ok ? 'bg-emerald-500/15 text-emerald-300' : 'bg-red-500/15 text-red-400'}`}>
+              {buyResult.ok ? '✓' : '✗'} {buyResult.msg}
+            </p>
+          )}
 
           <button
             onClick={() => setDdOpen(o => !o)}

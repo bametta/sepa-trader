@@ -74,6 +74,7 @@ _COLS = [
     "volume",
     "average_volume_30d_calc",
     "sector",
+    "industry",
 ]
 
 
@@ -170,6 +171,271 @@ def analyze(symbol: str, db=None) -> dict:
     return batch_analyze([symbol], db=db).get(symbol, {"signal": "ERROR", "score": 0, "price": None})
 
 
+# Full column set for the unified scan — same fields batch_analyze fetches via
+# symbol lookup, plus market_cap_basic for the pre-filter sort.
+_SCAN_COLS = [
+    "close", "EMA20", "EMA50", "EMA100", "EMA200", "SMA200",
+    "volume", "average_volume_30d_calc", "market_cap_basic",
+    "sector", "industry",
+]
+
+# Mega scan column set: superset covering all three screeners in one TV call.
+# Minervini needs: close, EMA20/50/100/200, SMA200, volume, avg_vol, market_cap, sector, industry
+# Pullback adds:   RSI, ADX, price_52_week_high, earnings_release_next_date, Perf.1M, Perf.3M
+# RS Momentum adds: Perf.6M, Perf.Y, exchange
+_MEGA_COLS = [
+    "close",
+    "EMA20",
+    "EMA50",
+    "EMA100",
+    "EMA200",
+    "SMA200",
+    "volume",
+    "average_volume_30d_calc",
+    "market_cap_basic",
+    "sector",
+    "industry",
+    "exchange",
+    "RSI",
+    "ADX",
+    "price_52_week_high",
+    "earnings_release_next_date",
+    "Perf.1M",
+    "Perf.3M",
+    "Perf.6M",
+    "Perf.Y",
+]
+
+
+def scan_universe_mega(
+    price_min: float = 5.0,
+    price_max: float = 0.0,
+    exchanges: list | None = None,
+    max_results: int = 1500,
+    db=None,
+) -> dict[str, dict]:
+    """Single TradingView scan covering all three screeners (Minervini, Pullback, RS).
+
+    Uses the broadest possible server-side filter — price, volume, market cap,
+    and exchange only. No strategy-specific EMA ladder or RSI filters are applied
+    server-side so the same dataset can feed all three screeners for their own
+    local filtering passes.
+
+    Returns {symbol: raw_vals_dict} with all _MEGA_COLS fields present.
+    Empty dict on failure so callers fall back to individual TV calls.
+    """
+    global _tv_cookie
+    floor_price = max(5.0, price_min or 0)
+    filters: list[dict] = [
+        {"left": "close",                   "operation": "egreater", "right": floor_price},
+        {"left": "average_volume_30d_calc", "operation": "egreater", "right": 500_000},
+        {"left": "market_cap_basic",        "operation": "egreater", "right": 300_000_000},
+        {"left": "exchange", "operation": "in_range",
+         "right": exchanges or ["NYSE", "NASDAQ"]},
+    ]
+    if price_max and price_max > 0:
+        filters.append({"left": "close", "operation": "eless", "right": price_max})
+
+    def _do_request(cookie: str = ""):
+        headers = dict(_TV_HEADERS)
+        if cookie:
+            headers["Cookie"] = cookie
+        return httpx.post(
+            SCAN_URL,
+            json={
+                "filter":  filters,
+                "columns": _MEGA_COLS,
+                "range":   [0, max_results],
+                "sort":    {"sortBy": "average_volume_30d_calc", "sortOrder": "desc"},
+                "markets": ["america"],
+            },
+            timeout=60,
+            headers=headers,
+        )
+
+    try:
+        resp = _do_request(_tv_cookie)
+        if resp.status_code == 401:
+            _tv_cookie = ""
+            fresh = _get_tv_cookie(db)
+            if fresh:
+                _tv_cookie = fresh
+                resp = _do_request(_tv_cookie)
+            else:
+                logger.warning("scan_universe_mega: TV 401 and no credentials — returning empty")
+                return {}
+        if resp.status_code == 401:
+            logger.warning("scan_universe_mega: TV 401 even after auth — returning empty")
+            return {}
+        if not resp.is_success:
+            logger.warning("scan_universe_mega: TV returned %d — returning empty", resp.status_code)
+            return {}
+    except Exception as exc:
+        logger.error("scan_universe_mega: request failed: %s", exc)
+        return {}
+
+    rows = resp.json().get("data") or []
+    result: dict[str, dict] = {}
+    for row in rows:
+        try:
+            sym  = row["s"].split(":")[-1]
+            vals = dict(zip(_MEGA_COLS, row["d"]))
+            result[sym] = vals
+        except (KeyError, IndexError, TypeError):
+            continue
+
+    logger.info(
+        "scan_universe_mega: %d symbols fetched (%d columns each, max_results=%d)",
+        len(result), len(_MEGA_COLS), max_results,
+    )
+    return result
+
+
+def score_mega_for_minervini(
+    mega_data: dict[str, dict],
+    vol_surge_pct: float = 40.0,
+    ema20_pct: float = 2.0,
+    ema50_pct: float = 3.0,
+) -> dict[str, dict]:
+    """Apply Minervini Stage-2 pre-filter and SEPA scoring to pre-fetched mega data.
+
+    Replicates the server-side Stage-2 ladder (close > EMA50 > EMA100 > EMA200)
+    that scan_and_score_universe applies — using EMA columns as a proxy for the
+    SMA50/SMA150/SMA200 TV server-side check. In practice EMA ≈ SMA for liquid
+    large-caps, so the difference is negligible.
+
+    Returns {symbol: sepa_result} in the same format as scan_and_score_universe().
+    """
+    results: dict[str, dict] = {}
+    for sym, vals in mega_data.items():
+        close = vals.get("close") or 0.0
+        e50   = vals.get("EMA50")  or 0.0
+        e100  = vals.get("EMA100") or 0.0
+        e200  = vals.get("EMA200") or 0.0
+        # Stage-2 approximation using EMA ladder (server-side uses SMA50>SMA150>SMA200)
+        if not (close > 0 and e50 > 0 and e100 > 0 and e200 > 0):
+            continue
+        if not (close > e50 and e50 > e100 and e100 > e200):
+            continue
+        results[sym] = _score_sepa(sym, vals, vol_surge_pct, ema20_pct, ema50_pct)
+    logger.info(
+        "score_mega_for_minervini: %d of %d passed Stage-2 pre-filter",
+        len(results), len(mega_data),
+    )
+    return results
+
+
+def scan_and_score_universe(
+    price_min: float = 0.0,
+    price_max: float = 0.0,
+    excluded_sectors: set | None = None,
+    excluded_industries: set | None = None,
+    exchanges: list | None = None,
+    max_results: int = 1500,
+    vol_surge_pct: float = 40.0,
+    ema20_pct: float = 2.0,
+    ema50_pct: float = 3.0,
+    db=None,
+) -> dict[str, dict]:
+    """Single TV scanner call: filter the full exchange, fetch SEPA columns,
+    and score everything — replaces the old two-call flow (universe fetch +
+    batch_analyze). Returns {symbol: result_dict} in the same format as
+    batch_analyze().
+
+    Server-side filters applied:
+      • price ≥ max($5, price_min)
+      • 30-day avg volume ≥ 500k
+      • market cap ≥ $300M
+      • exchange in NYSE / NASDAQ (or override)
+      • Stage-2 trend ladder: close > SMA50 > SMA150 > SMA200
+
+    Sector / industry exclusion and SEPA scoring are done client-side on the
+    returned rows so every Stage-2 candidate on the exchange is evaluated.
+    """
+    floor_price = max(5.0, price_min or 0)
+    filters: list[dict] = [
+        {"left": "close",                   "operation": "egreater", "right": floor_price},
+        {"left": "average_volume_30d_calc", "operation": "egreater", "right": 500_000},
+        {"left": "market_cap_basic",        "operation": "egreater", "right": 300_000_000},
+        {"left": "exchange", "operation": "in_range",
+         "right": exchanges or ["NYSE", "NASDAQ"]},
+        # Stage-2 trend ladder — pre-filter to structural candidates only
+        {"left": "close",  "operation": "greater", "right": "SMA50"},
+        {"left": "SMA50",  "operation": "greater", "right": "SMA150"},
+        {"left": "SMA150", "operation": "greater", "right": "SMA200"},
+    ]
+    if price_max and price_max > 0:
+        filters.append({"left": "close", "operation": "eless", "right": price_max})
+
+    def _do_request(cookie: str = ""):
+        headers = dict(_TV_HEADERS)
+        if cookie:
+            headers["Cookie"] = cookie
+        return httpx.post(
+            SCAN_URL,
+            json={
+                "filter":  filters,
+                "columns": _SCAN_COLS,
+                "range":   [0, max_results],
+                "sort":    {"sortBy": "average_volume_30d_calc", "sortOrder": "desc"},
+                "markets": ["america"],
+            },
+            timeout=60,
+            headers=headers,
+        )
+
+    global _tv_cookie
+    try:
+        resp = _do_request(_tv_cookie)
+        if resp.status_code == 401:
+            _tv_cookie = ""
+            fresh = _get_tv_cookie(db)
+            if fresh:
+                _tv_cookie = fresh
+                resp = _do_request(_tv_cookie)
+            else:
+                logger.warning("scan_and_score_universe: TV 401 and no credentials — returning empty")
+                return {}
+        if resp.status_code == 401:
+            logger.warning("scan_and_score_universe: TV 401 even after auth — returning empty")
+            return {}
+        if not resp.is_success:
+            logger.warning("scan_and_score_universe: TV returned %d — returning empty", resp.status_code)
+            return {}
+    except Exception as exc:
+        logger.error("scan_and_score_universe: request failed: %s", exc)
+        return {}
+
+    rows = resp.json().get("data") or []
+    excluded_sectors    = excluded_sectors    or set()
+    excluded_industries = excluded_industries or set()
+
+    results: dict[str, dict] = {}
+    skipped = 0
+    for row in rows:
+        try:
+            full_sym = row["s"]
+            vals     = dict(zip(_SCAN_COLS, row["d"]))
+        except (KeyError, IndexError, TypeError):
+            continue
+        sector   = (vals.get("sector")   or "").strip()
+        industry = (vals.get("industry") or "").strip()
+        if excluded_sectors    and sector.lower()   in excluded_sectors:
+            skipped += 1
+            continue
+        if excluded_industries and industry.lower() in excluded_industries:
+            skipped += 1
+            continue
+        sym = full_sym.split(":")[-1]
+        results[sym] = _score_sepa(sym, vals, vol_surge_pct, ema20_pct, ema50_pct)
+
+    logger.info(
+        "scan_and_score_universe: %d from TV, %d sector-skipped, %d scored (max_results=%d)",
+        len(rows), skipped, len(results), max_results,
+    )
+    return results
+
+
 def _score_sepa(
     symbol: str,
     v: dict,
@@ -233,6 +499,7 @@ def _score_sepa(
         "score":       score,
         "price":       round(close, 4),
         "sector":      (v.get("sector") or "").strip(),
+        "industry":    (v.get("industry") or "").strip(),
         "ema20":       round(e20, 4)  if e20  else None,
         "ema50":       round(e50, 4)  if e50  else None,
         "ema150":      round(e150, 4) if e150 else None,

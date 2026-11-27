@@ -87,8 +87,9 @@ export const resetAdminUserPassword = (id)                          => api.post(
 export const fetchAppHealth        = ()                             => api.get('/admin/health').then(r => r.data)
 
 // ── Trading ───────────────────────────────────────────────────────────────────
-export const fetchAccount         = () => api.get('/account').then(r => r.data)
+export const fetchAccount          = () => api.get('/account').then(r => r.data)
 export const fetchAccountsOverview = () => api.get('/account/overview').then(r => r.data)
+export const updateTotalDeposited  = (amount, deposit_key) => api.patch('/account/deposits', { total_deposited: amount, deposit_key }).then(r => r.data)
 export const fetchPositions    = () => api.get('/positions').then(r => r.data)
 export const fetchOpenOrders   = () => api.get('/orders/open').then(r => r.data)
 export const fetchTradeHistory = (limit=50) => api.get(`/orders/history?limit=${limit}`).then(r => r.data)
@@ -105,11 +106,14 @@ export const fetchScreenerStatus = () => api.get('/screener/status').then(r => r
 export const runScreener           = () => api.post('/screener/run').then(r => r.data)
 export const runMinerviniScreener  = () => api.post('/screener/run-minervini').then(r => r.data)
 export const runPullbackScreener   = () => api.post('/screener/run-pullback').then(r => r.data)
+export const runRsScreener         = () => api.post('/screener/run-rs').then(r => r.data)
+export const runPeadScreener       = () => api.post('/screener/run-pead').then(r => r.data)
 export const fetchPullbackSettings = () => api.get('/screener/pullback-settings').then(r => r.data)
 export const fetchTvScreeners      = () => api.get('/screener/tv-screeners').then(r => r.data)
 export const syncTradingView    = () => api.post('/screener/sync-tradingview').then(r => r.data)
 export const exportWatchlist    = () => api.get('/screener/watchlist-export', { responseType: 'blob' }).then(r => r.data)
 export const updatePlanStatus   = (symbol, status) => api.patch(`/screener/weekly-plan/${symbol}/status`, { status }).then(r => r.data)
+export const forceBuySymbol     = (symbol) => api.post(`/screener/weekly-plan/${symbol}/force-buy`).then(r => r.data)
 export const fetchAlpacaHistory = (limit=100) => api.get(`/orders/alpaca-history?limit=${limit}`).then(r => r.data)
 export const fetchAnalyses      = (limit=20) => api.get(`/screener/analysis?limit=${limit}`).then(r => r.data)
 export const runAnalysis        = () => api.post('/screener/analysis/run').then(r => r.data)
@@ -121,8 +125,9 @@ export const evaluateDualMomentum   = () => api.post('/strategies/dual-momentum/
 export const executeDualMomentum    = () => api.post('/strategies/dual-momentum/execute').then(r => r.data)
 export const fetchDMPosition        = () => api.get('/strategies/dual-momentum/position').then(r => r.data)
 export const fetchDMHistory         = (limit = 24) => api.get(`/strategies/dual-momentum/history?limit=${limit}`).then(r => r.data)
-export const fetchDMConfig          = () => api.get('/strategies/dual-momentum/config').then(r => r.data)
-export const updateDMConfig         = (data) => api.patch('/strategies/dual-momentum/config', data).then(r => r.data)
+export const fetchDMConfig          = (mode) => api.get('/strategies/dual-momentum/config', { params: mode ? { mode } : {} }).then(r => r.data)
+export const updateDMConfig         = ({ data, mode }) => api.patch('/strategies/dual-momentum/config', data, { params: mode ? { mode } : {} }).then(r => r.data)
+export const copyDMConfig           = (src, dst) => api.post('/strategies/dual-momentum/copy-config', null, { params: { src, dst } }).then(r => r.data)
 export const runDMBacktest          = (params) => api.post('/strategies/dual-momentum/backtest', params).then(r => r.data)
 
 // ── IRA Portfolio Manager ─────────────────────────────────────────────────────
@@ -130,6 +135,10 @@ export const fetchIRAStatus    = () => api.get('/ira/status').then(r => r.data)
 export const fetchIRATarget    = () => api.get('/ira/target').then(r => r.data)
 export const fetchIRAHistory   = (limit = 20) => api.get(`/ira/history?limit=${limit}`).then(r => r.data)
 export const runIRARebalance   = (body) => api.post('/ira/rebalance', body).then(r => r.data)
+
+// ── AI pre-trade gate log ─────────────────────────────────────────────────────
+export const fetchPreTradeLog = (limit = 100, symbol = null) =>
+  api.get('/ai/pre-trade-log', { params: { limit, ...(symbol ? { symbol } : {}) } }).then(r => r.data)
 
 // ── Market tape check ─────────────────────────────────────────────────────────
 export const fetchTapeCheck         = () => api.get('/market/tape-check').then(r => r.data)
