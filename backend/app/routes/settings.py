@@ -65,6 +65,11 @@ EDITABLE_KEYS = {
     "ira_rebalance_threshold_pct",  # drift % before auto-rebalance fires
     "ira_cash_buffer_pct",      # % of portfolio held as cash buffer
     "ira_etf_universe",         # comma-separated ETF tickers override
+    "ira_tilt_max_pp",          # max AI tilt per ETF in percentage points (default 5, 0 = off)
+    "ira_birth_year", "ira_retire_age", "ira_risk",
+    "ira_target_amount", "ira_target_income",          # today's dollars; income uses 4% rule
+    "ira_annual_contribution", "ira_annual_income",
+    "ira_max_expense_pct", "ira_max_turnover_pct", "ira_max_stock_pct",   # AI gate hard limits
     # PEAD screener settings
     "pead_max_slots",
     "pead_screener_enabled",

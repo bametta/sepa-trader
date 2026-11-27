@@ -215,7 +215,8 @@ def _call_ai(
             max_tokens=max_tokens,
             messages=[{"role": "user", "content": prompt}],
         )
-        return resp.content[0].text
+        # Models may return thinking blocks before the text block, so don't assume content[0].
+        return "".join(b.text for b in resp.content if getattr(b, "type", None) == "text")
 
     # openai or openai_compatible (xAI, DeepSeek, Mistral, Groq, Gemini, …)
     if provider in ("openai", "openai_compatible"):

@@ -30,6 +30,7 @@ DEFAULT_UNIVERSE = ["VTI", "VXUS", "QQQ", "SCHD", "VNQ", "BND", "TIP", "GLD", "B
 MAX_WEIGHT       = 0.40   # no single ETF above 40%
 MIN_DEFENSIVE    = 0.05   # always keep >=5% in BND/TIP/BIL
 MIN_TRADE_USD    = 5.0
+MIN_DEPLOY_USD   = 25.0   # idle settled cash below this isn't worth deploying
 DEFENSIVE        = {"BND", "TIP", "BIL"}
 
 # Rules-based baselines by regime (weights sum to 1.0)
@@ -60,8 +61,14 @@ def get_config(db: Session, user_id: int) -> dict:
         day = int(g("ira_rebalance_day", "4"))
     except ValueError:
         day = 4
+    try:
+        tilt = float(g("ira_tilt_max_pp", "5"))
+    except ValueError:
+        tilt = 5.0
     return {
         "enabled":       g("ira_enabled", "false").lower() == "true",
+        "halted":        g("ira_halt", "false").lower() == "true",
+        "tilt_pp":       max(0.0, min(10.0, tilt)),
         "universe":      uni or DEFAULT_UNIVERSE,
         "threshold_pct": max(1.0, min(25.0, threshold)),
         "cash_buffer":   max(0.0, min(20.0, cash_buf)) / 100.0,
@@ -189,22 +196,27 @@ def normalize_weights(weights: dict, universe: list[str]) -> dict:
 
 
 def _ai_adjust(db: Session, user_id: int, baseline: dict, regime: str,
-               context: dict, holdings: list[dict]) -> tuple[dict, str]:
-    """Ask the AI to tilt the baseline. Returns (weights, rationale). Fail-open to baseline."""
+               context: dict, holdings: list[dict], tilt: float = 0.05) -> tuple[dict, str]:
+    """Ask the AI to tilt the baseline by at most ±`tilt` per ETF. Returns (weights, rationale).
+    Falls back to the baseline on any AI problem; tilt <= 0 disables the AI allocation step."""
+    if tilt <= 0:
+        return baseline, "AI tilt disabled; rules-based glidepath core only."
     from .claude_analyst import _call_ai
     prompt = (
         "You are the portfolio manager for a long-horizon Roth IRA (ETF-only, no leverage, "
         "no shorting, rebalanced weekly). Goal: long-term growth with controlled drawdowns.\n\n"
         f"Detected regime: {regime}\n"
-        f"Context: {json.dumps(context, default=str)[:2500]}\n"
+        f"Context: {json.dumps({k: v for k, v in context.items() if k not in ('etf_market', 'profile_line')}, default=str)[:2000]}\n"
+        f"Live ETF stats (returns, 20d vol, % off 52w high, above 200d SMA): {json.dumps(context.get('etf_market', {}))}\n"
+        f"{context.get('profile_line', '')}\n"
         f"Current holdings: {json.dumps([{k: h[k] for k in ('symbol','weight','unrealized_plpc')} for h in holdings], default=str)}\n"
         f"Rules-based baseline weights: {json.dumps(baseline)}\n\n"
-        "You may tilt the baseline by at most ±10 percentage points per ETF. Use ONLY the tickers "
+        f"You may tilt the baseline by at most ±{tilt * 100:.0f} percentage points per ETF. Use ONLY the tickers "
         "in the baseline. Prefer stability — do not churn without a clear reason.\n"
         'Reply with JSON only: {"weights": {"TICKER": 0.xx, ...}, "rationale": "2-4 sentences"}'
     )
     try:
-        raw = _call_ai(db, prompt, 700, user_id)
+        raw = _call_ai(db, prompt, 1500, user_id)
     except Exception as exc:
         logger.error("ira AI call failed: %s", exc)
         return baseline, f"AI unavailable ({str(exc)[:80]}); using rules-based baseline."
@@ -221,15 +233,28 @@ def _ai_adjust(db: Session, user_id: int, baseline: dict, regime: str,
     bounded = {}
     for s, base_w in baseline.items():
         p = proposed.get(s, base_w)
-        bounded[s] = min(base_w + 0.10, max(base_w - 0.10, p))
+        bounded[s] = min(base_w + tilt, max(base_w - tilt, p))
     return bounded, str(data.get("rationale", ""))[:1000]
 
 
 def build_target(db: Session, user_id: int, holdings: list[dict] | None = None) -> dict:
     cfg = get_config(db, user_id)
     regime, ctx = _detect_regime()
+    try:
+        from . import ira_data, ira_planner
+        stats = ira_data.market_stats(cfg["universe"])
+        ctx["etf_market"] = {s: {k: v[k] for k in ("ret_1m", "ret_3m", "ret_12m", "vol_20d",
+                                                    "pct_off_52w_high", "above_200sma")}
+                             for s, v in stats.items() if v}
+        prof = ira_planner.get_profile(db, user_id)
+        if prof["age"] is not None:
+            ctx["profile_line"] = (
+                f"Investor: age {prof['age']}, retire at {prof['retire_age']}, risk {prof['risk']}; "
+                f"age-appropriate equity share ~{ira_planner.glidepath_equity(prof['age'], prof['retire_age'], prof['risk']):.0%}.")
+    except Exception as exc:
+        logger.warning("ira live context failed: %s", exc)
     baseline = normalize_weights(BASELINES[regime], cfg["universe"])
-    tilted, rationale = _ai_adjust(db, user_id, baseline, regime, ctx, holdings or [])
+    tilted, rationale = _ai_adjust(db, user_id, baseline, regime, ctx, holdings or [], cfg["tilt_pp"] / 100.0)
     target = normalize_weights(tilted, cfg["universe"])
     return {"regime": regime, "baseline": baseline, "target": target, "rationale": rationale}
 
@@ -276,6 +301,33 @@ def plan_rebalance(snapshot: dict, target: dict, threshold_pct: float,
             capped.append({**o, "notional": round(amt, 2),
                            "capped": amt < o["notional"] - 0.01})
             budget -= amt
+
+    # Deploy idle settled cash (initial funding, contributions) into the most underweight
+    # ETFs even when each shortfall is under the drift threshold. Buy-only, keeps the cash buffer.
+    free = budget - equity * cash_buffer
+    if free >= MIN_DEPLOY_USD:
+        selling = {o["symbol"] for o in sells}
+        ordered = {o["symbol"]: o for o in capped}
+        short = {}
+        for sym, tgt_w in target.items():
+            if tgt_w <= 0 or sym in selling:
+                continue
+            gap = investable * tgt_w - held.get(sym, {}).get("market_value", 0.0) \
+                  - ordered.get(sym, {}).get("notional", 0.0)
+            if gap >= MIN_TRADE_USD:
+                short[sym] = gap
+        total = sum(short.values())
+        for sym, gap in sorted(short.items(), key=lambda kv: -kv[1]):
+            amt = round(gap * min(1.0, free / total), 2)
+            if amt < MIN_TRADE_USD:
+                continue
+            if sym in ordered:
+                ordered[sym]["notional"] = round(ordered[sym]["notional"] + amt, 2)
+                ordered[sym]["capped"] = False
+            else:
+                drift = (held.get(sym, {}).get("market_value", 0.0) / equity - target[sym]) * 100.0
+                capped.append({"symbol": sym, "side": "buy", "notional": amt,
+                               "drift_pct": round(drift, 2), "cash_deploy": True})
     return sells + capped
 
 
@@ -303,6 +355,67 @@ def execute_plan(db: Session, user_id: int, orders: list[dict]) -> list[dict]:
     return results
 
 
+def _alert(msg: str, level: str = "INFO") -> None:
+    try:
+        from . import telegram_alerts as tg
+        tg.send_sync(msg, level=level)
+    except Exception as exc:
+        logger.warning("ira alert failed: %s", exc)
+
+
+_BAD_FINAL = ("canceled", "cancelled", "rejected", "expired")
+
+
+def verify_orders(client, results: list[dict], timeout_s: int = 25) -> list[dict]:
+    """Poll submitted orders until filled/cancelled/rejected or timeout; annotate each result."""
+    import time
+    deadline = time.time() + timeout_s
+    pending = [r for r in results if r.get("status") == "submitted" and r.get("order_id")]
+    while pending:
+        still = []
+        for r in pending:
+            try:
+                o = client.get_order_by_id(r["order_id"])
+            except Exception as exc:
+                r["verify_error"] = str(exc)[:120]
+                still.append(r)
+                continue
+            st = str(getattr(o, "status", "")).lower().split(".")[-1]
+            r["final_status"] = st
+            r["filled_qty"] = _sf(getattr(o, "filled_qty", None), 0.0)
+            r["filled_avg_price"] = _sf(getattr(o, "filled_avg_price", None), None)
+            if st != "filled" and st not in _BAD_FINAL:
+                still.append(r)
+        pending = still
+        if not pending or time.time() >= deadline:
+            break
+        time.sleep(2)
+    return results
+
+
+def _problems(results: list[dict]) -> list[str]:
+    out = []
+    for r in results:
+        if r.get("status") == "failed":
+            out.append(f"{r['side']} {r['symbol']} failed: {r.get('error', '')}")
+        elif r.get("final_status") in _BAD_FINAL:
+            out.append(f"{r['side']} {r['symbol']} {r['final_status']}")
+        elif r.get("status") == "submitted" and r.get("final_status") != "filled":
+            out.append(f"{r['side']} {r['symbol']} not confirmed filled ({r.get('final_status', 'unknown')})")
+    return out
+
+
+def _execute_and_verify(db: Session, user_id: int, plan: list[dict], regime: str) -> tuple[list[dict], bool]:
+    results = execute_plan(db, user_id, plan)
+    verify_orders(alp.get_client(MODE), results)
+    problems = _problems(results)
+    if problems:
+        _alert("IRA rebalance needs attention:\n" + "\n".join(problems[:8]), "URGENT")
+    else:
+        _alert(f"IRA rebalance filled: {len(results)} order(s), regime {regime}.")
+    return results, any(r["status"] == "submitted" for r in results)
+
+
 def _market_open(client) -> bool:
     try:
         return bool(client.get_clock().is_open)
@@ -320,15 +433,38 @@ def run_rebalance(db: Session, user_id: int, execute: bool = False, force: bool 
     threshold = 0.0 if force else cfg["threshold_pct"]
     plan = plan_rebalance(snap, tgt["target"], threshold, cfg["cash_buffer"])
 
+    from . import ira_data, ira_gate, ira_planner
+    try:
+        planner = ira_planner.build_plan(
+            db, user_id, snap["equity"],
+            tactical_equity=ira_planner.equity_share_of(ira_data.bucket_exposure(tgt["target"])),
+        )
+    except Exception as exc:
+        logger.warning("ira planner failed: %s", exc)
+        planner = None
+    gate = ira_gate.review(db, user_id, snap, tgt, plan, planner)
+    if plan:
+        try:
+            from .claude_analyst import log_pre_trade
+            log_pre_trade(db, "IRA", "IRA_REBALANCE", gate["verdict"], gate["reason"],
+                          ira_gate.format_analysis(gate), MODE, user_id)
+        except Exception as exc:
+            logger.warning("ira gate log failed: %s", exc)
+
     results: list[dict] = []
     executed = False
     note = ""
     if plan and execute:
-        if not _market_open(alp.get_client(MODE)):
+        if cfg["halted"]:
+            note = "IRA trading is HALTED (kill switch) — plan saved, not executed."
+        elif gate["verdict"] != "APPROVE":
+            note = f"AI gate {gate['verdict']}: {gate['reason']} — plan saved, not executed."
+        elif not _market_open(alp.get_client(MODE)):
             note = "Market closed — plan saved, not executed."
         else:
-            results = execute_plan(db, user_id, plan)
-            executed = any(r["status"] == "submitted" for r in results)
+            results, executed = _execute_and_verify(db, user_id, plan, tgt["regime"])
+        if not executed:
+            _alert(f"IRA scheduled rebalance NOT executed: {note}", "INFO")
     elif snap["equity"] <= 0:
         note = "IRA account has no funds yet — nothing to allocate."
     elif not plan:
@@ -337,30 +473,106 @@ def run_rebalance(db: Session, user_id: int, execute: bool = False, force: bool 
     payload = {
         "regime": tgt["regime"], "baseline": tgt["baseline"], "target": tgt["target"],
         "plan": plan, "results": results, "equity": snap["equity"],
-        "spendable": snap["spendable"], "note": note,
+        "spendable": snap["spendable"], "note": note, "gate": gate,
         "ran_at": datetime.utcnow().isoformat(),
     }
-    db.execute(
+    approved = bool(plan) and gate["verdict"] == "APPROVE" and not cfg["halted"]
+    verdict = "EXECUTED" if executed else ("PROPOSED" if approved else (gate["verdict"] if plan else "HOLD"))
+    proposal_id = db.execute(
         text("""
             INSERT INTO strategy_signals
                 (user_id, strategy_name, action, data, reasoning, ai_verdict, ai_reasoning, mode, executed)
             VALUES (:uid, :name, :action, CAST(:data AS jsonb), :reasoning, :verdict, :ai, :mode, :ex)
+            RETURNING id
         """),
         {"uid": user_id, "name": STRATEGY,
          "action": "REBALANCE" if plan else "HOLD",
          "data": json.dumps(payload, default=str),
          "reasoning": f"Regime: {tgt['regime']}. {len(plan)} trade(s) proposed.",
-         "verdict": "EXECUTED" if executed else ("PROPOSED" if plan else "HOLD"),
-         "ai": tgt["rationale"], "mode": MODE, "ex": executed},
+         "verdict": verdict, "ai": tgt["rationale"], "mode": MODE, "ex": executed},
+    ).scalar()
+    db.commit()
+    return {**payload, "executed": executed, "rationale": tgt["rationale"], "planner": planner,
+            "proposal_id": proposal_id if approved else None, "halted": cfg["halted"]}
+
+
+MAX_PROPOSAL_AGE_S = 30 * 60
+
+
+def execute_proposal(db: Session, user_id: int, proposal_id: int) -> dict:
+    """Execute exactly the plan the user previewed, after re-validating it against the live account.
+
+    Raises ValueError with a short code when the proposal can't safely run. The row is claimed
+    atomically first, so a double-click or retry can never submit the orders twice.
+    """
+    cfg = get_config(db, user_id)
+    if cfg["halted"]:
+        raise ValueError("ira_halted: trading is halted (kill switch)")
+    row = db.execute(
+        text("""SELECT data, ai_verdict, executed,
+                       EXTRACT(EPOCH FROM (NOW() - created_at)) AS age_s
+                FROM strategy_signals
+                WHERE id = :id AND user_id = :uid AND strategy_name = :n"""),
+        {"id": proposal_id, "uid": user_id, "n": STRATEGY},
+    ).fetchone()
+    if not row:
+        raise ValueError("proposal_not_found")
+    data, verdict, was_executed, age_s = row
+    if isinstance(data, str):
+        data = json.loads(data)
+    if was_executed or verdict != "PROPOSED":
+        raise ValueError(f"proposal_not_available: status {verdict}")
+    if age_s > MAX_PROPOSAL_AGE_S:
+        raise ValueError("proposal_expired: preview again (proposals expire after 30 minutes)")
+    if (data.get("gate") or {}).get("verdict") != "APPROVE":
+        raise ValueError("proposal_not_approved: the AI gate did not approve this plan")
+
+    snap = get_snapshot(db, user_id)
+    prev_eq = data.get("equity") or 0.0
+    if prev_eq <= 0 or abs(snap["equity"] - prev_eq) / prev_eq > 0.03:
+        raise ValueError("account_changed: equity moved more than 3% since the preview; preview again")
+    held = {h["symbol"]: h["market_value"] for h in snap["holdings"]}
+    plan = [dict(o) for o in data.get("plan", [])]
+    for o in plan:
+        if o["side"] == "sell" and held.get(o["symbol"], 0.0) < 0.9 * o["notional"]:
+            raise ValueError(f"account_changed: {o['symbol']} holding no longer matches the preview")
+    buys = [o for o in plan if o["side"] == "buy"]
+    total_buy = sum(o["notional"] for o in buys)
+    if total_buy > snap["spendable"] + 0.01:
+        scale = snap["spendable"] / total_buy if total_buy else 0.0
+        for o in buys:
+            o["notional"] = round(o["notional"] * scale, 2)
+        plan = [o for o in plan if o["side"] == "sell" or o["notional"] >= MIN_TRADE_USD]
+    if not plan:
+        raise ValueError("nothing_to_execute")
+    if not _market_open(alp.get_client(MODE)):
+        raise ValueError("market_closed: orders can only be placed while the market is open")
+
+    claimed = db.execute(
+        text("""UPDATE strategy_signals SET ai_verdict = 'EXECUTING'
+                WHERE id = :id AND user_id = :uid AND ai_verdict = 'PROPOSED' RETURNING id"""),
+        {"id": proposal_id, "uid": user_id},
+    ).fetchone()
+    db.commit()
+    if not claimed:
+        raise ValueError("proposal_not_available: already executing or executed")
+
+    try:
+        results, executed = _execute_and_verify(db, user_id, plan, data.get("regime", ""))
+    except Exception as exc:
+        db.execute(text("UPDATE strategy_signals SET ai_verdict = 'FAILED' WHERE id = :id"), {"id": proposal_id})
+        db.commit()
+        _alert(f"IRA rebalance crashed mid-execution: {str(exc)[:200]}. Check Alpaca before retrying.", "URGENT")
+        raise
+    data.update({"plan": plan, "results": results, "executed_at": datetime.utcnow().isoformat()})
+    final = "EXECUTED" if executed and not _problems(results) else ("PARTIAL" if executed else "FAILED")
+    db.execute(
+        text("""UPDATE strategy_signals SET data = CAST(:d AS jsonb), ai_verdict = :v, executed = :ex
+                WHERE id = :id"""),
+        {"d": json.dumps(data, default=str), "v": final, "ex": executed, "id": proposal_id},
     )
     db.commit()
-    if executed:
-        try:
-            from . import telegram_alerts as tg
-            tg.send_sync(f"IRA rebalance submitted: {len(results)} order(s), regime {tgt['regime']}.")
-        except Exception:
-            pass
-    return {**payload, "executed": executed, "rationale": tgt["rationale"]}
+    return {**data, "executed": executed, "final_status": final, "problems": _problems(results)}
 
 
 def get_history(db: Session, user_id: int, limit: int = 20) -> list[dict]:
