@@ -119,18 +119,25 @@ def get_snapshot(db: Session, user_id: int) -> dict:
 # ── Allocation engine ─────────────────────────────────────────────────────────
 
 def _detect_regime() -> tuple[str, dict]:
-    """Map market environment + Dual Momentum into a coarse regime label."""
+    """Map market environment + Dual Momentum into a coarse regime label.
+
+    SPY below its 200-day SMA (CORRECTION) caps the regime at neutral, so a
+    Dual Momentum SPY/EFA pick can't promote it to risk-on.
+    """
     info: dict = {}
     regime = "neutral"
+    capped = False
     try:
         from .strategies.market_env import assess
         env = assess() or {}
         info["market_env"] = env
-        label = str(env.get("regime") or env.get("environment") or env.get("status") or "").lower()
-        if any(w in label for w in ("bull", "risk_on", "risk-on", "favorable", "green")):
+        label = str(env.get("environment") or "").upper()
+        if label in ("BULL", "BULL_VOLATILE"):
             regime = "risk_on"
-        elif any(w in label for w in ("bear", "risk_off", "risk-off", "defensive", "red", "unfavorable")):
+        elif label == "BEAR":
             regime = "risk_off"
+        elif label == "CORRECTION":
+            capped = True
     except Exception as exc:
         logger.warning("ira regime: market_env failed: %s", exc)
     try:
@@ -140,7 +147,7 @@ def _detect_regime() -> tuple[str, dict]:
         rec = dm.get("recommended_symbol")
         if rec in ("AGG", "BIL"):
             regime = "risk_off"
-        elif rec in ("SPY", "EFA") and regime == "neutral":
+        elif rec in ("SPY", "EFA") and regime == "neutral" and not capped:
             regime = "risk_on"
     except Exception as exc:
         logger.warning("ira regime: dual momentum failed: %s", exc)
@@ -322,6 +329,8 @@ def run_rebalance(db: Session, user_id: int, execute: bool = False, force: bool 
         else:
             results = execute_plan(db, user_id, plan)
             executed = any(r["status"] == "submitted" for r in results)
+    elif snap["equity"] <= 0:
+        note = "IRA account has no funds yet — nothing to allocate."
     elif not plan:
         note = "Portfolio within drift threshold — no trades needed."
 
