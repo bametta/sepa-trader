@@ -577,7 +577,12 @@ const SECTIONS = [
           { value: 'aggressive',   label: 'Aggressive' },
         ],
       },
-      { key: 'savings_total_target',    label: 'TOTAL retirement goal $ across ALL accounts (Savings tab)', type: 'text', span: true },
+      { key: 'retire_spending_target',  label: 'Yearly spending wanted in retirement $ (today\'s dollars)', type: 'text' },
+      { key: 'income_va_annual',        label: 'VA disability per year $ (tax-free, cost-of-living adjusted)', type: 'text' },
+      { key: 'income_ss_annual',        label: 'Social Security per year $ (your statement\'s estimate)', type: 'text' },
+      { key: 'income_ss_claim_age',     label: 'Social Security starts at age (62-70, default 67)', type: 'text' },
+      { key: 'income_other_annual',     label: 'Other guaranteed income per year $ (pension etc.)', type: 'text' },
+      { key: 'savings_total_target',    label: 'TOTAL retirement goal $ across ALL accounts (leave blank to use spending minus guaranteed income)', type: 'text', span: true },
       { key: 'ira_target_amount',       label: 'Retirement target $ (today\'s dollars)', type: 'text' },
       { key: 'ira_target_income',       label: 'or target yearly income $ (4% rule)',     type: 'text' },
       {
