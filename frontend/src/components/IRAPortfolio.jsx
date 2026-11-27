@@ -6,6 +6,7 @@ import { useQuery, useMutation, useQueryClient } from 'react-query'
 import {
   fetchIRAStatus, fetchIRATarget, fetchIRAHistory, runIRARebalance,
   fetchIRAPlan, runIRABacktest, setIRAHalt,
+  fetchIRAContributions, addIRAContribution, deleteIRAContribution, fetchIRAHistoricalStress,
 } from '../api/client'
 
 const usd = v => v != null ? new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(v) : '—'
@@ -150,8 +151,160 @@ function PlanCard({ plan }) {
           ))}
         </tbody>
       </table>
+      <StressSection plan={plan} />
       <div className="text-[11px] text-slate-600">
         {plan.disclaimer} IRS limits: {plan.limits.note}
+      </div>
+    </div>
+  )
+}
+
+function StressSection({ plan }) {
+  const replay = useMutation(fetchIRAHistoricalStress)
+  const st = plan.stress
+  if (!st || st.error) return null
+  const w = st.withdrawal
+  const h = replay.data
+  return (
+    <div className="border-t border-white/[0.05] pt-3 space-y-3">
+      <div className="text-[10px] uppercase tracking-wider text-slate-500">
+        Stress tests · contributing {usd0(st.contribution_assumed)}/yr
+      </div>
+      <table className="w-full text-sm">
+        <thead>
+          <tr className="text-[10px] uppercase tracking-wider text-slate-500 text-left">
+            <th className="py-1">Scenario</th><th className="text-right">Ends at</th>
+            <th className="text-right">vs expected</th><th className="text-right">% of goal</th>
+          </tr>
+        </thead>
+        <tbody>
+          {st.scenarios.map(r => (
+            <tr key={r.key} className="border-t border-white/[0.05]">
+              <td className="py-1.5 text-slate-300">{r.label}</td>
+              <td className="text-right num text-slate-200">{usd0(r.final)}</td>
+              <td className="text-right num text-slate-400">{r.key === 'expected' ? '—' : pct(r.vs_expected, 0)}</td>
+              <td className={`text-right num ${r.meets_target ? 'text-emerald-400' : 'text-amber-400'}`}>{pct(r.pct_of_target, 0)}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      {w && (
+        <div className="rounded-lg border border-white/[0.08] p-3 space-y-1 text-sm">
+          <div className="text-[10px] uppercase tracking-wider text-slate-500">
+            Retirement spending test · {pct(w.withdrawal_rate, 0)} of the goal ({usd0(w.annual_spend)}/yr) for {w.horizon_years} years
+          </div>
+          <div className="text-slate-200">
+            Lasts the full {w.horizon_years} years in <span className="font-semibold">{pct(w.success_probability, 0)}</span> of simulations
+            {w.safe_rate_90pct != null && <> · highest rate that works 90% of the time: <span className="font-semibold">{pct(w.safe_rate_90pct, 1)}</span></>}
+          </div>
+          <div className="text-xs text-slate-400">
+            Bad start (equity −30% then −15% in years 1–2): {w.bad_start.years_funded >= w.horizon_years
+              ? `still funded at year ${w.horizon_years} with ${usd0(w.bad_start.ending_balance)} left`
+              : `money runs out after ${w.bad_start.years_funded} years`}
+          </div>
+        </div>
+      )}
+      <div className="flex items-center gap-3">
+        <button className="btn-ghost" disabled={replay.isLoading} onClick={() => replay.mutate()}>
+          {replay.isLoading ? 'Replaying…' : 'Replay real market history'}
+        </button>
+        {replay.isError && <span className="text-sm text-red-400">{errMsg(replay.error)}</span>}
+      </div>
+      {h && !h.available && <div className="text-sm text-amber-400">{h.reason}</div>}
+      {h?.available && (
+        <div className="text-xs text-slate-400 space-y-1">
+          <div>
+            {h.windows} start dates in {h.history}, {h.window_years_used}-year windows, real dollars: worst {usd0(h.worst.final)}
+            {' '}(started {h.worst.starting}), 10th percentile {usd0(h.p10)}, median {usd0(h.median)}, best {usd0(h.best)}
+            {h.share_reaching_target != null && <> · reached the goal in {pct(h.share_reaching_target, 0)}</>}
+          </div>
+          <div className="text-[11px] text-slate-600">{h.note}</div>
+        </div>
+      )}
+    </div>
+  )
+}
+
+function ContributionsCard() {
+  const qc = useQueryClient()
+  const q = useQuery('ira-contrib', fetchIRAContributions, { retry: false })
+  const today = new Date().toISOString().slice(0, 10)
+  const [form, setForm] = useState({ amount: '', contributed_on: today, tax_year: new Date().getFullYear(), note: '' })
+  const refresh = data => { qc.setQueryData('ira-contrib', data); qc.invalidateQueries('ira-plan') }
+  const add = useMutation(addIRAContribution, { onSuccess: d => { refresh(d); setForm(f => ({ ...f, amount: '', note: '' })) } })
+  const del = useMutation(deleteIRAContribution, { onSuccess: refresh })
+  const d = q.data
+
+  return (
+    <div className="card space-y-3">
+      <div className="text-slate-100 font-semibold">Contributions &amp; IRS limit</div>
+      {q.isError && <div className="text-sm text-red-400">{errMsg(q.error)}</div>}
+      {d?.years.map(y => (
+        <div key={y.year} className={`rounded-lg border p-3 space-y-1 ${y.excess > 0 ? 'border-red-500/50' : 'border-white/[0.08]'}`}>
+          <div className="flex items-center justify-between text-sm">
+            <span className="text-slate-100 font-semibold">{y.year} tax year</span>
+            <span className="text-slate-300 num">{usd0(y.contributed)} of {usd0(y.allowed)}</span>
+          </div>
+          <div className="h-1.5 rounded bg-white/[0.06] overflow-hidden">
+            <div className={`h-full ${y.excess > 0 ? 'bg-red-500' : 'bg-emerald-500'}`}
+                 style={{ width: `${Math.min(100, y.allowed ? (y.contributed / y.allowed) * 100 : 0)}%` }} />
+          </div>
+          <div className="text-xs text-slate-400">
+            {y.remaining > 0
+              ? <>{usd0(y.remaining)} of room left{y.monthly_to_fill_by_year_end != null && <> · {usd0(y.monthly_to_fill_by_year_end)}/mo fills it by Dec 31</>}
+                {' '}· deadline {y.deadline} ({y.days_to_deadline} days)</>
+              : 'Limit reached for this year.'}
+            {y.catch_up_eligible && ` · includes ${usd0(y.catch_up)} catch-up`}
+            {y.estimated && ' · limit estimated from the latest known year'}
+          </div>
+          {y.phase_out_note && <div className="text-xs text-amber-400">{y.phase_out_note}</div>}
+          {y.warning && <div className="text-xs text-red-400">{y.warning}</div>}
+        </div>
+      ))}
+
+      <form className="grid grid-cols-2 md:grid-cols-5 gap-2 items-end"
+            onSubmit={e => { e.preventDefault(); add.mutate({ amount: parseFloat(form.amount), contributed_on: form.contributed_on, tax_year: parseInt(form.tax_year, 10), note: form.note }) }}>
+        <label className="text-[10px] uppercase tracking-wider text-slate-500">Amount $
+          <input className="input w-full" type="number" min="0.01" step="0.01" required value={form.amount}
+                 onChange={e => setForm({ ...form, amount: e.target.value })} />
+        </label>
+        <label className="text-[10px] uppercase tracking-wider text-slate-500">Date
+          <input className="input w-full" type="date" max={today} required value={form.contributed_on}
+                 onChange={e => setForm({ ...form, contributed_on: e.target.value })} />
+        </label>
+        <label className="text-[10px] uppercase tracking-wider text-slate-500">Tax year
+          <select className="input w-full" value={form.tax_year} onChange={e => setForm({ ...form, tax_year: e.target.value })}>
+            {[new Date().getFullYear(), new Date().getFullYear() - 1].map(y => <option key={y} value={y}>{y}</option>)}
+          </select>
+        </label>
+        <label className="text-[10px] uppercase tracking-wider text-slate-500">Note
+          <input className="input w-full" type="text" maxLength={200} value={form.note}
+                 onChange={e => setForm({ ...form, note: e.target.value })} />
+        </label>
+        <button className="btn-primary" disabled={add.isLoading}>{add.isLoading ? 'Adding…' : 'Record contribution'}</button>
+      </form>
+      {add.isError && <div className="text-sm text-red-400">{errMsg(add.error)}</div>}
+
+      {d?.ledger.length > 0 && (
+        <table className="w-full text-sm">
+          <tbody>
+            {d.ledger.slice(0, 12).map(c => (
+              <tr key={c.id} className="border-t border-white/[0.05]">
+                <td className="py-1 text-slate-400">{c.contributed_on}</td>
+                <td className="text-slate-500">{c.tax_year}</td>
+                <td className="text-right num text-slate-200">{usd(c.amount)}</td>
+                <td className="text-slate-500 pl-3">{c.note}</td>
+                <td className="text-right">
+                  <button className="text-xs text-slate-500 hover:text-red-400" disabled={del.isLoading}
+                          onClick={() => window.confirm('Remove this contribution from the ledger?') && del.mutate(c.id)}>remove</button>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+      <div className="text-[11px] text-slate-600">
+        Manual ledger: record deposits as you make them. {d?.note} {d?.inputs?.magi_note}
       </div>
     </div>
   )
@@ -402,6 +555,7 @@ export default function IRAPortfolio() {
       </div>
 
       <PlanCard plan={plan.data} />
+      <ContributionsCard />
       <BacktestCard />
 
       <div className="card space-y-2">

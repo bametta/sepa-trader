@@ -124,6 +124,17 @@ def _run_migrations():
                 created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )
         """))
+        db.execute(text("""
+            CREATE TABLE IF NOT EXISTS ira_contributions (
+                id             SERIAL PRIMARY KEY,
+                user_id        INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                tax_year       INTEGER NOT NULL,
+                amount         NUMERIC(12,2) NOT NULL CHECK (amount > 0),
+                contributed_on DATE NOT NULL,
+                note           TEXT,
+                created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+        """))
 
         # ── Add user_id FK to trading tables (idempotent) ────────────────────
         for table in ("weekly_plan", "trade_log", "signal_log", "ai_analysis_log"):
