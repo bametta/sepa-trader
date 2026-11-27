@@ -58,6 +58,13 @@ EDITABLE_KEYS = {
     "rs_min_percentile", "rs_require_stage2",
     "rs_max_extension", "rs_top_n", "rs_max_slots",
     "rs_exchanges", "rs_excluded_sectors",
+    # IRA Portfolio Manager
+    "alpaca_ira_key", "alpaca_ira_secret",
+    "ira_enabled",
+    "ira_rebalance_day",        # weekday 0-6 for weekly rebalance (default 4 = Friday)
+    "ira_rebalance_threshold_pct",  # drift % before auto-rebalance fires
+    "ira_cash_buffer_pct",      # % of portfolio held as cash buffer
+    "ira_etf_universe",         # comma-separated ETF tickers override
     # PEAD screener settings
     "pead_max_slots",
     "pead_screener_enabled",

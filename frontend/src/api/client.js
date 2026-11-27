@@ -130,6 +130,12 @@ export const updateDMConfig         = ({ data, mode }) => api.patch('/strategies
 export const copyDMConfig           = (src, dst) => api.post('/strategies/dual-momentum/copy-config', null, { params: { src, dst } }).then(r => r.data)
 export const runDMBacktest          = (params) => api.post('/strategies/dual-momentum/backtest', params).then(r => r.data)
 
+// ── IRA Portfolio Manager ─────────────────────────────────────────────────────
+export const fetchIRAStatus    = () => api.get('/ira/status').then(r => r.data)
+export const fetchIRATarget    = () => api.get('/ira/target').then(r => r.data)
+export const fetchIRAHistory   = (limit = 20) => api.get(`/ira/history?limit=${limit}`).then(r => r.data)
+export const runIRARebalance   = (body) => api.post('/ira/rebalance', body).then(r => r.data)
+
 // ── AI pre-trade gate log ─────────────────────────────────────────────────────
 export const fetchPreTradeLog = (limit = 100, symbol = null) =>
   api.get('/ai/pre-trade-log', { params: { limit, ...(symbol ? { symbol } : {}) } }).then(r => r.data)

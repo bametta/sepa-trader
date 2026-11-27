@@ -11,6 +11,7 @@ import SettingsPanel from './components/SettingsPanel'
 import WeeklyPlan from './components/WeeklyPlan'
 import AdminPanel from './components/AdminPanel'
 import DualMomentumTab from './components/DualMomentumTab'
+import IRAPortfolio from './components/IRAPortfolio'
 import PreTradeLog from './components/PreTradeLog'
 import { fetchPositions, updateSetting, fetchSettings } from './api/client'
 
@@ -22,6 +23,7 @@ const TAB_CONFIG = [
   { id: 'Orders',         icon: '↕', label: 'Orders' },
   { id: 'Weekly Plan',    icon: '✦', label: 'Weekly Plan' },
   { id: 'Dual Momentum',  icon: '⟳', label: 'Dual Momentum' },
+  { id: 'IRA',            icon: '◈', label: 'IRA' },
   { id: 'AI Gate',        icon: '✓', label: 'AI Gate' },
   { id: 'Settings',       icon: '⚙', label: 'Settings' },
 ]
@@ -190,6 +192,7 @@ function Dashboard() {
           {tab === 'Orders'        && <div className="space-y-5"><OpenOrdersTable /><AlpacaHistoryTable /></div>}
           {tab === 'Weekly Plan'   && <WeeklyPlan />}
           {tab === 'Dual Momentum' && <DualMomentumTab />}
+          {tab === 'IRA'           && <IRAPortfolio />}
           {tab === 'AI Gate'       && <PreTradeLog />}
           {tab === 'Settings'      && <SettingsPanel />}
           {tab === 'Admin'         && <AdminPanel />}

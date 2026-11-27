@@ -21,6 +21,8 @@ _clients: dict[str, TradingClient] = {}
 def get_client(mode: str = "paper") -> TradingClient:
     """Global client using .env credentials — used by scheduler/background jobs only."""
     if mode not in _clients:
+        if mode == "ira":
+            raise ValueError("IRA client not configured — call configure_from_db_settings(..., 'ira') first")
         if mode == "paper":
             _clients[mode] = TradingClient(
                 api_key=(settings.alpaca_paper_key or "").strip(),
@@ -58,7 +60,11 @@ def configure_from_db_settings(merged: dict, mode: str, is_admin: bool = True) -
     Call this at the start of run_monitor so the live client uses DB-stored keys
     (saved via Settings panel) rather than the .env-file keys which may be empty.
     """
-    if mode == "paper":
+    if mode == "ira":
+        key    = (merged.get("alpaca_ira_key") or "").strip()
+        secret = (merged.get("alpaca_ira_secret") or "").strip()
+        paper  = False   # IRA is always a live, real-money cash account
+    elif mode == "paper":
         key    = (merged.get("alpaca_paper_key") or "").strip()
         secret = (merged.get("alpaca_paper_secret") or "").strip()
         if is_admin:
