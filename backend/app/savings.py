@@ -392,6 +392,60 @@ def owns_account(db, uid: int, account_id: int) -> bool:
                       {"id": account_id, "u": uid}).fetchone() is not None
 
 
+def validate_value_updates(updates: list[dict], today: date | None = None) -> list[dict]:
+    """Clean a batch of manual-value updates: [{holding_id, value, as_of?}]. All-or-nothing: raises on any problem."""
+    today = today or date.today()
+    if not updates:
+        raise ValueError("no updates to save")
+    if len(updates) > MAX_HOLDINGS:
+        raise ValueError(f"too many updates (max {MAX_HOLDINGS})")
+    clean, seen = [], set()
+    for i, u in enumerate(updates, start=1):
+        try:
+            hid = int(u["holding_id"])
+        except (KeyError, TypeError, ValueError):
+            raise ValueError(f"update {i}: holding_id is required")
+        if hid in seen:
+            raise ValueError(f"update {i}: holding {hid} appears twice")
+        seen.add(hid)
+        try:
+            value = float(u["value"])
+        except (KeyError, TypeError, ValueError):
+            raise ValueError(f"update {i}: value must be a number")
+        if not (0 <= value <= 1e10) or value != value:
+            raise ValueError(f"update {i}: value must be between 0 and 10,000,000,000")
+        raw = u.get("as_of")
+        try:
+            as_of = date.fromisoformat(raw) if isinstance(raw, str) and raw else (raw if isinstance(raw, date) else today)
+        except ValueError:
+            raise ValueError(f"update {i}: as_of must look like 2026-11-27")
+        if as_of > today:
+            raise ValueError(f"update {i}: as_of cannot be in the future")
+        clean.append({"holding_id": hid, "value": round(value, 2), "as_of": as_of})
+    return clean
+
+
+def update_manual_values(db, uid: int, account_id: int, updates: list[dict], today: date | None = None) -> int:
+    """Set the value and as-of date of hand-valued holdings (no quantity) in one account, atomically.
+    Holdings priced by quantity are refused: change those by importing or editing the holdings."""
+    clean = validate_value_updates(updates, today)
+    if not owns_account(db, uid, account_id):
+        raise ValueError("account_not_found")
+    try:
+        for u in clean:
+            n = db.execute(
+                text("""UPDATE savings_holdings SET manual_value = :v, as_of = :d, updated_at = NOW()
+                        WHERE id = :h AND account_id = :a AND quantity IS NULL"""),
+                {"v": u["value"], "d": u["as_of"], "h": u["holding_id"], "a": account_id}).rowcount
+            if n != 1:
+                raise ValueError(f"holding {u['holding_id']} was not found in this account or is priced by quantity")
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    return len(clean)
+
+
 def replace_holdings(db, uid: int, account_id: int, holdings: list[dict]) -> int:
     """Atomically replace an account's holdings (all-or-nothing)."""
     if not owns_account(db, uid, account_id):

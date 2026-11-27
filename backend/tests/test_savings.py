@@ -337,6 +337,95 @@ class MaxDeferralTests(unittest.TestCase):
                               account_type="taxable")
 
 
+class ManualValueTests(unittest.TestCase):
+    """Quick-update table for hand-valued holdings (Equity Trust real estate, notes, core funds)."""
+
+    def clean(self, updates, today=TODAY):
+        return sv.validate_value_updates(updates, today)
+
+    def test_valid_updates_are_cleaned_and_dated(self):
+        out = self.clean([{"holding_id": "7", "value": "250000.456", "as_of": "2026-05-20"},
+                          {"holding_id": 8, "value": 0}])
+        self.assertEqual(out[0], {"holding_id": 7, "value": 250000.46, "as_of": date(2026, 5, 20)})
+        self.assertEqual(out[1]["as_of"], TODAY)                        # default is today
+        self.assertEqual(out[1]["value"], 0.0)                          # a written-off asset is allowed
+
+    def test_bad_updates_are_rejected(self):
+        bad = ([], [{"value": 1}], [{"holding_id": 1}], [{"holding_id": 1, "value": "abc"}],
+               [{"holding_id": 1, "value": -1}], [{"holding_id": 1, "value": float("nan")}],
+               [{"holding_id": 1, "value": 1e11}], [{"holding_id": 1, "value": 1, "as_of": "next week"}],
+               [{"holding_id": 1, "value": 1, "as_of": "2026-06-02"}],
+               [{"holding_id": 1, "value": 1}, {"holding_id": 1, "value": 2}])
+        for updates in bad:
+            with self.subTest(updates=updates), self.assertRaises(ValueError):
+                self.clean(updates)
+
+    def test_batch_size_is_capped(self):
+        with self.assertRaises(ValueError):
+            self.clean([{"holding_id": i, "value": 1} for i in range(sv.MAX_HOLDINGS + 1)])
+
+
+class ValueDB:
+    """Wraps FakeDB (defined below) so holding updates report a configurable number of affected rows."""
+    def __init__(self, rowcounts=(1,), **kw):
+        self._db = FakeDB(**kw)
+        self.rowcounts = list(rowcounts)
+
+    def __getattr__(self, name):
+        return getattr(self._db, name)
+
+    def execute(self, sql, params=None):
+        r = self._db.execute(sql, params)
+        if "UPDATE savings_holdings" in sql:
+            r.rowcount = self.rowcounts.pop(0) if self.rowcounts else 1
+        return r
+
+    def commit(self):
+        self._db.commit()
+
+    def rollback(self):
+        self._db.rollback()
+
+
+class ManualValueDbTests(unittest.TestCase):
+    UPDATES = [{"holding_id": 11, "value": 160000, "as_of": "2026-05-30"}, {"holding_id": 12, "value": 26000}]
+
+    def test_all_updates_commit_together(self):
+        db = ValueDB(rowcounts=[1, 1])
+        self.assertEqual(sv.update_manual_values(db, 1, 5, self.UPDATES, TODAY), 2)
+        self.assertEqual((db.commits, db.rollbacks), (1, 0))
+        ups = [c for c in db.calls if "UPDATE savings_holdings" in c[0]]
+        self.assertEqual([(c[1]["h"], c[1]["v"], c[1]["a"]) for c in ups], [(11, 160000.0, 5), (12, 26000.0, 5)])
+        self.assertEqual(ups[0][1]["d"], date(2026, 5, 30))
+
+    def test_one_missing_holding_rolls_everything_back(self):
+        db = ValueDB(rowcounts=[1, 0])
+        with self.assertRaises(ValueError) as cm:
+            sv.update_manual_values(db, 1, 5, self.UPDATES, TODAY)
+        self.assertIn("holding 12", str(cm.exception))
+        self.assertEqual((db.commits, db.rollbacks), (0, 1))
+
+    def test_updates_only_touch_hand_valued_holdings_in_that_account(self):
+        db = ValueDB()
+        sv.update_manual_values(db, 1, 5, [{"holding_id": 11, "value": 1}], TODAY)
+        sql = [c[0] for c in db.calls if "UPDATE savings_holdings" in c[0]][0]
+        self.assertIn("account_id = :a", sql)
+        self.assertIn("quantity IS NULL", sql)
+
+    def test_other_users_accounts_are_refused_before_any_write(self):
+        db = ValueDB(owns=False)
+        with self.assertRaises(ValueError) as cm:
+            sv.update_manual_values(db, 1, 5, self.UPDATES, TODAY)
+        self.assertEqual(str(cm.exception), "account_not_found")
+        self.assertFalse(any("UPDATE savings_holdings" in c[0] for c in db.calls))
+
+    def test_invalid_input_never_reaches_the_database(self):
+        db = ValueDB()
+        with self.assertRaises(ValueError):
+            sv.update_manual_values(db, 1, 5, [{"holding_id": 1, "value": -5}], TODAY)
+        self.assertEqual(db.calls, [])
+
+
 class SnapshotDiffTests(unittest.TestCase):
     def snap(self, *items):
         return [{"key": k, "symbol": k if q is not None else None, "name": k, "quantity": q, "value": v}
