@@ -117,3 +117,44 @@ def put_holdings(account_id: int, body: HoldingsBody, current_user: dict = Depen
             raise HTTPException(404, "account_not_found")
         raise HTTPException(400, str(exc))
     return {"status": "saved", "holdings": n}
+
+
+# ── Import a positions export; manual-trade helper ────────────────────────────
+
+class ImportBody(BaseModel):
+    text: str
+    apply: bool = False        # false = preview only (nothing saved)
+
+
+class TradePlanBody(BaseModel):
+    account_ids: list[int] | None = None
+    mode: str = "cash_only"    # "cash_only" (buys only) or "full" (also sells)
+    target: str | None = None  # e.g. "VTI:50, VXUS:25, BND:25"; blank = saved model, else age-based default
+
+
+@router.post("/accounts/{account_id}/import")
+def import_positions(account_id: int, body: ImportBody, current_user: dict = Depends(get_current_user),
+                     db: Session = Depends(get_db)):
+    """Parse a Schwab positions export (or this app's CSV). Preview shows what changed; apply saves it."""
+    if len(body.text) > savings.MAX_CSV_CHARS:
+        raise HTTPException(400, "file is too large")
+    try:
+        return savings_service.import_positions(db, current_user["id"], account_id, body.text, body.apply)
+    except ValueError as exc:
+        if str(exc) == "account_not_found":
+            raise HTTPException(404, "account_not_found")
+        raise HTTPException(400, str(exc))
+
+
+@router.get("/target-model")
+def target_model(current_user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
+    return savings_service.target_info(db, current_user["id"])
+
+
+@router.post("/trade-plan")
+def trade_plan(body: TradePlanBody, current_user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
+    """A worksheet of whole-share buys/sells per account. It places nothing."""
+    try:
+        return savings_service.trade_plan(db, current_user["id"], body.account_ids, body.mode, body.target)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))

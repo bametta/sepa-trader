@@ -9,7 +9,7 @@ from datetime import date
 
 import numpy as np
 
-from . import ira_planner, ira_stress, savings
+from . import ira_planner, ira_stress, savings, savings_trades
 from .database import get_user_setting
 
 logger = logging.getLogger(__name__)
@@ -157,3 +157,101 @@ def combined_plan(db, uid: int, summary: dict) -> dict:
                 lo, hi = (lo, mid) if ok else (mid, hi)
             out["extra_saving_for_80pct"] = round(hi)
     return out
+
+
+# ── Import and manual-trade helper ────────────────────────────────────────────
+
+def _own_account(db, uid: int, account_id: int) -> dict:
+    for a in savings.load_accounts(db, uid):
+        if a["id"] == account_id:
+            return a
+    raise ValueError("account_not_found")
+
+
+def _valued(holdings: list[dict], prices: dict) -> list[dict]:
+    out = []
+    for h in holdings:
+        sym = (h.get("symbol") or "").upper() or None
+        val, _ = savings.value_holding(h, prices.get(sym) if sym else None)
+        out.append({"key": sym or h["name"], "symbol": sym, "name": h["name"], "quantity": h.get("quantity"),
+                    "value": val})
+    return out
+
+
+def import_positions(db, uid: int, account_id: int, text: str, apply: bool = False) -> dict:
+    """Parse a Schwab positions export (or our own CSV), show what would change, and save only if `apply`."""
+    from . import schwab_import
+    account = _own_account(db, uid, account_id)
+    if schwab_import.looks_like_schwab(text):
+        parsed = schwab_import.parse_schwab_positions(text)
+        source = "schwab"
+    else:
+        parsed = {"holdings": savings.parse_holdings_csv(text), "file_total": None, "warnings": [], "title": None}
+        source = "csv"
+    new = parsed["holdings"]
+    symbols = [h["symbol"] for h in new + account["holdings"] if h.get("symbol") and h.get("quantity") is not None]
+    prices = fetch_prices(symbols)
+    before, after = _valued(account["holdings"], prices), _valued(new, prices)
+    prev_total, new_total = sum(h["value"] for h in before), sum(h["value"] for h in after)
+    diff = savings.diff_snapshots(before, after, prev_total, new_total) if before else \
+        {"events": [{"type": "added", "key": h["key"], "name": h["name"], "quantity": h["quantity"],
+                     "value": round(h["value"], 2)} for h in after], "total_change": round(new_total, 2),
+         "traded_net": 0.0, "market_and_other": round(new_total, 2)}
+    warnings = list(parsed["warnings"])
+    if before and prev_total and abs(new_total - prev_total) / prev_total > 0.5:
+        warnings.append(f"The new total (${new_total:,.0f}) differs from the stored total (${prev_total:,.0f}) by more "
+                        "than 50%. Make sure this file belongs to this account.")
+    result = {"source": source, "title": parsed.get("title"), "holdings": len(new), "file_total": parsed.get("file_total"),
+              "parsed_total": round(new_total, 2), "stored_total": round(prev_total, 2), "warnings": warnings,
+              "diff": diff, "applied": False}
+    if apply:
+        savings.replace_holdings(db, uid, account_id, new)
+        result["applied"] = True
+    return result
+
+
+def saved_target_model(db, uid: int) -> str:
+    return (get_user_setting(db, "savings_target_model", "", uid) or "").strip()
+
+
+def default_target_for(db, uid: int) -> dict:
+    p = ira_planner.get_profile(db, uid)
+    if p["age"] is None:
+        raise ValueError("Set your birth year and retirement age in Settings, or type a target model yourself.")
+    return savings_trades.default_target(ira_planner.glidepath_equity(p["age"], p["retire_age"], p["risk"]))
+
+
+def target_info(db, uid: int) -> dict:
+    saved = saved_target_model(db, uid)
+    try:
+        default = savings_trades.format_target(default_target_for(db, uid))
+    except ValueError:
+        default = ""
+    return {"saved": saved, "default": default, "effective": saved or default}
+
+
+def trade_plan(db, uid: int, account_ids: list[int] | None, mode: str, target_text: str | None) -> dict:
+    from . import savings_trades as st
+    accounts = [a for a in savings.load_accounts(db, uid) if account_ids is None or a["id"] in account_ids]
+    accounts = [a for a in accounts if savings.tax_bucket(a["account_type"]) in ("roth", "pre_tax")]
+    if not accounts:
+        raise ValueError("Pick at least one Roth or pre-tax retirement account that has holdings.")
+    text = (target_text or "").strip() or saved_target_model(db, uid)
+    target = st.parse_target_model(text) if text else default_target_for(db, uid)
+    symbols = set(target) | {h["symbol"] for a in accounts for h in a["holdings"]
+                             if h.get("symbol") and h.get("quantity") is not None}
+    prices = fetch_prices(symbols)
+    shaped = []
+    for a in accounts:
+        holdings = []
+        for h in a["holdings"]:
+            sym = (h.get("symbol") or "").upper() or None
+            val, _ = savings.value_holding(h, prices.get(sym) if sym else None)
+            holdings.append({**h, "symbol": sym, "value": val})
+        shaped.append({"id": a["id"], "name": f"{a['provider']} · {a['name']}",
+                       "tax": savings.tax_bucket(a["account_type"]), "holdings": holdings})
+    plan = st.plan_trades(shaped, prices, target, mode=mode)
+    plan["target_text"] = st.format_target(target)
+    plan["target_source"] = "typed" if (target_text or "").strip() else ("saved" if text else "age-based default")
+    plan["prices_as_of"] = "live quotes (may be delayed); use limit orders"
+    return plan

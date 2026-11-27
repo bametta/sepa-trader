@@ -1,0 +1,94 @@
+"""Schwab positions CSV importer, against several plausible export layouts."""
+import unittest
+from datetime import date
+
+from tests._loader import load
+
+si = load("schwab_import")
+TODAY = date(2026, 6, 1)
+
+STANDARD = '''"Positions for account PCRA Roth ...1234 as of 04:20 PM ET, 11/26/2026"
+""
+"Symbol","Description","Quantity","Price","Price Change %","Price Change $","Market Value","Day Change %","Day Change $","Cost Basis","Gain/Loss $","Gain/Loss %","Ratings","Reinvest Dividends?","Capital Gains?","% Of Account","Security Type"
+"VTI","VANGUARD TOTAL STOCK MARKET ETF","100","$250.00","0.5%","$1.25","$25,000.00","0.5%","$125.00","$20,000.00","$5,000.00","25%","--","No","N/A","60.2%","ETFs & Closed End Funds"
+"BND","VANGUARD TOTAL BOND MARKET ETF","80.5","$71.38","0%","$0.00","$5,746.09","0%","$0.00","$5,900.00","($153.91)","-2.6%","--","No","N/A","13.8%","ETFs & Closed End Funds"
+"SWVXX","SCHWAB VALUE ADVANTAGE MONEY FUND","1,000","$1.00","--","--","$1,000.00","--","--","--","--","--","--","--","--","2.4%","Money Market Fund"
+"Cash & Cash Investments","--","--","--","--","--","$9,800.00","--","--","--","--","--","--","--","--","23.6%","Cash and Money Market"
+"Account Total","--","--","--","--","--","$41,546.09","--","--","--","--","--","--","--","--","--","--"
+'''
+
+
+class ParseTests(unittest.TestCase):
+    def parse(self, text):
+        return si.parse_schwab_positions(text, TODAY)
+
+    def test_standard_export(self):
+        out = self.parse(STANDARD)
+        by = {h["symbol"] or h["name"]: h for h in out["holdings"]}
+        self.assertEqual(set(by), {"VTI", "BND", "SWVXX", "Cash & Cash Investments"})
+        self.assertEqual((by["VTI"]["quantity"], by["VTI"]["manual_value"]), (100.0, 25000.0))
+        self.assertEqual(by["BND"]["quantity"], 80.5)
+        self.assertEqual(by["SWVXX"]["quantity"], 1000.0)                     # thousands separator
+        self.assertEqual(by["SWVXX"]["asset_class"], "cash")                  # money market fund
+        self.assertEqual(by["Cash & Cash Investments"]["asset_class"], "cash")
+        self.assertIsNone(by["Cash & Cash Investments"]["symbol"])
+        self.assertEqual(out["file_total"], 41546.09)
+        self.assertEqual(out["parsed_total"], 41546.09)
+        self.assertEqual(out["warnings"], [])
+        self.assertIn("PCRA Roth", out["title"])
+
+    def test_header_without_title_and_in_other_order(self):
+        text = 'Market Value,Quantity,Description,Symbol\n"$500.00","5","Some ETF","XYZ"\n'
+        h = self.parse(text)["holdings"][0]
+        self.assertEqual((h["symbol"], h["quantity"], h["manual_value"]), ("XYZ", 5.0, 500.0))
+
+    def test_bom_blank_lines_and_extra_columns(self):
+        text = "﻿\n\nSymbol,Quantity,Market Value,Mystery\n\nVTI,10,$2500,zzz\n\n"
+        self.assertEqual(len(self.parse(text)["holdings"]), 1)
+
+    def test_parentheses_negative_and_dashes(self):
+        self.assertEqual(si.money("($153.91)"), -153.91)
+        self.assertIsNone(si.money("--"))
+        self.assertIsNone(si.money("N/A"))
+        self.assertEqual(si.money("$1,234.50"), 1234.5)
+
+    def test_position_with_only_a_value_becomes_a_manual_holding(self):
+        text = "Symbol,Description,Quantity,Market Value\nSTABLE,STABLE VALUE FUND,--,$10000\n"
+        h = self.parse(text)["holdings"][0]
+        self.assertIsNone(h["quantity"])
+        self.assertEqual(h["manual_value"], 10000.0)
+
+    def test_unusable_rows_are_skipped_with_a_warning(self):
+        text = ("Symbol,Quantity,Market Value\nVTI,10,$2500\n"
+                "??BAD??,5,$100\nSHORT,-5,$100\nEMPTY,--,--\n")
+        out = self.parse(text)
+        self.assertEqual([h["symbol"] for h in out["holdings"]], ["VTI"])
+        self.assertEqual(len(out["warnings"]), 3)
+
+    def test_total_mismatch_is_reported(self):
+        text = "Symbol,Quantity,Market Value\nVTI,10,$2500\nAccount Total,--,$9000\n"
+        self.assertTrue(any("account total" in w for w in self.parse(text)["warnings"]))
+
+    def test_lowercase_symbols_are_normalised(self):
+        self.assertEqual(self.parse("Symbol,Quantity\nvti,3\n")["holdings"][0]["symbol"], "VTI")
+
+    def test_unreadable_inputs_raise_helpful_errors(self):
+        for bad in ("", "   ", "a,b,c\n1,2,3\n", "Symbol,Description\nVTI,x\n", "Symbol,Quantity\n"):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                self.parse(bad)
+        with self.assertRaises(ValueError) as cm:
+            self.parse("a,b,c\n1,2,3\n")
+        self.assertIn("first few lines", str(cm.exception))
+
+    def test_detection(self):
+        self.assertTrue(si.looks_like_schwab(STANDARD))
+        self.assertFalse(si.looks_like_schwab("symbol,name,quantity,value\nVTI,,10,\n"))
+
+    def test_output_matches_the_holdings_shape_the_tracker_stores(self):
+        for h in self.parse(STANDARD)["holdings"]:
+            self.assertEqual(set(h), {"symbol", "name", "quantity", "manual_value", "asset_class", "illiquid", "as_of"})
+            self.assertEqual(h["as_of"], TODAY)
+
+
+if __name__ == "__main__":
+    unittest.main()
