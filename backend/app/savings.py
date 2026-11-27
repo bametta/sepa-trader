@@ -24,7 +24,11 @@ EQUITY_CLASSES = set(EQUITY_BUCKETS) | {"company_stock"}
 ILLIQUID_DEFAULT = {"alt_real_estate", "alt_private", "alt_other"}
 
 STALE_DAYS = {"liquid": 90, "illiquid": 180}
-LIMITS = {"position_pct": 0.25, "company_stock_pct": 0.10, "illiquid_pct": 0.25}
+LIMITS = {"position_pct": 0.25, "company_stock_pct": 0.10, "illiquid_pct": 0.25, "tech_theme_pct": 0.30}
+# Technology / semiconductor / AI funds: different tickers, but they hold many of the same companies, so they behave
+# like one big bet. Broad funds (VTI, VOO...) hold tech too and are deliberately not counted here.
+TECH_THEME = {"QQQ", "QQQM", "SMH", "SOXX", "SOXQ", "XLK", "VGT", "FTEC", "IYW", "IGV", "BOTZ", "ROBO", "AIQ",
+              "ARKK", "ARKW", "ARKQ", "CIBR", "SKYY", "FDN", "WCLD", "XSD", "PSI"}
 MAX_HOLDINGS = 500
 MAX_CSV_CHARS = 200_000
 CSV_COLUMNS = ("symbol", "name", "quantity", "value", "asset_class", "illiquid", "as_of")
@@ -213,6 +217,8 @@ def is_single_name(h: dict) -> bool:
     if cls in ("company_stock", "crypto"):
         return True
     sym = (h.get("symbol") or "").upper()
+    if sym in TECH_THEME:                 # a sector bet, even though it is a fund
+        return True
     if cls != "auto" or not sym:
         return False
     if sym in REFERENCE or (len(sym) == 5 and sym.endswith("X")):
@@ -237,6 +243,7 @@ def build_summary(accounts: list[dict], prices: dict, today: date | None = None,
     by_provider, by_tax, by_class, positions = {}, {}, {}, {}
     out_accounts, warnings = [], []
     stale, missing, unclassified = [], [], 0.0
+    tech_total, tech_syms = 0.0, set()
 
     for a in accounts:
         acct_value = 0.0
@@ -257,6 +264,9 @@ def build_summary(accounts: list[dict], prices: dict, today: date | None = None,
             p = positions.setdefault(key, {"symbol": sym, "name": h["name"], "value": 0.0, "single": False})
             p["value"] += val
             p["single"] = p["single"] or is_single_name(h)
+            if sym in TECH_THEME:
+                tech_total += val
+                tech_syms.add(sym)
             as_of = h.get("as_of")
             age = (today - as_of).days if as_of else None
             is_stale = (source == "manual" and age is not None
@@ -318,6 +328,11 @@ def build_summary(accounts: list[dict], prices: dict, today: date | None = None,
         if p["pct"] > LIMITS["position_pct"] and p["single"]:
             warnings.append({"code": "CONCENTRATION", "severity": "warn",
                              "detail": f"{p['name']} is {p['pct']:.0%} of everything you track."})
+    if pct(tech_total) > LIMITS["tech_theme_pct"]:
+        warnings.append({"code": "TECH_THEME", "severity": "warn",
+                         "detail": f"Tech / semiconductor / AI funds ({', '.join(sorted(tech_syms))}) are "
+                                   f"{pct(tech_total):.0%} of everything you track. They hold many of the same "
+                                   f"companies, so they move together."})
     if pct(by_class.get("company_stock", 0.0)) > LIMITS["company_stock_pct"]:
         warnings.append({"code": "COMPANY_STOCK", "severity": "warn",
                          "detail": f"Employer stock is {pct(by_class['company_stock']):.0%} of your total."})
@@ -332,8 +347,33 @@ def build_summary(accounts: list[dict], prices: dict, today: date | None = None,
         "by_tax": {k: round(v, 2) for k, v in sorted(by_tax.items(), key=lambda kv: -kv[1])},
         "by_class": {k: round(v, 2) for k, v in sorted(by_class.items(), key=lambda kv: -kv[1])},
         "equity_share": pct(equity), "illiquid_share": pct(illiquid_total),
+        "by_theme": {"tech": round(tech_total, 2), "tech_pct": pct(tech_total)},
         "positions": top, "warnings": warnings, "deferrals": deferrals,
     }
+
+
+def update_reminder(accounts: list[dict], today: date | None = None, max_age: int = 45) -> str | None:
+    """Quarterly nudge to refresh hand-tracked accounts. None when there is nothing to track.
+    Read-only (Alpaca) accounts update themselves and are skipped."""
+    today = today or date.today()
+    lines = []
+    for a in accounts:
+        if a.get("read_only"):
+            continue
+        dates = [h["as_of"] for h in a.get("holdings", []) if h.get("as_of")]
+        label = f"{a['provider']} / {a['name']}"
+        if not dates:
+            lines.append(f"- {label}: no holdings recorded yet")
+            continue
+        age = (today - max(dates)).days
+        if age > max_age:
+            lines.append(f"- {label}: last updated {max(dates).isoformat()} ({age} days ago)")
+        else:
+            lines.append(f"- {label}: updated {age} days ago (fine)")
+    if not lines:
+        return None
+    return ("Quarterly savings check-in: re-import or update your accounts so the totals, trade helper and "
+            "concentration checks stay accurate.\n" + "\n".join(lines))
 
 
 # ── Database ──────────────────────────────────────────────────────────────────

@@ -40,6 +40,38 @@ FIDELITY_TWO = (FID_HEADER +
     'Z22222222,Joint Brokerage,SPAXX**,HELD IN MONEY MARKET,,,,$500.00,,,,,,,,Margin\n' + FID_FOOTER)
 
 
+SCHWAB_REAL_STYLE = '''"Positions for account PCRA Roth ...0001 as of 11/27/2026"
+""
+"Symbol","Description","Qty (Quantity)","Price","Price Chng % (Price Change %)","Price Chng $ (Price Change $)","Mkt Val (Market Value)","Day Chng % (Day Change %)","Day Chng $ (Day Change $)","Cost Basis","Gain $ (Gain/Loss $)","Gain % (Gain/Loss %)","Ratings","Reinvest?","Reinvest Capital Gains?","% of Acct (% of Account)","Asset Type","Security Type"
+"QQQM","INVESCO NASDAQ 100 ETF","25.4","$267.80","0.5%","$1.30","$6,801.89","0.5%","$33.02","$6,000.00","$801.89","13.4%","--","No","N/A","41.8%","Equity","ETFs & Closed End Funds"
+"SMH","VANECK SEMICONDUCTOR ETF","7.25","$440.00","-0.3%","-$1.32","$3,190.00","-0.3%","-$9.57","$3,000.00","$190.00","6.3%","--","No","N/A","19.6%","Equity","ETFs & Closed End Funds"
+"Cash & Cash Investments","--","--","--","--","--","$1,554.26","--","--","--","--","--","--","--","--","9.6%","Cash and Money Market","Cash and Money Market"
+"Account Total","--","--","--","--","--","$11,546.15","--","--","--","--","--","--","--","--","--","--","--"
+'''
+
+
+class SchwabHeaderTests(unittest.TestCase):
+    """Schwab's real export names columns like 'Qty (Quantity)' and 'Mkt Val (Market Value)'."""
+
+    def test_quantity_column_with_a_bracketed_name_is_read(self):
+        by = {h["symbol"] or h["name"]: h for h in si.parse_positions(SCHWAB_REAL_STYLE, TODAY)["holdings"]}
+        self.assertEqual(by["QQQM"]["quantity"], 25.4)
+        self.assertEqual(by["SMH"]["quantity"], 7.25)
+        self.assertEqual(by["QQQM"]["manual_value"], 6801.89)
+        self.assertEqual(by["Cash & Cash Investments"]["asset_class"], "cash")
+
+    def test_totals_still_reconcile(self):
+        out = si.parse_positions(SCHWAB_REAL_STYLE, TODAY)
+        self.assertEqual(out["file_total"], 11546.15)
+        self.assertEqual(out["warnings"], [])
+
+    def test_quantity_variants(self):
+        for header in ("Quantity", "Qty", "Qty (Quantity)", "Shares"):
+            with self.subTest(header=header):
+                text = f"Symbol,{header},Market Value\nVTI,3,$900\n"
+                self.assertEqual(si.parse_positions(text, TODAY)["holdings"][0]["quantity"], 3.0)
+
+
 class FidelityTests(unittest.TestCase):
     def parse(self, text, key=None):
         return si.parse_positions(text, TODAY, key)

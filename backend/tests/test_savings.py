@@ -611,5 +611,48 @@ class DbLayerTests(unittest.TestCase):
                 self.assertEqual(params.get("u"), 7, sql)
 
 
+class TechThemeTests(unittest.TestCase):
+    def test_tech_funds_flagged_together(self):
+        s = sv.build_summary([acct("Schwab", "roth_ira", [
+            hold("a", "QQQM", qty=10), hold("b", "SMH", qty=10), hold("c", "BOTZ", qty=10),
+            hold("d", "BND", qty=10)])], {"QQQM": 100, "SMH": 100, "BOTZ": 100, "BND": 100}, TODAY)
+        self.assertIn("TECH_THEME", {w["code"] for w in s["warnings"]})
+        self.assertAlmostEqual(s["by_theme"]["tech_pct"], 0.75)
+
+    def test_broad_funds_not_flagged(self):
+        s = sv.build_summary([acct("Fidelity", "roth_ira", [hold("v", "VTI", qty=10)])], {"VTI": 100}, TODAY)
+        self.assertNotIn("TECH_THEME", {w["code"] for w in s["warnings"]})
+        self.assertEqual(s["by_theme"]["tech"], 0)
+
+    def test_small_tech_slice_ok(self):
+        s = sv.build_summary([acct("Fidelity", "roth_ira", [
+            hold("q", "QQQM", qty=1), hold("v", "VTI", qty=9)])], {"QQQM": 100, "VTI": 100}, TODAY)
+        self.assertNotIn("TECH_THEME", {w["code"] for w in s["warnings"]})
+
+
+class ReminderTests(unittest.TestCase):
+    def test_flags_old_and_empty_accounts(self):
+        old = TODAY - timedelta(days=100)
+        msg = sv.update_reminder([
+            acct("Schwab", "roth_ira", [hold("x", val=1, as_of=old)], aid=1),
+            acct("Fidelity", "roth_ira", [hold("y", val=1, as_of=TODAY)], aid=2),
+            acct("Equity Trust", "ira", [], aid=3)], TODAY)
+        self.assertIn("100 days ago", msg)
+        self.assertIn("Equity Trust", msg)
+        self.assertIn("Fidelity", msg)
+        self.assertIn("fine", msg)
+
+    def test_skips_read_only_and_none_when_nothing(self):
+        a = acct("Alpaca", "roth_ira", [hold("z", val=1)])
+        a["read_only"] = True
+        self.assertIsNone(sv.update_reminder([a], TODAY))
+        self.assertIsNone(sv.update_reminder([], TODAY))
+
+    def test_boundary_is_not_stale(self):
+        edge = TODAY - timedelta(days=45)
+        msg = sv.update_reminder([acct("S", "roth_ira", [hold("x", val=1, as_of=edge)])], TODAY)
+        self.assertIn("fine", msg)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -730,6 +730,30 @@ async def _ira_contribution_reminder_job():
     await asyncio.get_running_loop().run_in_executor(None, _ira_contribution_reminders)
 
 
+def _savings_update_reminders() -> None:
+    """Quarterly: ask users who track savings accounts by hand to refresh them."""
+    from . import savings
+    from . import telegram_alerts as tg
+    today = datetime.now(_ET).date()
+    db = SessionLocal()
+    try:
+        uids = [r[0] for r in db.execute(text(
+            "SELECT DISTINCT user_id FROM savings_accounts WHERE is_active")).fetchall()]
+        for uid in uids:
+            try:
+                msg = savings.update_reminder(savings.load_accounts(db, uid), today)
+                if msg:
+                    tg.send_sync(msg, level="INFO")
+            except Exception as exc:
+                logger.error("Savings update reminder uid=%s failed: %s", uid, exc)
+    finally:
+        db.close()
+
+
+async def _savings_update_reminder_job():
+    await asyncio.get_running_loop().run_in_executor(None, _savings_update_reminders)
+
+
 async def _ira_watchdog():
     """
     Weekdays 10:30 AM ET. For each user with ira_enabled=true, runs the IRA
@@ -1194,6 +1218,14 @@ def start_scheduler():
         _ira_contribution_reminder_job,
         CronTrigger(day=1, hour=9, minute=0, timezone="America/New_York"),
         id="ira_contribution_reminder",
+        replace_existing=True,
+    )
+
+    # Savings tracker check-in: Jan/Apr/Jul/Oct 1st, 9:15 AM ET.
+    scheduler.add_job(
+        _savings_update_reminder_job,
+        CronTrigger(month="1,4,7,10", day=1, hour=9, minute=15, timezone="America/New_York"),
+        id="savings_update_reminder",
         replace_existing=True,
     )
 
