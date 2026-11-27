@@ -106,6 +106,26 @@ class BacktestEngineTests(unittest.TestCase):
         self.assertAlmostEqual(trend.sum(), 1.0, places=6)
         self.assertAlmostEqual(plain.sum(), 1.0, places=6)
 
+    def test_live_overlay_matches_the_validated_backtest_exactly(self):
+        """What runs live must be what was validated: same weights from the same market state."""
+        import sys
+        live = sys.modules["app.ira_manager"]
+        universe = list(self.b.DEFAULT_UNIVERSE)
+        cols = universe + ["SPY"]
+        idx = pd.bdate_range("2020-01-01", periods=300)
+        rng = np.random.default_rng(5)
+        for trial in range(30):
+            drift = {s: rng.choice([-0.002, 0.002]) for s in cols}
+            px = pd.DataFrame({s: 100 * np.exp(np.cumsum(rng.normal(drift[s], 0.004, 300))) for s in cols}, index=idx)
+            px["SPY"] = np.linspace(100, 200, 300)          # calm uptrend -> risk_on
+            vix = pd.Series(15.0, index=idx)
+            bt_row = self.b.build_regime_targets(px, cols, universe, 200, True, vix)[-1]
+            stats = {s: {"above_200sma": bool(px[s].iloc[-1] > px[s].tail(200).mean())} for s in universe}
+            base = live.normalize_weights(live.BASELINES["risk_on"], universe)
+            weights, _ = live.apply_trend_overlay(base, stats, universe)
+            live_row = np.array([weights.get(c, 0.0) for c in cols])
+            np.testing.assert_allclose(live_row, bt_row, atol=1e-9, err_msg=f"trial {trial}")
+
     def test_metrics_max_drawdown(self):
         idx = pd.bdate_range("2020-01-01", periods=5)
         curve = pd.Series([1.0, 1.2, 0.6, 0.9, 1.0], index=idx)

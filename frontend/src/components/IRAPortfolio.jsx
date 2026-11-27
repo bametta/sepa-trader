@@ -346,6 +346,11 @@ export default function IRAPortfolio() {
                 ))}
               </tbody>
             </table>
+            {t.trend_flagged?.length > 0 && (
+              <div className="text-xs text-amber-400">
+                Trend overlay: {t.trend_flagged.join(', ')} below the 200-day average, held at half weight with the rest in T-bills.
+              </div>
+            )}
             {t.rationale && (
               <div className="text-xs text-slate-400 italic border-t border-white/[0.05] pt-2">
                 {t.rationale}
