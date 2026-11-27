@@ -3,7 +3,10 @@
  */
 import { useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
-import { fetchIRAStatus, fetchIRATarget, fetchIRAHistory, runIRARebalance } from '../api/client'
+import {
+  fetchIRAStatus, fetchIRATarget, fetchIRAHistory, runIRARebalance,
+  fetchIRAPlan, runIRABacktest,
+} from '../api/client'
 
 const usd = v => v != null ? new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(v) : '—'
 const pct = (v, d = 1) => v != null ? `${(v * 100).toFixed(d)}%` : '—'
@@ -58,6 +61,146 @@ function PlanTable({ plan }) {
   )
 }
 
+const VERDICT = {
+  APPROVE: 'text-emerald-400', NO_TRADES: 'text-slate-400',
+  BLOCK: 'text-red-400', UNAVAILABLE: 'text-amber-400',
+}
+const SEV = { block: 'text-red-400', warn: 'text-amber-400', info: 'text-slate-500' }
+const usd0 = v => v != null ? `$${Math.round(v).toLocaleString('en-US')}` : '—'
+
+function GateCard({ gate }) {
+  return (
+    <div className="border-t border-white/[0.05] pt-3 space-y-1.5">
+      <div className="flex items-center gap-2">
+        <span className="text-[10px] uppercase tracking-wider text-slate-500">AI gate</span>
+        <span className={`text-sm font-semibold ${VERDICT[gate.verdict] || 'text-slate-300'}`}>{gate.verdict}</span>
+        <span className="text-[11px] text-slate-500 num">
+          expense {gate.metrics.blended_expense_pct}% · turnover {gate.metrics.turnover_pct}%
+        </span>
+      </div>
+      {gate.reason && <div className="text-xs text-slate-400">{gate.reason}</div>}
+      {gate.checks.map((c, i) => (
+        <div key={i} className={`text-[11px] ${SEV[c.severity]}`}>{c.severity.toUpperCase()} · {c.detail}</div>
+      ))}
+    </div>
+  )
+}
+
+function PlanCard({ plan }) {
+  if (!plan) return null
+  if (!plan.ready) {
+    return (
+      <div className="card space-y-1">
+        <div className="text-slate-100 font-semibold">Retirement plan</div>
+        <div className="text-sm text-slate-400">
+          Add your birth year and a retirement target (or yearly income goal) in Settings → IRA Portfolio
+          to get a projection and contribution recommendation.
+        </div>
+      </div>
+    )
+  }
+  const r = plan.recommendation
+  return (
+    <div className="card space-y-3">
+      <div className="flex items-center justify-between">
+        <div className="text-slate-100 font-semibold">Retirement plan</div>
+        <span className="text-[11px] text-slate-500 num">
+          age {plan.profile.age} → {plan.profile.retire_age} · glidepath equity {pct(plan.glidepath_equity, 0)}
+          {plan.glidepath_gap != null && ` (target ${plan.glidepath_gap >= 0 ? '+' : ''}${(plan.glidepath_gap * 100).toFixed(0)} pts)`}
+        </span>
+      </div>
+      {plan.target?.amount && (
+        <div className="text-sm text-slate-300">
+          Goal {usd0(plan.target.amount)} in today's dollars ({plan.target.basis}) · expected real return {pct(plan.expected_real_return)}, volatility {pct(plan.expected_volatility)}
+        </div>
+      )}
+      {r && (
+        <div className="rounded-lg border border-white/[0.08] p-3 space-y-1">
+          <div className="text-[10px] uppercase tracking-wider text-slate-500">Recommended contribution</div>
+          <div className="text-lg font-bold text-slate-100 num">
+            {r.kind === 'already_on_track' ? 'Already on track'
+              : `${usd0(r.annual)}/yr · ${usd0(r.monthly)}/mo (${pct(r.pct_of_limit, 0)} of the ${usd0(plan.contribution_limit)} limit)`}
+            {r.pct_of_income != null && r.kind !== 'already_on_track' && ` · ${pct(r.pct_of_income)} of income`}
+          </div>
+          {r.kind === 'limit_not_enough' && (
+            <div className="text-xs text-amber-400">
+              Maxing the IRA gives only a {pct(r.prob_at_limit, 0)} chance. About {usd0(r.total_annual_saving_needed)}/yr
+              total saving is needed for {pct(r.success_threshold, 0)} confidence, i.e. {usd0(r.extra_outside_ira)}/yr beyond the IRA.
+            </div>
+          )}
+        </div>
+      )}
+      <table className="w-full text-sm">
+        <thead>
+          <tr className="text-[10px] uppercase tracking-wider text-slate-500 text-left">
+            <th className="py-1">Contribution</th><th className="text-right">Poor (p10)</th>
+            <th className="text-right">Median</th><th className="text-right">Good (p90)</th>
+            {plan.target?.amount && <th className="text-right">Reach goal</th>}
+          </tr>
+        </thead>
+        <tbody>
+          {plan.scenarios.map(s => (
+            <tr key={s.annual} className="border-t border-white/[0.05]">
+              <td className="py-1.5 text-slate-200 num">{usd0(s.annual)}/yr ({pct(s.pct_of_limit, 0)})</td>
+              <td className="text-right num text-slate-400">{usd0(s.p10)}</td>
+              <td className="text-right num text-slate-200">{usd0(s.p50)}</td>
+              <td className="text-right num text-slate-400">{usd0(s.p90)}</td>
+              {plan.target?.amount && <td className="text-right num text-slate-300">{pct(s.prob_reach_target, 0)}</td>}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      <div className="text-[11px] text-slate-600">
+        {plan.disclaimer} IRS limits: {plan.limits.note}
+      </div>
+    </div>
+  )
+}
+
+function BacktestCard() {
+  const bt = useMutation(runIRABacktest)
+  const res = bt.data?.results
+  return (
+    <div className="card space-y-3">
+      <div className="flex items-center justify-between">
+        <div className="text-slate-100 font-semibold">Strategy backtest</div>
+        <button className="btn-ghost" disabled={bt.isLoading}
+                onClick={() => bt.mutate({ cadence: 'weekly', threshold: 0.05, cost_bps: 3 })}>
+          {bt.isLoading ? 'Running…' : 'Run backtest'}
+        </button>
+      </div>
+      {bt.isError && <div className="text-sm text-red-400">{errMsg(bt.error)}</div>}
+      {res && (
+        <>
+          <table className="w-full text-sm">
+            <thead>
+              <tr className="text-[10px] uppercase tracking-wider text-slate-500 text-left">
+                <th className="py-1">Strategy</th><th className="text-right">CAGR</th><th className="text-right">Vol</th>
+                <th className="text-right">Sharpe</th><th className="text-right">Max DD</th><th className="text-right">Turnover/yr</th>
+              </tr>
+            </thead>
+            <tbody>
+              {Object.entries(res).map(([name, m]) => (
+                <tr key={name} className="border-t border-white/[0.05]">
+                  <td className="py-1.5 text-slate-200">{name.replace('_', ' ')}</td>
+                  <td className="text-right num text-slate-200">{pct(m.cagr)}</td>
+                  <td className="text-right num text-slate-400">{pct(m.volatility)}</td>
+                  <td className="text-right num text-slate-300">{m.sharpe ?? '—'}</td>
+                  <td className="text-right num text-red-400">{pct(m.max_drawdown)}</td>
+                  <td className="text-right num text-slate-400">{m.turnover_per_year.toFixed(2)}x</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          <div className="text-[11px] text-slate-600">
+            {bt.data.period.start} → {bt.data.period.end}. {bt.data.notes.join(' ')}
+          </div>
+        </>
+      )}
+    </div>
+  )
+}
+
 export default function IRAPortfolio() {
   const qc = useQueryClient()
   const [preview, setPreview] = useState(null)
@@ -67,6 +210,7 @@ export default function IRAPortfolio() {
   const connected = status.data?.connected
   const target = useQuery('ira-target', fetchIRATarget, { enabled: !!connected, retry: false, staleTime: 5 * 60000 })
   const history = useQuery('ira-history', () => fetchIRAHistory(10), { enabled: !!connected })
+  const plan = useQuery('ira-plan', fetchIRAPlan, { enabled: !!connected, retry: false, staleTime: 5 * 60000 })
 
   const rebalance = useMutation(runIRARebalance, {
     onSuccess: (data, vars) => {
@@ -174,12 +318,16 @@ export default function IRAPortfolio() {
         )}
         {rebalance.data?.note && <div className="text-sm text-slate-400">{rebalance.data.note}</div>}
         {preview && <PlanTable plan={preview.plan} />}
+        {preview?.gate && <GateCard gate={preview.gate} />}
         {preview?.plan?.some(o => o.capped) && (
           <div className="text-[11px] text-slate-500">
             * Buy reduced to settled cash. Sale proceeds settle T+1; the next run completes the buy.
           </div>
         )}
       </div>
+
+      <PlanCard plan={plan.data} />
+      <BacktestCard />
 
       <div className="card space-y-2">
         <div className="text-slate-100 font-semibold">History</div>

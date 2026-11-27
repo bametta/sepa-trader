@@ -30,6 +30,7 @@ DEFAULT_UNIVERSE = ["VTI", "VXUS", "QQQ", "SCHD", "VNQ", "BND", "TIP", "GLD", "B
 MAX_WEIGHT       = 0.40   # no single ETF above 40%
 MIN_DEFENSIVE    = 0.05   # always keep >=5% in BND/TIP/BIL
 MIN_TRADE_USD    = 5.0
+MIN_DEPLOY_USD   = 25.0   # idle settled cash below this isn't worth deploying
 DEFENSIVE        = {"BND", "TIP", "BIL"}
 
 # Rules-based baselines by regime (weights sum to 1.0)
@@ -196,7 +197,9 @@ def _ai_adjust(db: Session, user_id: int, baseline: dict, regime: str,
         "You are the portfolio manager for a long-horizon Roth IRA (ETF-only, no leverage, "
         "no shorting, rebalanced weekly). Goal: long-term growth with controlled drawdowns.\n\n"
         f"Detected regime: {regime}\n"
-        f"Context: {json.dumps(context, default=str)[:2500]}\n"
+        f"Context: {json.dumps({k: v for k, v in context.items() if k not in ('etf_market', 'profile_line')}, default=str)[:2000]}\n"
+        f"Live ETF stats (returns, 20d vol, % off 52w high, above 200d SMA): {json.dumps(context.get('etf_market', {}))}\n"
+        f"{context.get('profile_line', '')}\n"
         f"Current holdings: {json.dumps([{k: h[k] for k in ('symbol','weight','unrealized_plpc')} for h in holdings], default=str)}\n"
         f"Rules-based baseline weights: {json.dumps(baseline)}\n\n"
         "You may tilt the baseline by at most ±10 percentage points per ETF. Use ONLY the tickers "
@@ -204,7 +207,7 @@ def _ai_adjust(db: Session, user_id: int, baseline: dict, regime: str,
         'Reply with JSON only: {"weights": {"TICKER": 0.xx, ...}, "rationale": "2-4 sentences"}'
     )
     try:
-        raw = _call_ai(db, prompt, 700, user_id)
+        raw = _call_ai(db, prompt, 1500, user_id)
     except Exception as exc:
         logger.error("ira AI call failed: %s", exc)
         return baseline, f"AI unavailable ({str(exc)[:80]}); using rules-based baseline."
@@ -228,6 +231,19 @@ def _ai_adjust(db: Session, user_id: int, baseline: dict, regime: str,
 def build_target(db: Session, user_id: int, holdings: list[dict] | None = None) -> dict:
     cfg = get_config(db, user_id)
     regime, ctx = _detect_regime()
+    try:
+        from . import ira_data, ira_planner
+        stats = ira_data.market_stats(cfg["universe"])
+        ctx["etf_market"] = {s: {k: v[k] for k in ("ret_1m", "ret_3m", "ret_12m", "vol_20d",
+                                                    "pct_off_52w_high", "above_200sma")}
+                             for s, v in stats.items() if v}
+        prof = ira_planner.get_profile(db, user_id)
+        if prof["age"] is not None:
+            ctx["profile_line"] = (
+                f"Investor: age {prof['age']}, retire at {prof['retire_age']}, risk {prof['risk']}; "
+                f"age-appropriate equity share ~{ira_planner.glidepath_equity(prof['age'], prof['retire_age'], prof['risk']):.0%}.")
+    except Exception as exc:
+        logger.warning("ira live context failed: %s", exc)
     baseline = normalize_weights(BASELINES[regime], cfg["universe"])
     tilted, rationale = _ai_adjust(db, user_id, baseline, regime, ctx, holdings or [])
     target = normalize_weights(tilted, cfg["universe"])
@@ -276,6 +292,33 @@ def plan_rebalance(snapshot: dict, target: dict, threshold_pct: float,
             capped.append({**o, "notional": round(amt, 2),
                            "capped": amt < o["notional"] - 0.01})
             budget -= amt
+
+    # Deploy idle settled cash (initial funding, contributions) into the most underweight
+    # ETFs even when each shortfall is under the drift threshold. Buy-only, keeps the cash buffer.
+    free = budget - equity * cash_buffer
+    if free >= MIN_DEPLOY_USD:
+        selling = {o["symbol"] for o in sells}
+        ordered = {o["symbol"]: o for o in capped}
+        short = {}
+        for sym, tgt_w in target.items():
+            if tgt_w <= 0 or sym in selling:
+                continue
+            gap = investable * tgt_w - held.get(sym, {}).get("market_value", 0.0) \
+                  - ordered.get(sym, {}).get("notional", 0.0)
+            if gap >= MIN_TRADE_USD:
+                short[sym] = gap
+        total = sum(short.values())
+        for sym, gap in sorted(short.items(), key=lambda kv: -kv[1]):
+            amt = round(gap * min(1.0, free / total), 2)
+            if amt < MIN_TRADE_USD:
+                continue
+            if sym in ordered:
+                ordered[sym]["notional"] = round(ordered[sym]["notional"] + amt, 2)
+                ordered[sym]["capped"] = False
+            else:
+                drift = (held.get(sym, {}).get("market_value", 0.0) / equity - target[sym]) * 100.0
+                capped.append({"symbol": sym, "side": "buy", "notional": amt,
+                               "drift_pct": round(drift, 2), "cash_deploy": True})
     return sells + capped
 
 
@@ -320,11 +363,31 @@ def run_rebalance(db: Session, user_id: int, execute: bool = False, force: bool 
     threshold = 0.0 if force else cfg["threshold_pct"]
     plan = plan_rebalance(snap, tgt["target"], threshold, cfg["cash_buffer"])
 
+    from . import ira_data, ira_gate, ira_planner
+    try:
+        planner = ira_planner.build_plan(
+            db, user_id, snap["equity"],
+            tactical_equity=ira_planner.equity_share_of(ira_data.bucket_exposure(tgt["target"])),
+        )
+    except Exception as exc:
+        logger.warning("ira planner failed: %s", exc)
+        planner = None
+    gate = ira_gate.review(db, user_id, snap, tgt, plan, planner)
+    if plan:
+        try:
+            from .claude_analyst import log_pre_trade
+            log_pre_trade(db, "IRA", "IRA_REBALANCE", gate["verdict"], gate["reason"],
+                          ira_gate.format_analysis(gate), MODE, user_id)
+        except Exception as exc:
+            logger.warning("ira gate log failed: %s", exc)
+
     results: list[dict] = []
     executed = False
     note = ""
     if plan and execute:
-        if not _market_open(alp.get_client(MODE)):
+        if gate["verdict"] != "APPROVE":
+            note = f"AI gate {gate['verdict']}: {gate['reason']} — plan saved, not executed."
+        elif not _market_open(alp.get_client(MODE)):
             note = "Market closed — plan saved, not executed."
         else:
             results = execute_plan(db, user_id, plan)
@@ -337,7 +400,7 @@ def run_rebalance(db: Session, user_id: int, execute: bool = False, force: bool 
     payload = {
         "regime": tgt["regime"], "baseline": tgt["baseline"], "target": tgt["target"],
         "plan": plan, "results": results, "equity": snap["equity"],
-        "spendable": snap["spendable"], "note": note,
+        "spendable": snap["spendable"], "note": note, "gate": gate,
         "ran_at": datetime.utcnow().isoformat(),
     }
     db.execute(
@@ -360,7 +423,7 @@ def run_rebalance(db: Session, user_id: int, execute: bool = False, force: bool 
             tg.send_sync(f"IRA rebalance submitted: {len(results)} order(s), regime {tgt['regime']}.")
         except Exception:
             pass
-    return {**payload, "executed": executed, "rationale": tgt["rationale"]}
+    return {**payload, "executed": executed, "rationale": tgt["rationale"], "planner": planner}
 
 
 def get_history(db: Session, user_id: int, limit: int = 20) -> list[dict]:

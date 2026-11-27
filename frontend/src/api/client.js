@@ -135,6 +135,9 @@ export const fetchIRAStatus    = () => api.get('/ira/status').then(r => r.data)
 export const fetchIRATarget    = () => api.get('/ira/target').then(r => r.data)
 export const fetchIRAHistory   = (limit = 20) => api.get(`/ira/history?limit=${limit}`).then(r => r.data)
 export const runIRARebalance   = (body) => api.post('/ira/rebalance', body).then(r => r.data)
+export const fetchIRAPlan      = () => api.get('/ira/plan').then(r => r.data)
+export const fetchIRAReference = () => api.get('/ira/reference').then(r => r.data)
+export const runIRABacktest    = (body) => api.post('/ira/backtest', body, { timeout: 180000 }).then(r => r.data)
 
 // ── AI pre-trade gate log ─────────────────────────────────────────────────────
 export const fetchPreTradeLog = (limit = 100, symbol = null) =>
