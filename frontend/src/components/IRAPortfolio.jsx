@@ -192,9 +192,55 @@ function BacktestCard() {
               ))}
             </tbody>
           </table>
-          <div className="text-[11px] text-slate-600">
-            {bt.data.period.start} → {bt.data.period.end}. {bt.data.notes.join(' ')}
+          <div className="text-[11px] text-slate-500">
+            {bt.data.data_mode} · {bt.data.period.start} → {bt.data.period.end}
           </div>
+
+          <div className="border-t border-white/[0.05] pt-3 space-y-2">
+            <div className="text-[10px] uppercase tracking-wider text-slate-500">
+              Does timing beat a static portfolio with the same average holdings?
+            </div>
+            {Object.entries(bt.data.verdict || {}).map(([name, v]) => (
+              <div key={name} className="text-sm">
+                <span className={`font-semibold ${v.earns_its_place ? 'text-emerald-400' : 'text-amber-400'}`}>
+                  {name.replace('_', ' ')}: {v.earns_its_place ? 'earns its place' : 'does not clear the bar'}
+                </span>
+                <span className="text-slate-400">
+                  {' '}· max drawdown {pct(v.drawdown_vs_matched_static)} vs static · CAGR {pct(v.cagr_vs_matched_static)}
+                  {' '}· shallower in {v.stress_windows_with_shallower_drawdown} crashes
+                  {' '}· holds in {pct(v.sensitivity_pass_rate, 0)} of parameter settings
+                </span>
+              </div>
+            ))}
+          </div>
+
+          <table className="w-full text-sm">
+            <thead>
+              <tr className="text-[10px] uppercase tracking-wider text-slate-500 text-left">
+                <th className="py-1">Crash</th><th>Strategy</th><th className="text-right">Max DD</th>
+                <th className="text-right">Static, same holdings</th>
+              </tr>
+            </thead>
+            <tbody>
+              {Object.entries(bt.data.stress || {}).flatMap(([label, row]) =>
+                ['regime_baseline', 'regime_trend'].map(n => (
+                  <tr key={label + n} className="border-t border-white/[0.05]">
+                    <td className="py-1 text-slate-300">{label.replace(/_/g, ' ')}</td>
+                    <td className="text-slate-400">{n.replace('regime_', '')}</td>
+                    <td className="text-right num text-slate-200">{pct(row[n]?.max_drawdown)}</td>
+                    <td className="text-right num text-slate-400">{pct(row['matched_static_for_' + n]?.max_drawdown)}</td>
+                  </tr>
+                )))}
+            </tbody>
+          </table>
+
+          {bt.data.rolling && (
+            <div className="text-xs text-slate-400">
+              Rolling 5-year windows, trend strategy vs static: smaller drawdown in {pct(bt.data.rolling['5y']?.regime_trend?.shallower_drawdown, 0)},
+              higher return in {pct(bt.data.rolling['5y']?.regime_trend?.beat_on_return, 0)}. The benefit is crash protection and it usually costs return in calm markets.
+            </div>
+          )}
+          <div className="text-[11px] text-slate-600">{bt.data.notes.join(' ')}</div>
         </>
       )}
     </div>
@@ -300,6 +346,11 @@ export default function IRAPortfolio() {
                 ))}
               </tbody>
             </table>
+            {t.trend_flagged?.length > 0 && (
+              <div className="text-xs text-amber-400">
+                Trend overlay: {t.trend_flagged.join(', ')} below the 200-day average, held at half weight with the rest in T-bills.
+              </div>
+            )}
             {t.rationale && (
               <div className="text-xs text-slate-400 italic border-t border-white/[0.05] pt-2">
                 {t.rationale}

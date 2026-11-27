@@ -68,6 +68,7 @@ def get_config(db: Session, user_id: int) -> dict:
     return {
         "enabled":       g("ira_enabled", "false").lower() == "true",
         "halted":        g("ira_halt", "false").lower() == "true",
+        "trend_overlay": g("ira_trend_overlay", "true").lower() != "false",
         "tilt_pp":       max(0.0, min(10.0, tilt)),
         "universe":      uni or DEFAULT_UNIVERSE,
         "threshold_pct": max(1.0, min(25.0, threshold)),
@@ -126,14 +127,12 @@ def get_snapshot(db: Session, user_id: int) -> dict:
 # ── Allocation engine ─────────────────────────────────────────────────────────
 
 def _detect_regime() -> tuple[str, dict]:
-    """Map market environment + Dual Momentum into a coarse regime label.
-
-    SPY below its 200-day SMA (CORRECTION) caps the regime at neutral, so a
-    Dual Momentum SPY/EFA pick can't promote it to risk-on.
+    """Regime from SPY vs its 200-day SMA and VIX only, the exact rules validated in ira_backtest:
+    BULL/BULL_VOLATILE -> risk_on, BEAR -> risk_off, anything else (CORRECTION, TRANSITIONAL,
+    data failure) -> neutral. Dual Momentum is deliberately excluded because it was never backtested.
     """
     info: dict = {}
     regime = "neutral"
-    capped = False
     try:
         from .strategies.market_env import assess
         env = assess() or {}
@@ -143,22 +142,46 @@ def _detect_regime() -> tuple[str, dict]:
             regime = "risk_on"
         elif label == "BEAR":
             regime = "risk_off"
-        elif label == "CORRECTION":
-            capped = True
     except Exception as exc:
         logger.warning("ira regime: market_env failed: %s", exc)
-    try:
-        from .strategies.dual_momentum import evaluate
-        dm = evaluate() or {}
-        info["dual_momentum"] = {k: dm.get(k) for k in ("recommended_symbol", "reasoning")}
-        rec = dm.get("recommended_symbol")
-        if rec in ("AGG", "BIL"):
-            regime = "risk_off"
-        elif rec in ("SPY", "EFA") and regime == "neutral" and not capped:
-            regime = "risk_on"
-    except Exception as exc:
-        logger.warning("ira regime: dual momentum failed: %s", exc)
     return regime, info
+
+
+def cap_flagged(tilted: dict, core: dict, flagged: list[str], universe: list[str]) -> dict:
+    """The AI may not undo the trend overlay: flagged ETFs never exceed their core weight.
+    Any weight removed is parked in cash so the total is unchanged."""
+    park = next((s for s in ("BIL", "BND", "TIP") if s in universe), None)
+    out = dict(tilted)
+    for sym in flagged:
+        excess = out.get(sym, 0.0) - core.get(sym, 0.0)
+        if excess > 0 and park:
+            out[sym] -= excess
+            out[park] = out.get(park, 0.0) + excess
+    return out
+
+
+def apply_trend_overlay(weights: dict, stats: dict, universe: list[str]) -> tuple[dict, list[str]]:
+    """Halve any risk ETF trading below its own 200-day average and park the freed weight in cash.
+
+    Mirrors ira_backtest.build_regime_targets(trend=True), the variant that passed validation.
+    ETFs with no live data are left alone (the AI gate blocks stale data separately).
+    Returns (normalized weights, list of flagged symbols).
+    """
+    park = next((s for s in ("BIL", "BND", "TIP") if s in universe), None)
+    if park is None:
+        return dict(weights), []
+    out, flagged, freed = dict(weights), [], 0.0
+    for sym, w in weights.items():
+        if sym in DEFENSIVE or w <= 0:
+            continue
+        st = stats.get(sym)
+        if st and st.get("above_200sma") is False:
+            out[sym] = w * 0.5
+            freed += w * 0.5
+            flagged.append(sym)
+    if freed:
+        out[park] = out.get(park, 0.0) + freed
+    return normalize_weights(out, universe), flagged
 
 
 def normalize_weights(weights: dict, universe: list[str]) -> dict:
@@ -210,7 +233,9 @@ def _ai_adjust(db: Session, user_id: int, baseline: dict, regime: str,
         f"Live ETF stats (returns, 20d vol, % off 52w high, above 200d SMA): {json.dumps(context.get('etf_market', {}))}\n"
         f"{context.get('profile_line', '')}\n"
         f"Current holdings: {json.dumps([{k: h[k] for k in ('symbol','weight','unrealized_plpc')} for h in holdings], default=str)}\n"
-        f"Rules-based baseline weights: {json.dumps(baseline)}\n\n"
+        f"Rules-based core weights (regime baseline after the validated trend overlay): {json.dumps(baseline)}\n"
+        "The trend overlay already halved any ETF below its 200-day average. Do NOT reverse it: never raise an "
+        "ETF listed under trend_overlay.halved_etfs_below_200d_sma above its core weight.\n\n"
         f"You may tilt the baseline by at most ±{tilt * 100:.0f} percentage points per ETF. Use ONLY the tickers "
         "in the baseline. Prefer stability — do not churn without a clear reason.\n"
         'Reply with JSON only: {"weights": {"TICKER": 0.xx, ...}, "rationale": "2-4 sentences"}'
@@ -240,6 +265,7 @@ def _ai_adjust(db: Session, user_id: int, baseline: dict, regime: str,
 def build_target(db: Session, user_id: int, holdings: list[dict] | None = None) -> dict:
     cfg = get_config(db, user_id)
     regime, ctx = _detect_regime()
+    stats: dict = {}
     try:
         from . import ira_data, ira_planner
         stats = ira_data.market_stats(cfg["universe"])
@@ -254,9 +280,16 @@ def build_target(db: Session, user_id: int, holdings: list[dict] | None = None) 
     except Exception as exc:
         logger.warning("ira live context failed: %s", exc)
     baseline = normalize_weights(BASELINES[regime], cfg["universe"])
-    tilted, rationale = _ai_adjust(db, user_id, baseline, regime, ctx, holdings or [], cfg["tilt_pp"] / 100.0)
+    core, flagged = baseline, []
+    if cfg["trend_overlay"]:
+        core, flagged = apply_trend_overlay(baseline, stats, cfg["universe"])
+    ctx["trend_overlay"] = ({"applied": True, "halved_etfs_below_200d_sma": flagged} if cfg["trend_overlay"]
+                            else {"applied": False})
+    tilted, rationale = _ai_adjust(db, user_id, core, regime, ctx, holdings or [], cfg["tilt_pp"] / 100.0)
+    tilted = cap_flagged(tilted, core, flagged, cfg["universe"])
     target = normalize_weights(tilted, cfg["universe"])
-    return {"regime": regime, "baseline": baseline, "target": target, "rationale": rationale}
+    return {"regime": regime, "baseline": baseline, "core": core, "trend_flagged": flagged,
+            "target": target, "rationale": rationale}
 
 
 # ── Rebalance planning / execution ────────────────────────────────────────────

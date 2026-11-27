@@ -144,6 +144,8 @@ class BacktestBody(BaseModel):
     cadence: str = "weekly"
     threshold: float = 0.05
     cost_bps: float = 3.0
+    extended: bool = True        # splice ETFs to long-history proxies (back to ~1999)
+    sensitivity: bool = True     # run the parameter grid (adds ~20s)
 
 
 _backtest_cache: dict = {}
@@ -157,12 +159,13 @@ def ira_backtest_run(body: BacktestBody, current_user: dict = Depends(get_curren
         raise HTTPException(400, "cadence must be weekly or monthly")
     if not (0.01 <= body.threshold <= 0.25) or not (0 <= body.cost_bps <= 50):
         raise HTTPException(400, "threshold must be 0.01-0.25 and cost_bps 0-50")
-    key = (body.cadence, round(body.threshold, 4), round(body.cost_bps, 2))
+    key = (body.cadence, round(body.threshold, 4), round(body.cost_bps, 2), body.extended, body.sensitivity)
     hit = _backtest_cache.get(key)
     if hit and time.time() - hit[0] < 6 * 3600:
         return hit[1]
     try:
-        res = ira_backtest.run_backtest(cadence=body.cadence, threshold=body.threshold, cost_bps=body.cost_bps)
+        res = ira_backtest.run_backtest(cadence=body.cadence, threshold=body.threshold, cost_bps=body.cost_bps,
+                                        extended=body.extended, sensitivity=body.sensitivity)
     except Exception as exc:
         logger.exception("ira backtest failed")
         raise HTTPException(502, f"Backtest failed: {str(exc)[:200]}")

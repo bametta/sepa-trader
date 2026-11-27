@@ -221,5 +221,98 @@ class ExecuteProposalTests(unittest.TestCase):
         self.assertLessEqual(sum(o["notional"] for o in captured["plan"]), 1500.01)
 
 
+class RegimeTests(unittest.TestCase):
+    def regime(self, env):
+        import sys
+        import types
+        pkg = types.ModuleType("app.strategies")
+        pkg.__path__ = []
+        me = types.ModuleType("app.strategies.market_env")
+        dm = types.ModuleType("app.strategies.dual_momentum")
+        self.dm_called = False
+
+        def assess():
+            if isinstance(env, Exception):
+                raise env
+            return {"environment": env}
+
+        def evaluate():
+            self.dm_called = True
+            return {"recommended_symbol": "AGG"}
+        me.assess, dm.evaluate = assess, evaluate
+        sys.modules.update({"app.strategies": pkg, "app.strategies.market_env": me,
+                            "app.strategies.dual_momentum": dm})
+        return m._detect_regime()[0]
+
+    def test_validated_mapping(self):
+        for env, want in [("BULL", "risk_on"), ("BULL_VOLATILE", "risk_on"), ("BEAR", "risk_off"),
+                          ("CORRECTION", "neutral"), ("TRANSITIONAL", "neutral"), ("UNKNOWN", "neutral")]:
+            with self.subTest(env=env):
+                self.assertEqual(self.regime(env), want)
+
+    def test_data_failure_defaults_to_neutral(self):
+        self.assertEqual(self.regime(RuntimeError("yahoo down")), "neutral")
+
+    def test_dual_momentum_is_not_consulted(self):
+        self.assertEqual(self.regime("BULL"), "risk_on")
+        self.assertFalse(self.dm_called)
+
+
+def stat(above):
+    return {"above_200sma": above}
+
+
+class TrendOverlayTests(unittest.TestCase):
+    BASE = m.normalize_weights(m.BASELINES["risk_on"], U)
+
+    def test_below_average_etfs_are_halved_and_moved_to_cash(self):
+        out, flagged = m.apply_trend_overlay(self.BASE, {"QQQ": stat(False), "VTI": stat(True)}, U)
+        self.assertEqual(flagged, ["QQQ"])
+        self.assertAlmostEqual(out["QQQ"], self.BASE["QQQ"] * 0.5, places=3)
+        self.assertAlmostEqual(out["BIL"], self.BASE["BIL"] + self.BASE["QQQ"] * 0.5, places=3)
+        self.assertAlmostEqual(out["VTI"], self.BASE["VTI"], places=3)
+        self.assertAlmostEqual(sum(out.values()), 1.0, places=3)
+
+    def test_defensive_etfs_are_never_halved(self):
+        stats = {s: stat(False) for s in U}
+        out, flagged = m.apply_trend_overlay(self.BASE, stats, U)
+        self.assertFalse(set(flagged) & m.DEFENSIVE)
+        self.assertGreaterEqual(out["BND"], self.BASE["BND"] - 1e-3)
+
+    def test_missing_or_unknown_data_leaves_weights_alone(self):
+        out, flagged = m.apply_trend_overlay(self.BASE, {"QQQ": None, "VTI": {"above_200sma": None}}, U)
+        self.assertEqual(flagged, [])
+        self.assertEqual(out, m.normalize_weights(self.BASE, U))
+
+    def test_overlay_never_raises_equity_share(self):
+        rng = random.Random(3)
+        for _ in range(100):
+            stats = {s: stat(rng.random() < 0.5) for s in U}
+            out, _ = m.apply_trend_overlay(self.BASE, stats, U)
+            risky = lambda w: sum(v for s, v in w.items() if s not in m.DEFENSIVE)
+            self.assertLessEqual(risky(out), risky(self.BASE) + 1e-3)
+            self.assertAlmostEqual(sum(out.values()), 1.0, places=3)
+
+    def test_no_cash_sleeve_in_universe_disables_overlay(self):
+        uni = ["VTI", "QQQ"]
+        base = {"VTI": 0.5, "QQQ": 0.5}
+        out, flagged = m.apply_trend_overlay(base, {"QQQ": stat(False)}, uni)
+        self.assertEqual((out, flagged), (base, []))
+
+
+class CapFlaggedTests(unittest.TestCase):
+    def test_ai_cannot_raise_a_flagged_etf_above_core(self):
+        core = {"VTI": 0.4, "QQQ": 0.05, "BIL": 0.55}
+        tilted = {"VTI": 0.4, "QQQ": 0.10, "BIL": 0.50}
+        out = m.cap_flagged(tilted, core, ["QQQ"], ["VTI", "QQQ", "BIL"])
+        self.assertAlmostEqual(out["QQQ"], 0.05)
+        self.assertAlmostEqual(sum(out.values()), 1.0)
+
+    def test_lower_weight_from_ai_is_kept(self):
+        core = {"QQQ": 0.05, "BIL": 0.95}
+        out = m.cap_flagged({"QQQ": 0.02, "BIL": 0.98}, core, ["QQQ"], ["QQQ", "BIL"])
+        self.assertAlmostEqual(out["QQQ"], 0.02)
+
+
 if __name__ == "__main__":
     unittest.main()

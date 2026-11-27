@@ -560,6 +560,13 @@ const SECTIONS = [
       { key: 'ira_cash_buffer_pct',         label: 'Cash buffer % (default 2)',     type: 'text' },
       { key: 'ira_etf_universe', label: 'ETF universe CSV (blank = default VTI,VXUS,QQQ,SCHD,VNQ,BND,TIP,GLD,BIL)', type: 'text', span: true },
       { key: 'ira_tilt_max_pp', label: 'AI tilt limit, points per ETF (default 5, 0 = rules-only)', type: 'text' },
+      {
+        key: 'ira_trend_overlay', label: 'Trend overlay (validated crash protection)', type: 'select',
+        options: [
+          { value: 'true',  label: 'On — halve ETFs below their 200-day average' },
+          { value: 'false', label: 'Off — regime baseline only (failed validation)' },
+        ],
+      },
       { key: 'ira_birth_year',  label: 'Birth year (for age-based plan)', type: 'text' },
       { key: 'ira_retire_age',  label: 'Retirement age (default 65)',     type: 'text' },
       {
