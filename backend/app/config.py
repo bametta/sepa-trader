@@ -25,6 +25,10 @@ class Settings(BaseSettings):
     # Set to true in production (HTTPS only) to mark auth cookies Secure
     secure_cookies: bool = False
 
+    # Self-registration is off by default (this app controls real-money accounts). Set ALLOW_REGISTRATION=true
+    # in .env only while you intentionally want new sign-ups.
+    allow_registration: bool = False
+
     class Config:
         env_file = ".env"
 

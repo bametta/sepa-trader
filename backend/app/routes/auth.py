@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Cookie, Depends, HTTPException, Response
+from fastapi import APIRouter, Cookie, Depends, HTTPException, Request, Response
 from pydantic import BaseModel, EmailStr
 from sqlalchemy import text
 from sqlalchemy.orm import Session
@@ -19,10 +19,29 @@ from ..auth import (
 from ..database import get_db, get_current_user
 from ..config import settings as _cfg
 from ..crypto import encrypt as _enc, decrypt as _dec
+from ..ratelimit import AttemptLimiter
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
 
 _SECURE_COOKIE = _cfg.secure_cookies   # set SECURE_COOKIES=true in .env for HTTPS production
+
+# Failed-attempt limits (in memory, per process). Email is limited separately from IP so that spoofing an IP
+# header does not unlock unlimited guessing against one account.
+_login_by_ip    = AttemptLimiter(10, 15 * 60)
+_login_by_email = AttemptLimiter(20, 15 * 60)
+_2fa_by_user    = AttemptLimiter(5, 10 * 60)
+
+
+def _client_ip(request: Request) -> str:
+    """Behind the reverse proxy the last X-Forwarded-For entry is the one the proxy itself added."""
+    xff = request.headers.get("x-forwarded-for", "")
+    if xff:
+        return xff.split(",")[-1].strip() or "unknown"
+    return request.client.host if request.client else "unknown"
+
+
+def _too_many(seconds: int) -> HTTPException:
+    return HTTPException(429, "Too many failed attempts. Try again later.", headers={"Retry-After": str(seconds)})
 
 
 def _set_auth_cookies(response: Response, user_id: int, role: str):
@@ -50,6 +69,8 @@ class RegisterBody(BaseModel):
 
 @router.post("/register", status_code=201)
 def register(body: RegisterBody, response: Response, db: Session = Depends(get_db)):
+    if not _cfg.allow_registration:
+        raise HTTPException(403, "Registration is disabled. Ask the administrator for an account.")
     if len(body.password) < 8:
         raise HTTPException(400, "Password must be at least 8 characters")
     if len(body.username) < 3:
@@ -84,16 +105,25 @@ class LoginBody(BaseModel):
 
 
 @router.post("/login")
-def login(body: LoginBody, response: Response, db: Session = Depends(get_db)):
+def login(body: LoginBody, request: Request, response: Response, db: Session = Depends(get_db)):
+    ip_key, email_key = _client_ip(request), body.email.strip().lower()
+    wait = max(_login_by_ip.retry_after(ip_key), _login_by_email.retry_after(email_key))
+    if wait:
+        raise _too_many(wait)
+
     row = db.execute(
         text("SELECT id, password_hash, role, is_active, totp_enabled FROM users WHERE email = :e"),
         {"e": body.email},
     ).fetchone()
 
     if not row or not verify_password(body.password, row[1]):
+        _login_by_ip.fail(ip_key)
+        _login_by_email.fail(email_key)
         raise HTTPException(401, "Invalid email or password")
     if not row[3]:
         raise HTTPException(403, "Account is inactive")
+    _login_by_ip.reset(ip_key)
+    _login_by_email.reset(email_key)
 
     db.execute(
         text("UPDATE users SET last_login = NOW() WHERE id = :id"),
@@ -134,8 +164,14 @@ def login_2fa(body: TwoFAVerifyBody, response: Response, db: Session = Depends(g
     if not row or not row[2]:
         raise HTTPException(401, "User not found or inactive")
 
+    key = f"user:{user_id}"
+    wait = _2fa_by_user.retry_after(key)
+    if wait:
+        raise _too_many(wait)
     if not verify_totp(_dec(row[1] or ""), body.code):
+        _2fa_by_user.fail(key)
         raise HTTPException(401, "Invalid 2FA code")
+    _2fa_by_user.reset(key)
 
     _set_auth_cookies(response, user_id, row[0])
     return {"requires_2fa": False, "id": user_id, "role": row[0]}
