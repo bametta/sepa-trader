@@ -559,6 +559,7 @@ const SECTIONS = [
       { key: 'ira_rebalance_threshold_pct', label: 'Drift threshold % (default 5)', type: 'text' },
       { key: 'ira_cash_buffer_pct',         label: 'Cash buffer % (default 2)',     type: 'text' },
       { key: 'ira_etf_universe', label: 'ETF universe CSV (blank = default VTI,VXUS,QQQ,SCHD,VNQ,BND,TIP,GLD,BIL)', type: 'text', span: true },
+      { key: 'ira_tilt_max_pp', label: 'AI tilt limit, points per ETF (default 5, 0 = rules-only)', type: 'text' },
       { key: 'ira_birth_year',  label: 'Birth year (for age-based plan)', type: 'text' },
       { key: 'ira_retire_age',  label: 'Retirement age (default 65)',     type: 'text' },
       {

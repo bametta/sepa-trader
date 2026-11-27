@@ -62,20 +62,46 @@ def ira_target(current_user: dict = Depends(get_current_user), db: Session = Dep
 class RebalanceBody(BaseModel):
     execute: bool = False
     force: bool = False
+    proposal_id: int | None = None
 
 
 @router.post("/rebalance")
 def ira_rebalance(body: RebalanceBody, current_user: dict = Depends(get_current_user),
                   db: Session = Depends(get_db)):
+    """Preview (default) or execute a previously previewed proposal.
+
+    Manual execution never recomputes the plan: it runs exactly the gated proposal the user
+    previewed, after re-validating it against the live account.
+    """
     uid = current_user["id"]
     _need_creds(db, uid)
     try:
-        return ira.run_rebalance(db, uid, execute=body.execute, force=body.force)
+        if body.execute:
+            if body.proposal_id is None:
+                raise HTTPException(400, "proposal_id_required: preview first, then confirm that proposal")
+            return ira.execute_proposal(db, uid, body.proposal_id)
+        return ira.run_rebalance(db, uid, execute=False, force=body.force)
     except HTTPException:
         raise
+    except ValueError as exc:
+        raise HTTPException(409, str(exc))
     except Exception as exc:
         logger.exception("ira rebalance failed")
         raise HTTPException(502, f"IRA rebalance error: {str(exc)[:200]}")
+
+
+class HaltBody(BaseModel):
+    halted: bool
+
+
+@router.post("/halt")
+def ira_halt(body: HaltBody, current_user: dict = Depends(get_current_user),
+             db: Session = Depends(get_db)):
+    """Kill switch: while halted, no IRA orders are placed (manual or scheduled)."""
+    from ..database import set_user_setting
+    set_user_setting(db, "ira_halt", "true" if body.halted else "false", current_user["id"])
+    ira._alert(f"IRA trading {'HALTED' if body.halted else 'RESUMED'} via kill switch.", "URGENT" if body.halted else "INFO")
+    return {"halted": body.halted}
 
 
 @router.get("/history")

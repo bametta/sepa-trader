@@ -5,7 +5,7 @@ import { useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import {
   fetchIRAStatus, fetchIRATarget, fetchIRAHistory, runIRARebalance,
-  fetchIRAPlan, runIRABacktest,
+  fetchIRAPlan, runIRABacktest, setIRAHalt,
 } from '../api/client'
 
 const usd = v => v != null ? new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(v) : '—'
@@ -53,7 +53,7 @@ function PlanTable({ plan }) {
               {usd(o.notional)}{o.capped ? ' *' : ''}
             </td>
             <td className="text-right num text-slate-400">{signed(o.drift_pct)}</td>
-            <td className="text-right text-slate-400">{o.status || 'proposed'}</td>
+            <td className="text-right text-slate-400">{o.final_status || o.status || 'proposed'}</td>
           </tr>
         ))}
       </tbody>
@@ -213,13 +213,16 @@ export default function IRAPortfolio() {
   const plan = useQuery('ira-plan', fetchIRAPlan, { enabled: !!connected, retry: false, staleTime: 5 * 60000 })
 
   const rebalance = useMutation(runIRARebalance, {
-    onSuccess: (data, vars) => {
-      setPreview(vars.execute ? null : data)
+    onSuccess: (data) => {
+      setPreview(data)
       setConfirming(false)
       qc.invalidateQueries('ira-status')
       qc.invalidateQueries('ira-history')
     },
   })
+
+  const halt = useMutation(setIRAHalt, { onSuccess: () => qc.invalidateQueries('ira-status') })
+  const canExecute = !!preview?.proposal_id && !preview?.executed && !preview?.final_status
 
   if (status.isLoading) return <div className="text-slate-500 text-sm">Loading IRA…</div>
   if (status.isError) {
@@ -244,6 +247,19 @@ export default function IRAPortfolio() {
 
   return (
     <div className="space-y-5">
+      <div className={`card flex items-center justify-between ${cfg.halted ? 'border border-red-500/40' : ''}`}>
+        <div className="text-sm">
+          <span className={`font-semibold ${cfg.halted ? 'text-red-400' : 'text-emerald-400'}`}>
+            {cfg.halted ? 'Trading HALTED' : 'Trading active'}
+          </span>
+          <span className="text-slate-500"> · kill switch blocks all IRA orders, manual and scheduled · AI tilt ±{cfg.tilt_pp} pts</span>
+        </div>
+        <button className={cfg.halted ? 'btn-primary' : 'btn-ghost'} disabled={halt.isLoading}
+                onClick={() => halt.mutate({ halted: !cfg.halted })}>
+          {cfg.halted ? 'Resume trading' : 'Halt trading'}
+        </button>
+      </div>
+
       <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
         <Stat label="IRA equity" value={usd(snap.equity)} />
         <Stat label="Settled cash" value={usd(snap.spendable)} sub="spendable (cash account)" />
@@ -301,23 +317,31 @@ export default function IRAPortfolio() {
                     onClick={() => rebalance.mutate({ execute: false, force: false })}>
               Preview
             </button>
-            {preview?.plan?.length > 0 && !confirming && (
+            {canExecute && !confirming && (
               <button className="btn-primary" onClick={() => setConfirming(true)}>Execute…</button>
             )}
-            {confirming && (
+            {canExecute && confirming && (
               <button className="btn-primary" disabled={rebalance.isLoading}
-                      onClick={() => rebalance.mutate({ execute: true, force: false })}>
-                Confirm — place {preview.plan.length} order(s)
+                      onClick={() => rebalance.mutate({ execute: true, proposal_id: preview.proposal_id })}>
+                Confirm — place exactly these {preview.plan.length} order(s)
               </button>
             )}
           </div>
         </div>
         {rebalance.isError && <div className="text-sm text-red-400">{errMsg(rebalance.error)}</div>}
-        {rebalance.isSuccess && rebalance.data?.executed && (
-          <div className="text-sm text-emerald-400">Orders submitted.</div>
+        {rebalance.data?.final_status && (
+          <div className={`text-sm ${rebalance.data.final_status === 'EXECUTED' ? 'text-emerald-400' : 'text-amber-400'}`}>
+            {rebalance.data.final_status === 'EXECUTED' ? 'All orders filled.'
+              : `Execution ${rebalance.data.final_status}: ${(rebalance.data.problems || []).join('; ') || 'check Alpaca'}`}
+          </div>
+        )}
+        {preview && !preview.proposal_id && preview.plan?.length > 0 && !preview.executed && !preview.final_status && (
+          <div className="text-sm text-amber-400">
+            Not executable: {preview.halted ? 'trading is halted.' : `AI gate ${preview.gate?.verdict}.`} {preview.gate?.reason}
+          </div>
         )}
         {rebalance.data?.note && <div className="text-sm text-slate-400">{rebalance.data.note}</div>}
-        {preview && <PlanTable plan={preview.plan} />}
+        {preview && <PlanTable plan={preview.results?.length ? preview.results : preview.plan} />}
         {preview?.gate && <GateCard gate={preview.gate} />}
         {preview?.plan?.some(o => o.capped) && (
           <div className="text-[11px] text-slate-500">
