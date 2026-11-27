@@ -56,6 +56,42 @@ class TargetModelTests(unittest.TestCase):
         self.assertEqual(st.parse_target_model(st.format_target(TARGET)), TARGET)
 
 
+class TechCapTests(unittest.TestCase):
+    TGT = {"VTI": 0.40, "QQQ": 0.30, "BND": 0.30}
+
+    def qqq_shares(self, plan):
+        return sum(t["shares"] for a in plan["accounts"] for t in a["trades"] if t["symbol"] == "QQQ")
+
+    def test_no_tech_buys_when_already_over_the_limit_elsewhere(self):
+        plan = st.plan_trades([acct(1, "roth", cash=10000)], PRICES, self.TGT, outside_total=100000, outside_tech=35000)
+        self.assertEqual(self.qqq_shares(plan), 0)
+        self.assertTrue(any("Held back" in n and "QQQ" in n for n in plan["notes"]))
+        spent = sum(t["value"] for t in plan["accounts"][0]["trades"])
+        self.assertGreater(spent, 2000)                                    # cash still goes to the other funds
+
+    def test_partial_buy_up_to_the_limit(self):
+        # everything = 110k; 30% = 33k; 32k tech already -> room $1,000 -> 1 share of QQQ at $650
+        plan = st.plan_trades([acct(1, "roth", cash=10000)], PRICES, self.TGT, outside_total=100000, outside_tech=32000)
+        self.assertEqual(self.qqq_shares(plan), 1)
+
+    def test_tech_total_never_exceeds_limit_after_trades(self):
+        for out_tech in (0, 10000, 29000, 31000, 40000):
+            with self.subTest(out_tech=out_tech):
+                plan = st.plan_trades([acct(1, "roth", cash=10000), acct(2, "pre_tax", cash=5000)], PRICES, self.TGT,
+                                      outside_total=85000, outside_tech=out_tech)
+                bought = self.qqq_shares(plan) * PRICES["QQQ"]
+                self.assertLessEqual(bought, max(0.0, 0.30 * 100000 - out_tech) + 1e-6)
+
+    def test_unaffected_without_tech_in_the_target(self):
+        plan = st.plan_trades([acct(1, "roth", cash=10000)], PRICES, TARGET, outside_total=50000, outside_tech=45000)
+        self.assertFalse(any("Held back" in n for n in plan["notes"]))
+        self.assertGreater(sum(t["value"] for t in plan["accounts"][0]["trades"]), 9000)
+
+    def test_small_tech_target_with_nothing_elsewhere_is_fine(self):
+        plan = st.plan_trades([acct(1, "roth", cash=10000)], PRICES, {"VTI": 0.8, "QQQ": 0.2})
+        self.assertGreaterEqual(self.qqq_shares(plan), 1)
+
+
 class CashOnlyTests(unittest.TestCase):
     def test_new_cash_is_deployed_in_whole_shares_without_overspending(self):
         plan = st.plan_trades([acct(1, "roth", cash=10000)], PRICES, TARGET)
