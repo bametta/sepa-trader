@@ -12,6 +12,7 @@ import WeeklyPlan from './components/WeeklyPlan'
 import AdminPanel from './components/AdminPanel'
 import DualMomentumTab from './components/DualMomentumTab'
 import IRAPortfolio from './components/IRAPortfolio'
+import SavingsTab from './components/SavingsTab'
 import PreTradeLog from './components/PreTradeLog'
 import { fetchPositions, updateSetting, fetchSettings } from './api/client'
 
@@ -24,6 +25,7 @@ const TAB_CONFIG = [
   { id: 'Weekly Plan',    icon: '✦', label: 'Weekly Plan' },
   { id: 'Dual Momentum',  icon: '⟳', label: 'Dual Momentum' },
   { id: 'IRA',            icon: '◈', label: 'IRA' },
+  { id: 'Savings',        icon: '▤', label: 'Savings' },
   { id: 'AI Gate',        icon: '✓', label: 'AI Gate' },
   { id: 'Settings',       icon: '⚙', label: 'Settings' },
 ]
@@ -193,6 +195,7 @@ function Dashboard() {
           {tab === 'Weekly Plan'   && <WeeklyPlan />}
           {tab === 'Dual Momentum' && <DualMomentumTab />}
           {tab === 'IRA'           && <IRAPortfolio />}
+          {tab === 'Savings'       && <SavingsTab />}
           {tab === 'AI Gate'       && <PreTradeLog />}
           {tab === 'Settings'      && <SettingsPanel />}
           {tab === 'Admin'         && <AdminPanel />}
