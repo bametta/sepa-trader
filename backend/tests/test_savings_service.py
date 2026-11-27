@@ -232,6 +232,59 @@ class ServiceTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.svc.trade_plan(MagicMock(), 1, None, "cash_only", None)
 
+    # ── guaranteed income ─────────────────────────────────────────────────────
+    def income(self, **kw):
+        SETTINGS.update({"retire_spending_target": "100000", "income_va_annual": "30000",
+                         "income_ss_annual": "40000", "income_ss_claim_age": "67", **{k: str(v) for k, v in kw.items()}})
+
+    def test_goal_is_implied_by_spending_minus_guaranteed_income(self):
+        self.income()
+        p = self.plan(self.summary(balance=200000))
+        ri = p["retirement_income"]
+        rate = ri["safe_rate_used"]
+        self.assertEqual(ri["spend"], 100000)
+        self.assertEqual(ri["bridge_years"], 2)                              # retire 65, claim 67
+        self.assertEqual(ri["required_portfolio"], round(30000 / rate + 40000 * 2))
+        self.assertEqual(p["target"], ri["required_portfolio"])
+        self.assertIn("implied", p["target_source"])
+        self.assertIsNotNone(p["prob_reach_target"])
+
+    def test_a_typed_goal_still_wins(self):
+        self.income()
+        SETTINGS["savings_total_target"] = "1500000"
+        p = self.plan()
+        self.assertEqual((p["target"], p["target_source"]), (1500000, "typed"))
+        self.assertIn("retirement_income", p)                                # the picture still shows
+
+    def test_more_guaranteed_income_improves_the_odds(self):
+        self.income(income_va_annual=10000)
+        low = self.plan(self.summary(balance=300000))
+        self.income(income_va_annual=60000)
+        high = self.plan(self.summary(balance=300000))
+        self.assertLess(high["retirement_income"]["required_portfolio"], low["retirement_income"]["required_portfolio"])
+        self.assertGreaterEqual(high["prob_reach_target"] if high["target"] else 1.0, low["prob_reach_target"])
+
+    def test_guaranteed_income_that_covers_spending_needs_no_goal(self):
+        self.income(retire_spending_target=50000, income_va_annual=60000, income_ss_annual=0)
+        p = self.plan()
+        self.assertTrue(p["retirement_income"]["covered"])
+        self.assertIsNone(p["target"])
+        self.assertEqual(p["target_source"], "guaranteed income covers spending")
+
+    def test_without_a_spending_target_nothing_changes(self):
+        SETTINGS.update({"income_va_annual": "30000"})
+        p = self.plan()
+        self.assertNotIn("retirement_income", p)
+        self.assertIsNone(p["target"])
+
+    def test_bad_or_out_of_range_settings_are_handled(self):
+        self.income(income_ss_claim_age=99, income_va_annual="lots", income_other_annual=-5)
+        ri = self.plan()["retirement_income"]
+        self.assertEqual(ri["claim_age"], 70)                                # clamped to 62-70
+        self.assertEqual((ri["va"], ri["other"]), (0, 0))                    # unreadable and negative -> 0
+        self.income(income_ss_claim_age=40)
+        self.assertEqual(self.plan()["retirement_income"]["claim_age"], 62)
+
     def test_bad_target_setting_is_ignored(self):
         SETTINGS["savings_total_target"] = "lots"
         self.assertIsNone(self.plan()["target"])

@@ -117,6 +117,15 @@ def changes(db, uid: int, days: int = 180) -> list[dict]:
             for c in savings.load_changes(db, uid, days)]
 
 
+def _amount(db, uid: int, key: str) -> float:
+    """A non-negative number from user settings; missing, blank, negative or unreadable values count as 0."""
+    try:
+        v = float(get_user_setting(db, key, "", uid) or 0)
+    except ValueError:
+        return 0.0
+    return v if 0 <= v <= 10_000_000 else 0.0
+
+
 def combined_plan(db, uid: int, summary: dict) -> dict:
     """Project the total of all retirement accounts using the age-based glidepath mix."""
     p = ira_planner.get_profile(db, uid)
@@ -147,7 +156,7 @@ def combined_plan(db, uid: int, summary: dict) -> dict:
         "ready": True, "balance": round(balance), "annual_contribution": round(first_year),
         "avg_annual_contribution": round(float(annual.mean())), "years": years,
         "retire_age": p["retire_age"], "glidepath_equity": glide, "actual_equity_share": summary["equity_share"],
-        "p10": round(p10), "p50": round(p50), "p90": round(p90), "target": round(target) if target else None,
+        "p10": round(p10), "p50": round(p50), "p90": round(p90),
         "assumptions": "Real (today's) dollars, long-run return assumptions, age-based glidepath mix, "
                        "yearly contributions across all retirement accounts (accounts set to the IRS limit follow it, "
                        "including catch-up from age 50).",
@@ -159,6 +168,24 @@ def combined_plan(db, uid: int, summary: dict) -> dict:
     if safe:
         out["safe_withdrawal_rate"] = safe
         out["income_at_safe_rate"] = {"p10": round(p10 * safe), "p50": round(p50 * safe), "p90": round(p90 * safe)}
+
+    # Guaranteed income (VA disability, Social Security, pensions) lowers what savings must cover. If you didn't type a
+    # total goal, the goal is implied by your spending target minus that income.
+    spend = _amount(db, uid, "retire_spending_target")
+    va, ss, other = (_amount(db, uid, k) for k in ("income_va_annual", "income_ss_annual", "income_other_annual"))
+    claim = int(min(70, max(62, _amount(db, uid, "income_ss_claim_age") or 67)))
+    rate = safe or 0.035
+    out["target_source"] = "typed" if target else None
+    if spend:
+        ri = savings.retirement_need(spend, va, ss, other, claim, p["retire_age"], rate)
+        ri.update({"va": round(va), "ss": round(ss), "other": round(other), "claim_age": claim, "safe_rate_used": rate,
+                   "income_p50_total_later": round(p50 * rate + va + other + ss)})
+        ri["funded_ratio"] = round(p50 / ri["required_portfolio"], 2) if ri["required_portfolio"] else None
+        out["retirement_income"] = ri
+        if not target:
+            target = float(ri["required_portfolio"]) if ri["required_portfolio"] > 0 else None
+            out["target_source"] = "implied by spending minus guaranteed income" if target else "guaranteed income covers spending"
+    out["target"] = round(target) if target else None
     if target:
         out["prob_reach_target"] = round(float((end >= target).mean()), 3)
         if out["prob_reach_target"] < 0.8:

@@ -426,6 +426,62 @@ class ManualValueDbTests(unittest.TestCase):
         self.assertEqual(db.calls, [])
 
 
+class RetirementNeedTests(unittest.TestCase):
+    def need(self, spend=100000, va=30000, ss=40000, other=0, claim=67, retire=65, rate=0.04):
+        return sv.retirement_need(spend, va, ss, other, claim, retire, rate)
+
+    def test_bridge_years_before_social_security_add_to_the_requirement(self):
+        n = self.need()
+        self.assertEqual((n["need_early"], n["need_later"], n["bridge_years"]), (70000, 30000, 2))
+        self.assertEqual(n["required_portfolio"], 30000 / 0.04 + 40000 * 2)          # 830,000
+        self.assertEqual((n["guaranteed_early"], n["guaranteed_later"]), (30000, 70000))
+
+    def test_no_bridge_when_social_security_starts_by_retirement(self):
+        n = self.need(claim=62, retire=65)
+        self.assertEqual(n["bridge_years"], 0)
+        self.assertEqual(n["need_early"], n["need_later"])
+        self.assertEqual(n["required_portfolio"], 750000)
+        self.assertEqual(n["guaranteed_early"], 70000)
+
+    def test_guaranteed_income_that_covers_spending_means_nothing_is_required(self):
+        n = self.need(spend=50000, va=60000, ss=0)
+        self.assertEqual((n["required_portfolio"], n["covered"]), (0, True))
+        n = self.need(spend=60000, va=20000, ss=40000, claim=62)
+        self.assertTrue(n["covered"])
+
+    def test_more_guaranteed_income_lowers_the_requirement_and_lower_safe_rates_raise_it(self):
+        base = self.need()["required_portfolio"]
+        self.assertLess(self.need(va=40000)["required_portfolio"], base)
+        self.assertLess(self.need(ss=50000)["required_portfolio"], base)
+        self.assertGreater(self.need(rate=0.03)["required_portfolio"], base)
+        self.assertGreater(self.need(spend=120000)["required_portfolio"], base)
+
+    def test_negative_or_missing_inputs_count_as_zero(self):
+        n = sv.retirement_need(80000, None, -5, "", 67, 65, 0.04)
+        self.assertEqual((n["guaranteed_later"], n["need_later"]), (0, 80000))
+        self.assertEqual(n["required_portfolio"], 2_000_000)
+
+    def test_rejects_a_nonpositive_safe_rate(self):
+        for rate in (0, -0.01):
+            with self.assertRaises(ValueError):
+                self.need(rate=rate)
+
+    def test_invariants_on_random_inputs(self):
+        import random
+        rng = random.Random(9)
+        for _ in range(500):
+            spend, va, ss, other = (rng.uniform(0, 200000) for _ in range(4))
+            claim, retire, rate = rng.randint(62, 70), rng.randint(55, 70), rng.uniform(0.025, 0.05)
+            n = sv.retirement_need(spend, va, ss, other, claim, retire, rate)
+            self.assertGreaterEqual(n["required_portfolio"], 0)
+            self.assertGreaterEqual(n["need_early"], n["need_later"])
+            # need_later is reported rounded to whole dollars, which the division by the rate magnifies
+            self.assertGreaterEqual(n["required_portfolio"] + 1, (n["need_later"] - 0.5) / rate)
+            self.assertEqual(n["covered"], n["required_portfolio"] <= 0)
+            more = sv.retirement_need(spend, va + 10000, ss, other, claim, retire, rate)
+            self.assertLessEqual(more["required_portfolio"], n["required_portfolio"])
+
+
 class SnapshotDiffTests(unittest.TestCase):
     def snap(self, *items):
         return [{"key": k, "symbol": k if q is not None else None, "name": k, "quantity": q, "value": v}

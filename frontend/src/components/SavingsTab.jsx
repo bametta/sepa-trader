@@ -534,12 +534,35 @@ function PlanCard() {
           (range {usd0(inc.p10)} to {usd0(inc.p90)}).
         </div>
       )}
+      {p.retirement_income && (
+        <div className="rounded-lg border border-white/[0.08] p-3 space-y-1 text-sm">
+          <div className="text-[10px] uppercase tracking-wider text-slate-500">Income picture in retirement (today's dollars, before tax on pre-tax withdrawals)</div>
+          <div className="flex justify-between text-slate-300"><span>Spending you want</span><span className="num">{usd0(p.retirement_income.spend)}/yr</span></div>
+          {p.retirement_income.va > 0 && <div className="flex justify-between text-slate-400"><span>VA disability</span><span className="num">− {usd0(p.retirement_income.va)}</span></div>}
+          {p.retirement_income.other > 0 && <div className="flex justify-between text-slate-400"><span>Other guaranteed income</span><span className="num">− {usd0(p.retirement_income.other)}</span></div>}
+          {p.retirement_income.ss > 0 && <div className="flex justify-between text-slate-400"><span>Social Security from age {p.retirement_income.claim_age}</span><span className="num">− {usd0(p.retirement_income.ss)}</span></div>}
+          <div className="flex justify-between text-slate-100 font-semibold border-t border-white/[0.05] pt-1">
+            <span>Your savings must supply</span>
+            <span className="num">{p.retirement_income.covered ? 'nothing: guaranteed income covers it'
+              : `${usd0(p.retirement_income.need_later)}/yr${p.retirement_income.bridge_years > 0 ? ` (${usd0(p.retirement_income.need_early)}/yr until Social Security starts)` : ''}`}</span>
+          </div>
+          {!p.retirement_income.covered && (
+            <div className="text-xs text-slate-400">
+              That needs about {usd0(p.retirement_income.required_portfolio)} saved at a {pct(p.retirement_income.safe_rate_used, 1)} withdrawal rate
+              {p.retirement_income.bridge_years > 0 && `, including ${p.retirement_income.bridge_years} year${p.retirement_income.bridge_years === 1 ? '' : 's'} of bridge before Social Security`}.
+              Your projected median is {usd0(p.p50)}{p.retirement_income.funded_ratio != null && `, about ${pct(p.retirement_income.funded_ratio, 0)} of that`}.
+            </div>
+          )}
+        </div>
+      )}
       {p.target
         ? <div className="text-sm text-slate-300">
-            Goal {usd0(p.target)}: {pct(p.prob_reach_target)} chance of reaching it.
+            Goal {usd0(p.target)}{p.target_source && p.target_source !== 'typed' ? ` (${p.target_source})` : ''}: {pct(p.prob_reach_target)} chance of reaching it.
             {p.extra_saving_for_80pct != null && <span className="text-amber-400"> About {usd0(p.extra_saving_for_80pct)}/yr more saving gets you to 80%.</span>}
           </div>
-        : <div className="text-xs text-slate-500">Set a total retirement goal in Settings → IRA Portfolio to see your odds.</div>}
+        : p.target_source === 'guaranteed income covers spending'
+          ? <div className="text-sm text-emerald-400">Your guaranteed income covers your spending, so savings are a cushion.</div>
+          : <div className="text-xs text-slate-500">Set a retirement spending target, or a total goal, in Settings → IRA Portfolio to see your odds.</div>}
       <div className="text-[11px] text-slate-600">{p.assumptions} Planning aid, not financial advice.</div>
     </div>
   )

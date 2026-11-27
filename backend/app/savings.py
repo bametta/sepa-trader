@@ -127,6 +127,27 @@ def validate_account(provider: str, name: str, account_type: str, annual_contrib
             "contribution_source": contribution_source, "max_deferral": bool(max_deferral)}
 
 
+def retirement_need(spend: float, va: float, ss: float, other: float, claim_age: int, retire_age: int,
+                    safe_rate: float) -> dict:
+    """What the portfolio must supply once guaranteed income is counted (today's dollars, pre-tax view).
+
+    `va` and `other` are assumed to be paid from retirement; Social Security starts at `claim_age`. Years between
+    retirement and claiming need the portfolio to cover the missing Social Security as well (the 'bridge'), which is
+    added undiscounted so the estimate stays conservative. Taxes on pre-tax withdrawals are not modelled."""
+    if safe_rate <= 0:
+        raise ValueError("safe_rate must be positive")
+    spend, va, ss, other = (max(0.0, float(x or 0.0)) for x in (spend, va, ss, other))
+    base = spend - va - other
+    early = max(0.0, base - (ss if claim_age <= retire_age else 0.0))
+    later = max(0.0, base - ss)
+    bridge = max(0, claim_age - retire_age)
+    required = later / safe_rate + (early - later) * bridge
+    return {"spend": round(spend), "need_early": round(early), "need_later": round(later), "bridge_years": bridge,
+            "guaranteed_early": round(va + other + (ss if claim_age <= retire_age else 0.0)),
+            "guaranteed_later": round(va + other + ss), "required_portfolio": round(required),
+            "covered": required <= 0}
+
+
 # 401(k) employee elective-deferral limits (from memory; verify at irs.gov each year):
 # year -> (base, catch-up at 50+, catch-up at 60-63 which replaces the 50+ amount)
 DEFERRAL_LIMITS = {2025: (23500.0, 7500.0, 11250.0), 2026: (24500.0, 8000.0, 11250.0)}
