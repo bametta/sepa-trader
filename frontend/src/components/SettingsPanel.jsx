@@ -577,6 +577,7 @@ const SECTIONS = [
           { value: 'aggressive',   label: 'Aggressive' },
         ],
       },
+      { key: 'savings_total_target',    label: 'TOTAL retirement goal $ across ALL accounts (Savings tab)', type: 'text', span: true },
       { key: 'ira_target_amount',       label: 'Retirement target $ (today\'s dollars)', type: 'text' },
       { key: 'ira_target_income',       label: 'or target yearly income $ (4% rule)',     type: 'text' },
       {

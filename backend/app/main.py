@@ -125,6 +125,57 @@ def _run_migrations():
             )
         """))
         db.execute(text("""
+            CREATE TABLE IF NOT EXISTS savings_accounts (
+                id                  SERIAL PRIMARY KEY,
+                user_id             INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                provider            VARCHAR(60) NOT NULL,
+                name                VARCHAR(100) NOT NULL,
+                account_type        VARCHAR(30) NOT NULL,
+                annual_contribution NUMERIC(14,2) NOT NULL DEFAULT 0,
+                contribution_source VARCHAR(10) NOT NULL DEFAULT 'employee',
+                retirement          BOOLEAN NOT NULL DEFAULT true,
+                is_active           BOOLEAN NOT NULL DEFAULT true,
+                notes               TEXT,
+                created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+        """))
+        db.execute(text("""
+            CREATE TABLE IF NOT EXISTS savings_holdings (
+                id            SERIAL PRIMARY KEY,
+                account_id    INTEGER NOT NULL REFERENCES savings_accounts(id) ON DELETE CASCADE,
+                symbol        VARCHAR(20),
+                name          VARCHAR(120) NOT NULL,
+                asset_class   VARCHAR(20) NOT NULL DEFAULT 'auto',
+                quantity      NUMERIC(20,6),
+                manual_value  NUMERIC(16,2),
+                as_of         DATE,
+                illiquid      BOOLEAN NOT NULL DEFAULT false,
+                updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                CHECK (quantity IS NOT NULL OR manual_value IS NOT NULL)
+            )
+        """))
+        db.execute(text("""
+            CREATE TABLE IF NOT EXISTS savings_history (
+                id        SERIAL PRIMARY KEY,
+                user_id   INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                as_of     DATE NOT NULL,
+                total     NUMERIC(16,2) NOT NULL,
+                breakdown JSONB,
+                UNIQUE (user_id, as_of)
+            )
+        """))
+        db.execute(text("""
+            CREATE TABLE IF NOT EXISTS savings_snapshots (
+                id          SERIAL PRIMARY KEY,
+                user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                account_key TEXT NOT NULL,
+                as_of       DATE NOT NULL,
+                value       NUMERIC(16,2) NOT NULL,
+                holdings    JSONB NOT NULL,
+                UNIQUE (user_id, account_key, as_of)
+            )
+        """))
+        db.execute(text("""
             CREATE TABLE IF NOT EXISTS ira_contributions (
                 id             SERIAL PRIMARY KEY,
                 user_id        INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -447,7 +498,7 @@ app.add_middleware(
     allow_headers=["Content-Type", "Authorization", "X-Requested-With"],
 )
 
-from .routes import auth as auth_route, admin as admin_route, strategies as strategies_route, ai_log as ai_log_route, ira as ira_route
+from .routes import auth as auth_route, admin as admin_route, strategies as strategies_route, ai_log as ai_log_route, ira as ira_route, savings as savings_route
 
 app.include_router(auth_route.router)
 app.include_router(admin_route.router)
@@ -460,6 +511,7 @@ app.include_router(webhook.router)
 app.include_router(screener.router)
 app.include_router(strategies_route.router)
 app.include_router(ira_route.router)
+app.include_router(savings_route.router)
 app.include_router(market_route.router)
 app.include_router(ai_log_route.router)
 

@@ -152,3 +152,14 @@ export const fetchPreTradeLog = (limit = 100, symbol = null) =>
 // ── Market tape check ─────────────────────────────────────────────────────────
 export const fetchTapeCheck         = () => api.get('/market/tape-check').then(r => r.data)
 export const refreshTapeCheck       = () => api.delete('/market/tape-check').then(r => r.data)
+
+// ── Savings tracker (all accounts, all providers) ─────────────────────────────
+export const fetchSavingsSummary   = () => api.get('/savings/summary', { timeout: 90000 }).then(r => r.data)
+export const fetchSavingsPlan      = () => api.get('/savings/plan', { timeout: 90000 }).then(r => r.data)
+export const fetchSavingsHistory   = () => api.get('/savings/history').then(r => r.data)
+export const createSavingsAccount  = (body) => api.post('/savings/accounts', body).then(r => r.data)
+export const patchSavingsAccount   = ({ id, ...body }) => api.patch(`/savings/accounts/${id}`, body).then(r => r.data)
+export const deleteSavingsAccount  = (id) => api.delete(`/savings/accounts/${id}`).then(r => r.data)
+export const fetchHoldingsCsv      = (id) => api.get(`/savings/accounts/${id}/holdings.csv`).then(r => r.data)
+export const saveHoldingsCsv       = ({ id, csv }) => api.put(`/savings/accounts/${id}/holdings`, { csv }).then(r => r.data)
+export const fetchSavingsChanges   = () => api.get('/savings/changes').then(r => r.data)
