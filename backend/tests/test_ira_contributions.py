@@ -95,6 +95,66 @@ class SummaryTests(unittest.TestCase):
         self.assertEqual((s["excess"], s["remaining"]), (0, 0))
 
 
+class PaceTests(unittest.TestCase):
+    def year(self, today, contributed, **kw):
+        return ic.summarize_year(today.year, today, 1990, None, None, contributed)
+
+    def test_on_pace_behind_and_maxed(self):
+        mid = date(2026, 7, 2)                                   # ~half the year gone: expect ~$3,750
+        self.assertEqual(self.year(mid, 4000)["pace"], "on_pace")
+        behind = self.year(mid, 1000)
+        self.assertEqual(behind["pace"], "behind")
+        self.assertAlmostEqual(behind["behind_by"], 7500 * ((mid - date(2026, 1, 1)).days + 1) / 365 - 1000, places=1)
+        self.assertEqual(self.year(mid, 7500)["pace"], "maxed")
+
+    def test_front_loading_counts_as_on_pace(self):
+        self.assertEqual(self.year(date(2026, 2, 1), 7000)["pace"], "on_pace")
+
+    def test_pace_only_reported_for_the_current_year(self):
+        prior = ic.summarize_year(2025, date(2026, 2, 1), 1990, None, None, 0.0)
+        self.assertNotIn("pace", prior)
+
+
+class ReminderTests(unittest.TestCase):
+    def summary(self, today, contributed_cur, contributed_prior=7000.0):
+        years = [ic.summarize_year(y, today, 1990, None, None, c)
+                 for y, c in ((today.year, contributed_cur), (today.year - 1, contributed_prior))
+                 if y in ic.open_tax_years(today)]
+        return {"years": years}
+
+    def test_nothing_to_say_when_everything_is_maxed(self):
+        today = date(2026, 6, 1)
+        self.assertIsNone(ic.reminder_text(self.summary(today, 7500), today))
+
+    def test_reports_room_pace_and_monthly_amount(self):
+        today = date(2026, 6, 1)
+        msg = ic.reminder_text(self.summary(today, 2000), today)
+        self.assertIn("2026: $2,000 of $7,500", msg)
+        self.assertIn("$5,500 left", msg)
+        self.assertIn("/month fills it by Dec 31", msg)
+        self.assertIn("behind pace", msg)
+
+    def test_prior_year_included_until_april_15(self):
+        early = date(2026, 2, 1)
+        msg = ic.reminder_text(self.summary(early, 0, contributed_prior=3000.0), early)
+        self.assertIn("2025: $3,000 of $7,000", msg)
+        self.assertIn("deadline 2026-04-15", msg)
+        late = date(2026, 5, 1)
+        self.assertNotIn("2025", ic.reminder_text(self.summary(late, 0), late))
+
+    def test_summary_exposes_the_max_every_year_flag(self):
+        SETTINGS.clear()
+        SETTINGS.update(ira_birth_year="1990", ira_contribute_max="true")
+        orig = ic.list_contributions
+        ic.list_contributions = lambda db, uid: []
+        try:
+            self.assertTrue(ic.summary(MagicMock(), 1, today=date(2026, 3, 1))["max_every_year"])
+            SETTINGS["ira_contribute_max"] = "false"
+            self.assertFalse(ic.summary(MagicMock(), 1, today=date(2026, 3, 1))["max_every_year"])
+        finally:
+            ic.list_contributions = orig
+
+
 class ValidationTests(unittest.TestCase):
     today = date(2026, 3, 1)
 

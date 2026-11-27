@@ -132,7 +132,8 @@ export const runDMBacktest          = (params) => api.post('/strategies/dual-mom
 
 // ── IRA Portfolio Manager ─────────────────────────────────────────────────────
 export const fetchIRAStatus    = () => api.get('/ira/status').then(r => r.data)
-export const fetchIRATarget    = () => api.get('/ira/target').then(r => r.data)
+export const fetchIRATarget    = (refresh = false) =>
+  api.get('/ira/target', { params: refresh ? { refresh: true } : {} }).then(r => r.data)
 export const fetchIRAHistory   = (limit = 20) => api.get(`/ira/history?limit=${limit}`).then(r => r.data)
 export const runIRARebalance   = (body) => api.post('/ira/rebalance', body).then(r => r.data)
 export const setIRAHalt        = (body) => api.post('/ira/halt', body).then(r => r.data)

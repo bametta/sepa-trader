@@ -47,19 +47,21 @@ def _resolve(key, years: int) -> int | None:
     return idx if 0 <= idx < years else None
 
 
-def project(balance: float, annual: float, years: int, mix: dict, shocks: dict | None = None) -> float:
+def project(balance: float, annual, years: int, mix: dict, shocks: dict | None = None) -> float:
+    """`annual` is a constant yearly contribution or a per-year sequence of length `years`."""
     by_year = {}
     for key, over in (shocks or {}).items():
         idx = _resolve(key, years)
         if idx is not None:
             by_year[idx] = over
+    per_year = np.broadcast_to(np.asarray(annual, dtype=float), (years,))
     bal = float(balance)
     for y in range(years):
-        bal = (bal + annual) * (1 + _year_returns(mix, by_year.get(y)))
+        bal = (bal + per_year[y]) * (1 + _year_returns(mix, by_year.get(y)))
     return bal
 
 
-def scenario_projection(balance: float, annual: float, years: int, mix: dict, target: float | None) -> list[dict]:
+def scenario_projection(balance: float, annual, years: int, mix: dict, target: float | None) -> list[dict]:
     expected = project(balance, annual, years, mix)
     rows = [{"key": "expected", "label": "Expected returns, no shock", "final": round(expected),
              "vs_expected": 0.0, "pct_of_target": round(expected / target, 3) if target else None,

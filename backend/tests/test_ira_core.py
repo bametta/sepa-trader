@@ -1,5 +1,6 @@
 """Core IRA safety logic: allocation limits, order planning, verification, one-time execution."""
 import json
+import types
 import random
 import unittest
 from types import SimpleNamespace as NS
@@ -298,6 +299,105 @@ class TrendOverlayTests(unittest.TestCase):
         base = {"VTI": 0.5, "QQQ": 0.5}
         out, flagged = m.apply_trend_overlay(base, {"QQQ": stat(False)}, uni)
         self.assertEqual((out, flagged), (base, []))
+
+
+class StableTargetTests(unittest.TestCase):
+    """The AI tilt is computed once per ET day per market state; failures are never cached."""
+    CORE = m.normalize_weights(m.BASELINES["neutral"], U)
+
+    def setUp(self):
+        self.store, self.day, self.calls, self.regime, self.ok = {}, "2026-11-27", 0, "neutral", True
+        self.patches = [
+            patch.object(m, "get_user_setting", lambda db, k, d="", u=None: self.store.get(k, d)),
+            patch.object(m, "set_user_setting", lambda db, k, v, u: self.store.__setitem__(k, v)),
+            patch.object(m, "get_config", lambda db, uid: {"universe": U, "tilt_pp": 5.0, "trend_overlay": False}),
+            patch.object(m, "_detect_regime", lambda: (self.regime, {})),
+            patch.object(m, "_et_today", lambda: self.day),
+            patch.object(m, "_ai_adjust", self.fake_ai),
+        ]
+        for p in self.patches:
+            p.start()
+        self.addCleanup(lambda: [p.stop() for p in self.patches])
+
+    def fake_ai(self, db, uid, core, regime, ctx, holdings, tilt):
+        self.calls += 1
+        tilted = dict(core)
+        tilted["SCHD"] = core["SCHD"] + 0.01 * self.calls          # a different answer on every call
+        return tilted, f"call {self.calls}", self.ok
+
+    def build(self, **kw):
+        return m.build_target(MagicMock(), 1, [], **kw)
+
+    def test_same_day_same_state_reuses_the_tilt(self):
+        a, b = self.build(), self.build()
+        self.assertEqual(self.calls, 1)
+        self.assertEqual(a["target"], b["target"])
+        self.assertFalse(a["cached"])
+        self.assertTrue(b["cached"])
+        self.assertEqual(b["rationale"], "call 1")
+
+    def test_new_day_recomputes(self):
+        self.build()
+        self.day = "2026-11-28"
+        self.build()
+        self.assertEqual(self.calls, 2)
+
+    def test_market_state_change_recomputes(self):
+        self.build()
+        self.regime = "risk_off"
+        self.build()
+        self.assertEqual(self.calls, 2)
+
+    def test_refresh_bypasses_and_replaces_the_cache(self):
+        self.build()
+        fresh = self.build(refresh=True)
+        self.assertEqual(self.calls, 2)
+        self.assertFalse(fresh["cached"])
+        self.assertEqual(self.build()["rationale"], "call 2")
+
+    def test_ai_failure_is_not_cached(self):
+        self.ok = False
+        self.build()
+        self.build()
+        self.assertEqual(self.calls, 2)
+        self.assertNotIn(m.TARGET_CACHE_KEY, self.store)
+
+    def test_corrupt_cache_is_ignored(self):
+        self.store[m.TARGET_CACHE_KEY] = "{not json"
+        self.assertFalse(self.build()["cached"])
+        self.assertEqual(self.calls, 1)
+
+    def test_cached_tilt_still_cannot_undo_the_overlay(self):
+        overlay_cfg = patch.object(m, "get_config",
+                                   lambda db, uid: {"universe": U, "tilt_pp": 5.0, "trend_overlay": True})
+        overlay_cfg.start()
+        self.addCleanup(overlay_cfg.stop)
+        stats = {"SCHD": {"above_200sma": False}}
+        base = m.normalize_weights(m.BASELINES["neutral"], U)
+        core, flagged = m.apply_trend_overlay(base, stats, U)
+        key = {"regime": "neutral", "overlay": True, "tilt_pp": 5.0, "universe": sorted(U), "flagged": sorted(flagged),
+               "core": {s: round(w, 3) for s, w in sorted(core.items())}}
+        raised = dict(core)
+        raised["SCHD"] = core["SCHD"] + 0.04                         # a stale cached tilt that raises a flagged ETF
+        self.store[m.TARGET_CACHE_KEY] = json.dumps({"date": self.day, "key": key, "tilted": raised, "rationale": "x"})
+        import sys
+        fake_ira_data = types.SimpleNamespace(market_stats=lambda syms: stats)
+        fake_planner = types.SimpleNamespace(get_profile=lambda db, uid: {"age": None},
+                                             glidepath_equity=lambda *a: 0.5)
+        pkg = sys.modules["app"]
+        saved = {k: getattr(pkg, k, None) for k in ("ira_data", "ira_planner")}
+        with patch.dict("sys.modules", {"app.ira_data": fake_ira_data, "app.ira_planner": fake_planner}):
+            pkg.ira_data, pkg.ira_planner = fake_ira_data, fake_planner
+            try:
+                out = self.build()
+            finally:
+                for k, v in saved.items():
+                    if v is None:
+                        delattr(pkg, k)
+                    else:
+                        setattr(pkg, k, v)
+        self.assertTrue(out["cached"])
+        self.assertLessEqual(out["target"]["SCHD"], core["SCHD"] + 0.002)
 
 
 class CapFlaggedTests(unittest.TestCase):

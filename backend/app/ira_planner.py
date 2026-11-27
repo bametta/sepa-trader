@@ -48,11 +48,18 @@ def get_profile(db, uid: int) -> dict:
         "risk": risk if risk in ("conservative", "moderate", "aggressive") else "moderate",
         "target_amount": num("ira_target_amount"), "target_income": num("ira_target_income"),
         "planned_contribution": num("ira_annual_contribution"), "annual_income": num("ira_annual_income"),
+        "contribute_max": (g("ira_contribute_max", "") or "").lower() == "true",
     }
 
 
 def contribution_limit(age: int | None) -> float:
     return LIMITS["base"] + (LIMITS["catch_up_50"] if age is not None and age >= 50 else 0.0)
+
+
+def contribution_path(age: int, years: int) -> np.ndarray:
+    """Max contribution for each remaining year, including the age-50 catch-up (limits assumed to keep
+    pace with inflation, so the path is in today's dollars)."""
+    return np.array([contribution_limit(age + i) for i in range(years)], dtype=float)
 
 
 def glidepath_equity(age: int, retire_age: int, risk: str) -> float:
@@ -86,14 +93,16 @@ def equity_share_of(bucket_exposure: dict) -> float:
     return round(sum(v for b, v in bucket_exposure.items() if b in EQUITY_BUCKETS), 3)
 
 
-def _simulate(balance: float, annual: float, years: int, mu: float, sigma: float,
+def _simulate(balance: float, annual, years: int, mu: float, sigma: float,
               n: int = 4000, seed: int = 7) -> np.ndarray:
+    """`annual` is a constant yearly contribution or a per-year array of length `years`."""
     rng = np.random.default_rng(seed)
     log_mu = np.log(1 + mu) - 0.5 * (sigma / (1 + mu)) ** 2
     log_sd = sigma / (1 + mu)
+    per_year = np.broadcast_to(np.asarray(annual, dtype=float), (years,))
     bal = np.full(n, float(balance))
-    for _ in range(years):
-        bal = (bal + annual) * np.exp(rng.normal(log_mu, log_sd, n))
+    for y in range(years):
+        bal = (bal + per_year[y]) * np.exp(rng.normal(log_mu, log_sd, n))
     return bal
 
 
@@ -129,14 +138,19 @@ def build_plan(db, uid: int, balance: float, tactical_equity: float | None = Non
     out["target"] = {"amount": round(target) if target else None,
                      "basis": "target_amount" if p["target_amount"] else ("income / 4% withdrawal rule" if target else None)}
 
+    max_mode = bool(p["contribute_max"])
+    path = contribution_path(age, years) if max_mode else None
+    at_limit = path if max_mode else limit          # what "maxing the IRA" means for the projections
+
     def scenario(annual):
+        a0 = float(np.asarray(annual, dtype=float).flat[0])   # first-year amount for display
         end = _simulate(balance, annual, years, mu, sigma)
-        s = {"annual": round(annual), "monthly": round(annual / 12),
-             "pct_of_limit": round(annual / limit, 3),
+        s = {"annual": round(a0), "monthly": round(a0 / 12),
+             "pct_of_limit": round(a0 / limit, 3),
              "p10": round(float(np.percentile(end, 10))), "p50": round(float(np.percentile(end, 50))),
              "p90": round(float(np.percentile(end, 90)))}
         if p["annual_income"]:
-            s["pct_of_income"] = round(annual / p["annual_income"], 4)
+            s["pct_of_income"] = round(a0 / p["annual_income"], 4)
         if target:
             s["prob_reach_target"] = round(float((end >= target).mean()), 3)
         return s
@@ -144,11 +158,22 @@ def build_plan(db, uid: int, balance: float, tactical_equity: float | None = Non
     levels = sorted({round(limit * f) for f in (0.25, 0.5, 0.75, 1.0)} |
                     ({round(p["planned_contribution"])} if p["planned_contribution"] else set()))
     out["scenarios"] = [scenario(a) for a in levels]
+    if max_mode:
+        # Replace the flat "100%" row with the true max-every-year path (catch-up from age 50).
+        for i, s in enumerate(out["scenarios"]):
+            if s["annual"] == round(limit):
+                out["scenarios"][i] = {**scenario(path), "max_every_year": True}
+        out["max_mode"] = {
+            "enabled": True, "first_year": round(float(path[0])), "final_year": round(float(path[-1])),
+            "catch_up_years": int((path > LIMITS["base"]).sum()), "total_contributed": round(float(path.sum())),
+            "note": "Assumes you contribute the IRS maximum every year, including the age-50 catch-up, "
+                    "with limits keeping pace with inflation.",
+        }
 
     if target:
         if _prob(target, balance, 0, years, mu, sigma) >= SUCCESS_TARGET:
             rec, kind = 0.0, "already_on_track"
-        elif _prob(target, balance, limit, years, mu, sigma) >= SUCCESS_TARGET:
+        elif _prob(target, balance, at_limit, years, mu, sigma) >= SUCCESS_TARGET:
             lo, hi = 0.0, limit
             for _ in range(18):
                 mid = (lo + hi) / 2
@@ -161,21 +186,25 @@ def build_plan(db, uid: int, balance: float, tactical_equity: float | None = Non
         if p["annual_income"]:
             r["pct_of_income"] = round(rec / p["annual_income"], 4)
         if kind == "limit_not_enough":
-            r["prob_at_limit"] = round(_prob(target, balance, limit, years, mu, sigma), 3)
-            lo, hi = limit, limit * 8
+            r["prob_at_limit"] = round(_prob(target, balance, at_limit, years, mu, sigma), 3)
+            base = np.asarray(at_limit, dtype=float)
+            lo, hi = 0.0, limit * 8               # extra yearly saving needed on top of maxing the IRA
             for _ in range(18):
                 mid = (lo + hi) / 2
-                lo, hi = (lo, mid) if _prob(target, balance, mid, years, mu, sigma) >= SUCCESS_TARGET else (mid, hi)
-            r["total_annual_saving_needed"] = round(hi)
-            r["extra_outside_ira"] = round(hi - limit)
+                lo, hi = (lo, mid) if _prob(target, balance, base + mid, years, mu, sigma) >= SUCCESS_TARGET else (mid, hi)
+            r["extra_outside_ira"] = round(hi)
+            r["total_annual_saving_needed"] = round(float(base.flat[0]) + hi)
             r["note"] = ("Maxing the IRA is not enough for an 80% chance. Close the gap with savings in a "
                          "401(k)/taxable account, a later retirement age, or a lower target.")
         out["recommendation"] = r
         try:
             from . import ira_stress
-            assumed = p["planned_contribution"] if p["planned_contribution"] else r["annual"]
+            assumed = path if max_mode else (p["planned_contribution"] if p["planned_contribution"] else r["annual"])
+            first = float(np.asarray(assumed, dtype=float).flat[0])
             out["stress"] = {
-                "contribution_assumed": round(assumed),
+                "contribution_assumed": round(first),
+                "contribution_avg": round(float(np.mean(assumed))),
+                "max_every_year": max_mode,
                 "scenarios": ira_stress.scenario_projection(balance, assumed, years, mix, target),
                 "withdrawal": ira_stress.withdrawal_test(target, p["retire_age"], p["risk"], 0.04),
             }

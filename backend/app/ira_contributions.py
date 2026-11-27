@@ -90,11 +90,34 @@ def summarize_year(year: int, today: date, birth_year: int | None, magi: float |
         "monthly_to_fill_by_deadline": (round(remaining / months_to_deadline, 2)
                                         if remaining and months_to_deadline else None),
     }
+    if year == today.year:
+        elapsed = min(1.0, ((today - date(year, 1, 1)).days + 1) / 365.0)
+        expected = allowed * elapsed
+        out["expected_by_today"] = round(expected, 2)
+        out["behind_by"] = round(max(0.0, expected - contributed), 2)
+        out["pace"] = "maxed" if remaining <= 0 else ("on_pace" if contributed + 0.5 >= expected else "behind")
     if excess > 0:
         out["warning"] = (f"Contributions exceed the limit by ${excess:,.2f}. Excess is taxed 6% per year until "
                           f"withdrawn (about ${excess * EXCISE_RATE:,.2f}/yr). Withdraw the excess and its "
                           "earnings before the filing deadline and talk to a tax professional.")
     return out
+
+
+def reminder_text(summary: dict, today: date) -> str | None:
+    """Monthly 'are you on track to max the IRA?' message, or None when nothing is open."""
+    open_years = set(open_tax_years(today))
+    lines = []
+    for y in summary["years"]:
+        if y["year"] not in open_years or y["remaining"] <= 0:
+            continue
+        if y["year"] == today.year and y.get("monthly_to_fill_by_year_end"):
+            when = f"about ${y['monthly_to_fill_by_year_end']:,.0f}/month fills it by Dec 31"
+        else:
+            when = f"deadline {y['deadline']}"
+        status = {"behind": " (behind pace)", "on_pace": " (on pace)"}.get(y.get("pace"), "")
+        lines.append(f"{y['year']}: ${y['contributed']:,.0f} of ${y['allowed']:,.0f} contributed, "
+                     f"${y['remaining']:,.0f} left, {when}{status}.")
+    return ("IRA contribution check:\n" + "\n".join(lines)) if lines else None
 
 
 # ── Ledger (database) ─────────────────────────────────────────────────────────
@@ -158,6 +181,7 @@ def summary(db, uid: int, today: date | None = None) -> dict:
     years = sorted(set(open_tax_years(today)) | set(by_year), reverse=True)
     return {
         "today": today.isoformat(),
+        "max_every_year": (g("ira_contribute_max") or "").lower() == "true",
         "years": [summarize_year(y, today, int(birth) if birth else None, magi, status, by_year.get(y, 0.0))
                   for y in years],
         "ledger": ledger,

@@ -17,7 +17,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from . import alpaca_client as alp
-from .database import get_user_setting, get_all_user_settings
+from .database import get_user_setting, get_all_user_settings, set_user_setting
 from .utils import sf as _sf
 
 logger = logging.getLogger(__name__)
@@ -219,11 +219,12 @@ def normalize_weights(weights: dict, universe: list[str]) -> dict:
 
 
 def _ai_adjust(db: Session, user_id: int, baseline: dict, regime: str,
-               context: dict, holdings: list[dict], tilt: float = 0.05) -> tuple[dict, str]:
-    """Ask the AI to tilt the baseline by at most ±`tilt` per ETF. Returns (weights, rationale).
-    Falls back to the baseline on any AI problem; tilt <= 0 disables the AI allocation step."""
+               context: dict, holdings: list[dict], tilt: float = 0.05) -> tuple[dict, str, bool]:
+    """Ask the AI to tilt the baseline by at most ±`tilt` per ETF. Returns (weights, rationale, ok).
+    Falls back to the baseline on any AI problem (ok=False, so the caller never caches it);
+    tilt <= 0 disables the AI allocation step."""
     if tilt <= 0:
-        return baseline, "AI tilt disabled; rules-based glidepath core only."
+        return baseline, "AI tilt disabled; rules-based glidepath core only.", True
     from .claude_analyst import _call_ai
     prompt = (
         "You are the portfolio manager for a long-horizon Roth IRA (ETF-only, no leverage, "
@@ -244,25 +245,60 @@ def _ai_adjust(db: Session, user_id: int, baseline: dict, regime: str,
         raw = _call_ai(db, prompt, 1500, user_id)
     except Exception as exc:
         logger.error("ira AI call failed: %s", exc)
-        return baseline, f"AI unavailable ({str(exc)[:80]}); using rules-based baseline."
+        return baseline, f"AI unavailable ({str(exc)[:80]}); using rules-based baseline.", False
     if not raw:
-        return baseline, "No AI provider configured; using rules-based baseline."
+        return baseline, "No AI provider configured; using rules-based baseline.", False
     m = re.search(r"\{.*\}", raw, re.S)
     if not m:
-        return baseline, "AI response unparseable; using rules-based baseline."
+        return baseline, "AI response unparseable; using rules-based baseline.", False
     try:
         data = json.loads(m.group(0))
         proposed = {s.upper(): float(v) for s, v in (data.get("weights") or {}).items()}
     except Exception:
-        return baseline, "AI response unparseable; using rules-based baseline."
+        return baseline, "AI response unparseable; using rules-based baseline.", False
     bounded = {}
     for s, base_w in baseline.items():
         p = proposed.get(s, base_w)
         bounded[s] = min(base_w + tilt, max(base_w - tilt, p))
-    return bounded, str(data.get("rationale", ""))[:1000]
+    return bounded, str(data.get("rationale", ""))[:1000], True
 
 
-def build_target(db: Session, user_id: int, holdings: list[dict] | None = None) -> dict:
+TARGET_CACHE_KEY = "ira_target_cache"
+
+
+def _et_today() -> str:
+    import pytz
+    return datetime.now(pytz.timezone("America/New_York")).date().isoformat()
+
+
+def _load_target_cache(db: Session, user_id: int, key: dict) -> dict | None:
+    """Today's cached AI tilt, only if it was computed for the same market state (same key)."""
+    try:
+        d = json.loads(get_user_setting(db, TARGET_CACHE_KEY, "", user_id) or "null")
+    except (TypeError, ValueError):
+        return None
+    if isinstance(d, dict) and d.get("date") == _et_today() and d.get("key") == key and d.get("tilted"):
+        return d
+    return None
+
+
+def _save_target_cache(db: Session, user_id: int, key: dict, tilted: dict, rationale: str) -> None:
+    try:
+        set_user_setting(db, TARGET_CACHE_KEY,
+                         json.dumps({"date": _et_today(), "key": key, "tilted": tilted, "rationale": rationale}),
+                         user_id)
+    except Exception as exc:
+        logger.warning("ira target cache save failed: %s", exc)
+
+
+def build_target(db: Session, user_id: int, holdings: list[dict] | None = None,
+                 refresh: bool = False) -> dict:
+    """Regime baseline -> trend overlay -> AI tilt.
+
+    The AI tilt is computed once per US-Eastern day and reused (page, preview, scheduled run) so the
+    target is stable. It recomputes if the market state changes (regime flips, an ETF crosses its
+    200-day average, settings change) or when `refresh` is set. AI failures are never cached.
+    """
     cfg = get_config(db, user_id)
     regime, ctx = _detect_regime()
     stats: dict = {}
@@ -285,11 +321,20 @@ def build_target(db: Session, user_id: int, holdings: list[dict] | None = None) 
         core, flagged = apply_trend_overlay(baseline, stats, cfg["universe"])
     ctx["trend_overlay"] = ({"applied": True, "halved_etfs_below_200d_sma": flagged} if cfg["trend_overlay"]
                             else {"applied": False})
-    tilted, rationale = _ai_adjust(db, user_id, core, regime, ctx, holdings or [], cfg["tilt_pp"] / 100.0)
+    cache_key = {"regime": regime, "overlay": bool(cfg["trend_overlay"]), "tilt_pp": cfg["tilt_pp"],
+                 "universe": sorted(cfg["universe"]), "flagged": sorted(flagged),
+                 "core": {s: round(w, 3) for s, w in sorted(core.items())}}
+    cached = None if refresh else _load_target_cache(db, user_id, cache_key)
+    if cached:
+        tilted, rationale = cached["tilted"], cached["rationale"]
+    else:
+        tilted, rationale, ok = _ai_adjust(db, user_id, core, regime, ctx, holdings or [], cfg["tilt_pp"] / 100.0)
+        if ok:
+            _save_target_cache(db, user_id, cache_key, tilted, rationale)
     tilted = cap_flagged(tilted, core, flagged, cfg["universe"])
     target = normalize_weights(tilted, cfg["universe"])
     return {"regime": regime, "baseline": baseline, "core": core, "trend_flagged": flagged,
-            "target": target, "rationale": rationale}
+            "target": target, "rationale": rationale, "cached": bool(cached), "target_date": _et_today()}
 
 
 # ── Rebalance planning / execution ────────────────────────────────────────────
@@ -456,13 +501,14 @@ def _market_open(client) -> bool:
         return False
 
 
-def run_rebalance(db: Session, user_id: int, execute: bool = False, force: bool = False) -> dict:
+def run_rebalance(db: Session, user_id: int, execute: bool = False, force: bool = False,
+                  refresh_target: bool = False) -> dict:
     """Evaluate (and optionally execute) a rebalance. Always logs the proposal."""
     if not has_credentials(db, user_id):
         raise ValueError("ira_credentials_missing")
     cfg  = get_config(db, user_id)
     snap = get_snapshot(db, user_id)
-    tgt  = build_target(db, user_id, snap["holdings"])
+    tgt  = build_target(db, user_id, snap["holdings"], refresh=refresh_target)
     threshold = 0.0 if force else cfg["threshold_pct"]
     plan = plan_rebalance(snap, tgt["target"], threshold, cfg["cash_buffer"])
 

@@ -68,6 +68,50 @@ class PlannerTests(unittest.TestCase):
         SETTINGS["ira_target_income"] = "30000"
         self.assertEqual(self.p.build_plan(None, 1, 0.0)["target"]["amount"], 750000)
 
+    def test_contribution_path_adds_catch_up_from_age_50(self):
+        path = self.p.contribution_path(45, 10)               # ages 45..54
+        self.assertEqual(list(path[:5]), [7500.0] * 5)
+        self.assertEqual(list(path[5:]), [8600.0] * 5)
+
+    def test_per_year_array_matches_the_constant_case(self):
+        const = self.p._simulate(1000.0, 7500.0, 12, 0.04, 0.12)
+        arr = self.p._simulate(1000.0, numpy.full(12, 7500.0), 12, 0.04, 0.12)
+        numpy.testing.assert_allclose(const, arr)
+
+    def test_max_every_year_mode_includes_the_catch_up(self):
+        SETTINGS["ira_contribute_max"] = "true"
+        SETTINGS["ira_birth_year"] = str(date.today().year - 38)
+        SETTINGS["ira_target_amount"] = "1000000"
+        plan = self.p.build_plan(None, 1, 0.0)
+        mm = plan["max_mode"]
+        self.assertEqual((mm["first_year"], mm["final_year"]), (7500, 8600))
+        self.assertGreater(mm["catch_up_years"], 0)
+        flat_years = 27
+        self.assertGreater(mm["total_contributed"], 7500 * flat_years)
+        row = [s for s in plan["scenarios"] if s.get("max_every_year")]
+        self.assertEqual(len(row), 1)
+        self.assertEqual(plan["stress"]["contribution_assumed"], 7500)
+        self.assertGreater(plan["stress"]["contribution_avg"], 7500)
+        self.assertTrue(plan["stress"]["max_every_year"])
+
+    def test_max_mode_beats_flat_limit_and_is_off_by_default(self):
+        SETTINGS["ira_target_amount"] = "1000000"
+        SETTINGS["ira_birth_year"] = str(date.today().year - 38)
+        flat = self.p.build_plan(None, 1, 0.0)
+        self.assertNotIn("max_mode", flat)
+        SETTINGS["ira_contribute_max"] = "true"
+        maxed = self.p.build_plan(None, 1, 0.0)
+        top = lambda p: max(s["p50"] for s in p["scenarios"])
+        self.assertGreater(top(maxed), top(flat))
+
+    def test_extra_saving_outside_the_ira_is_reported_on_top_of_the_max_path(self):
+        SETTINGS["ira_contribute_max"] = "true"
+        SETTINGS["ira_target_amount"] = "5000000"
+        rec = self.p.build_plan(None, 1, 0.0)["recommendation"]
+        self.assertEqual(rec["kind"], "limit_not_enough")
+        self.assertGreater(rec["extra_outside_ira"], 0)
+        self.assertEqual(rec["total_annual_saving_needed"], 7500 + rec["extra_outside_ira"])
+
     def test_retirement_in_the_past_is_not_ready(self):
         SETTINGS["ira_retire_age"] = "30"
         self.assertFalse(self.p.build_plan(None, 1, 0.0)["ready"])

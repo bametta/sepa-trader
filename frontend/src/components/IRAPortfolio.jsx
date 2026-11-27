@@ -115,6 +115,13 @@ function PlanCard({ plan }) {
           Goal {usd0(plan.target.amount)} in today's dollars ({plan.target.basis}) · expected real return {pct(plan.expected_real_return)}, volatility {pct(plan.expected_volatility)}
         </div>
       )}
+      {plan.max_mode && (
+        <div className="text-xs text-slate-400">
+          Contribution goal: the IRS maximum every year, {usd0(plan.max_mode.first_year)}/yr
+          {plan.max_mode.catch_up_years > 0 && <> rising to {usd0(plan.max_mode.final_year)}/yr from age 50</>}
+          {' '}({usd0(plan.max_mode.total_contributed)} contributed in total).
+        </div>
+      )}
       {r && (
         <div className="rounded-lg border border-white/[0.08] p-3 space-y-1">
           <div className="text-[10px] uppercase tracking-wider text-slate-500">Recommended contribution</div>
@@ -242,7 +249,14 @@ function ContributionsCard() {
       {d?.years.map(y => (
         <div key={y.year} className={`rounded-lg border p-3 space-y-1 ${y.excess > 0 ? 'border-red-500/50' : 'border-white/[0.08]'}`}>
           <div className="flex items-center justify-between text-sm">
-            <span className="text-slate-100 font-semibold">{y.year} tax year</span>
+            <span className="text-slate-100 font-semibold">
+              {y.year} tax year
+              {y.pace && (
+                <span className={`ml-2 text-[11px] font-normal ${y.pace === 'behind' ? 'text-amber-400' : 'text-emerald-400'}`}>
+                  {y.pace === 'maxed' ? 'maxed ✓' : y.pace === 'on_pace' ? 'on pace' : `behind pace by ${usd0(y.behind_by)}`}
+                </span>
+              )}
+            </span>
             <span className="text-slate-300 num">{usd0(y.contributed)} of {usd0(y.allowed)}</span>
           </div>
           <div className="h-1.5 rounded bg-white/[0.06] overflow-hidden">
@@ -407,7 +421,8 @@ export default function IRAPortfolio() {
 
   const status = useQuery('ira-status', fetchIRAStatus, { refetchInterval: 60000, retry: false })
   const connected = status.data?.connected
-  const target = useQuery('ira-target', fetchIRATarget, { enabled: !!connected, retry: false, staleTime: 5 * 60000 })
+  const target = useQuery('ira-target', () => fetchIRATarget(), { enabled: !!connected, retry: false, staleTime: 5 * 60000 })
+  const recompute = useMutation(() => fetchIRATarget(true), { onSuccess: d => qc.setQueryData('ira-target', d) })
   const history = useQuery('ira-history', () => fetchIRAHistory(10), { enabled: !!connected })
   const plan = useQuery('ira-plan', fetchIRAPlan, { enabled: !!connected, retry: false, staleTime: 5 * 60000 })
 
@@ -470,10 +485,20 @@ export default function IRAPortfolio() {
       <div className="card space-y-3">
         <div className="flex items-center justify-between">
           <div className="text-slate-100 font-semibold">Target vs current</div>
-          {regime && (
-            <span className={`text-xs px-2 py-0.5 rounded border ${regime.cls}`}>{regime.label}</span>
-          )}
+          <div className="flex items-center gap-3">
+            {t?.target_date && (
+              <span className="text-[11px] text-slate-500">
+                set {t.target_date}{t.cached ? ' · stable for the day' : ''}
+                {' '}<button className="underline hover:text-slate-300" disabled={recompute.isLoading}
+                             onClick={() => recompute.mutate()}>{recompute.isLoading ? 'recomputing…' : 'recompute'}</button>
+              </span>
+            )}
+            {regime && (
+              <span className={`text-xs px-2 py-0.5 rounded border ${regime.cls}`}>{regime.label}</span>
+            )}
+          </div>
         </div>
+        {recompute.isError && <div className="text-sm text-red-400">{errMsg(recompute.error)}</div>}
         {target.isLoading && <div className="text-sm text-slate-500">Building AI target…</div>}
         {target.isError && <div className="text-sm text-red-400">{errMsg(target.error)}</div>}
         {t && (
