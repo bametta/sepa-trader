@@ -32,13 +32,16 @@ function Panel({ title, to, onNavigate, children, error, loading }) {
   )
 }
 
-function Stat({ label, value, sub, tone }) {
-  const color = tone === 'good' ? 'text-emerald-400' : tone === 'bad' ? 'text-red-400' : 'text-slate-100'
+const TONE = { good: 'text-emerald-400', bad: 'text-red-400' }
+
+// `tone` colors the headline value (use for limit breaches); `subTone` colors only the small line under it
+// (use for up/down moves, so a down day doesn't turn the whole number red).
+function Stat({ label, value, sub, tone, subTone }) {
   return (
     <div>
       <div className="text-[10px] uppercase tracking-wider text-slate-500">{label}</div>
-      <div className={`num text-lg font-semibold ${color}`}>{value}</div>
-      {sub && <div className="text-[11px] text-slate-500">{sub}</div>}
+      <div className={`num text-lg font-semibold ${TONE[tone] || 'text-slate-100'}`}>{value}</div>
+      {sub && <div className={`text-[11px] ${TONE[subTone] || 'text-slate-500'}`}>{sub}</div>}
     </div>
   )
 }
@@ -114,10 +117,10 @@ export default function Overview({ onNavigate }) {
               <>
                 <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
                   <Stat label="Total" value={usd0(s.total)} sub={change != null ? `${usdS(change)} since last snapshot` : null}
-                        tone={change > 0 ? 'good' : change < 0 ? 'bad' : undefined} />
+                        subTone={change > 0 ? 'good' : change < 0 ? 'bad' : undefined} />
                   <Stat label="Retirement" value={usd0(s.retirement_total)} />
                   <Stat label="Stocks" value={pct(s.equity_share)} sub={p?.ready ? `glidepath ${pct(p.glidepath_equity)}` : null} />
-                  <Stat label="Tech funds" value={pct(s.by_theme?.tech_pct)} sub="limit 30%"
+                  <Stat label="Tech funds" value={pct(s.by_theme?.tech_pct)} sub="limit 30% (40% for dips)"
                         tone={s.by_theme?.tech_pct > 0.3 ? 'bad' : undefined} />
                 </div>
                 <Spark points={pts} />
@@ -158,7 +161,7 @@ export default function Overview({ onNavigate }) {
 
         <Panel title="By account" to="Savings" onNavigate={onNavigate} loading={summary.isLoading} error={summary.isError}>
           <div className="space-y-2">
-            {(s?.accounts || []).slice().sort((a, b) => b.value - a.value).slice(0, 7).map(a => (
+            {(s?.accounts || []).filter(a => a.value >= 1).sort((a, b) => b.value - a.value).slice(0, 7).map(a => (
               <Bar key={a.id} label={`${a.provider} · ${a.name}`} value={a.value} total={s.total} />
             ))}
             <div className="flex flex-wrap gap-x-4 gap-y-1 pt-1 text-[11px] text-slate-500">
@@ -182,7 +185,7 @@ export default function Overview({ onNavigate }) {
             <div className="space-y-3">
               {modeAccts.slice(0, 3).map(a => (
                 <Stat key={a.name} label={a.name} value={usd0(a.portfolio_value)}
-                      sub={`today ${usdS(a.day_pnl)}`} tone={a.day_pnl > 0 ? 'good' : a.day_pnl < 0 ? 'bad' : undefined} />
+                      sub={`today ${usdS(a.day_pnl)}`} subTone={a.day_pnl > 0 ? 'good' : a.day_pnl < 0 ? 'bad' : undefined} />
               ))}
               <div className="text-[11px] text-slate-500">
                 {(positions.data || []).length} open position(s)

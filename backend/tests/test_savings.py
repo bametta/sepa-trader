@@ -624,6 +624,19 @@ class TechThemeTests(unittest.TestCase):
         self.assertNotIn("TECH_THEME", {w["code"] for w in s["warnings"]})
         self.assertEqual(s["by_theme"]["tech"], 0)
 
+    def test_tech_fund_not_double_flagged_as_concentration(self):
+        s = sv.build_summary([acct("Schwab", "roth_ira", [hold("a", "QQQM", qty=10), hold("b", "BND", qty=2)])],
+                             {"QQQM": 100, "BND": 100}, TODAY)
+        codes = {w["code"] for w in s["warnings"]}
+        self.assertIn("TECH_THEME", codes)
+        self.assertNotIn("CONCENTRATION", codes)
+        self.assertIn("QQQM alone is", next(w["detail"] for w in s["warnings"] if w["code"] == "TECH_THEME"))
+
+    def test_company_stock_still_flagged_when_tech_is_over(self):
+        s = sv.build_summary([acct("Schwab", "roth_ira", [hold("a", "QQQM", qty=10), hold("Employer", "ACME", qty=10)])],
+                             {"QQQM": 100, "ACME": 100}, TODAY)
+        self.assertIn("CONCENTRATION", {w["code"] for w in s["warnings"]})      # ACME is a single name, not tech
+
     def test_small_tech_slice_ok(self):
         s = sv.build_summary([acct("Fidelity", "roth_ira", [
             hold("q", "QQQM", qty=1), hold("v", "VTI", qty=9)])], {"QQQM": 100, "VTI": 100}, TODAY)

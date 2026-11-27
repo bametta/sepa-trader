@@ -243,7 +243,7 @@ def build_summary(accounts: list[dict], prices: dict, today: date | None = None,
     by_provider, by_tax, by_class, positions = {}, {}, {}, {}
     out_accounts, warnings = [], []
     stale, missing, unclassified = [], [], 0.0
-    tech_total, tech_syms = 0.0, set()
+    tech_total, tech_syms, tech_by_sym = 0.0, set(), {}
 
     for a in accounts:
         acct_value = 0.0
@@ -267,6 +267,7 @@ def build_summary(accounts: list[dict], prices: dict, today: date | None = None,
             if sym in TECH_THEME:
                 tech_total += val
                 tech_syms.add(sym)
+                tech_by_sym[sym] = tech_by_sym.get(sym, 0.0) + val
             as_of = h.get("as_of")
             age = (today - as_of).days if as_of else None
             is_stale = (source == "manual" and age is not None
@@ -324,15 +325,20 @@ def build_summary(accounts: list[dict], prices: dict, today: date | None = None,
     if unclassified > 0.005 * (total or 1):
         warnings.append({"code": "UNCLASSIFIED", "severity": "warn",
                          "detail": f"${unclassified:,.0f} is in holdings without an asset class, so allocation is understated."})
+    tech_over = pct(tech_total) > LIMITS["tech_theme_pct"]
     for p in top[:3]:
+        if (p["symbol"] or "").upper() in TECH_THEME and tech_over:
+            continue                                   # already covered by the (broader) TECH_THEME warning below
         if p["pct"] > LIMITS["position_pct"] and p["single"]:
             warnings.append({"code": "CONCENTRATION", "severity": "warn",
                              "detail": f"{p['name']} is {p['pct']:.0%} of everything you track."})
-    if pct(tech_total) > LIMITS["tech_theme_pct"]:
+    if tech_over:
+        biggest = max(((s, v) for s, v in tech_by_sym.items()), key=lambda kv: kv[1])
         warnings.append({"code": "TECH_THEME", "severity": "warn",
                          "detail": f"Tech / semiconductor / AI funds ({', '.join(sorted(tech_syms))}) are "
-                                   f"{pct(tech_total):.0%} of everything you track. They hold many of the same "
-                                   f"companies, so they move together."})
+                                   f"{pct(tech_total):.0%} of everything you track; {biggest[0]} alone is "
+                                   f"{pct(biggest[1]):.0%}. They hold many of the same companies, so they move "
+                                   f"together."})
     if pct(by_class.get("company_stock", 0.0)) > LIMITS["company_stock_pct"]:
         warnings.append({"code": "COMPANY_STOCK", "severity": "warn",
                          "detail": f"Employer stock is {pct(by_class['company_stock']):.0%} of your total."})

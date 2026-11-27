@@ -141,7 +141,8 @@ function Dashboard() {
           )}
         </div>
 
-        <AccountSummary onModeChange={handleModeChange} refetchInterval={ACCOUNT_INTERVAL} />
+        {/* The Overview tab has its own trading panel, so the tall account card would only push it down */}
+        {tab !== 'Overview' && <AccountSummary onModeChange={handleModeChange} refetchInterval={ACCOUNT_INTERVAL} />}
 
         {/* Tab bar */}
         <div className="flex gap-1 p-1 w-fit max-w-full overflow-x-auto"
