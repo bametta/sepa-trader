@@ -12,7 +12,7 @@ is worth most in the Roth). It never moves money between accounts, so each accou
 import math
 import re
 
-from .savings import exposure
+from .savings import LIMITS, TECH_THEME, exposure
 
 PRETAX_CLASSES = {"bonds_agg", "bonds_tips", "cash"}
 SYMBOL_RE = re.compile(r"^[A-Z0-9][A-Z0-9.\-]{0,9}$")
@@ -105,9 +105,14 @@ def _assign_targets(accounts, target_dollars, capacity):
 
 
 def plan_trades(accounts: list[dict], prices: dict, target: dict, mode: str = "cash_only",
-                min_trade: float = 25.0, drift_threshold: float = 0.03) -> dict:
+                min_trade: float = 25.0, drift_threshold: float = 0.03, outside_total: float = 0.0,
+                outside_tech: float = 0.0, tech_limit: float | None = None) -> dict:
     """accounts: [{id, name, tax('roth'|'pre_tax'), holdings:[{symbol, quantity, value, asset_class, name}]}].
-    mode 'cash_only' buys with each account's cash and never sells; 'full' also sells overweight holdings."""
+    mode 'cash_only' buys with each account's cash and never sells; 'full' also sells overweight holdings.
+    Buys of tech/semiconductor/AI funds are capped so those funds stay within `tech_limit` (default 30%) of
+    everything tracked: the selected accounts plus `outside_total` dollars elsewhere, of which `outside_tech`
+    is already in tech funds. Cash that can't go to tech goes to the other funds, or stays in cash."""
+    limit = LIMITS["tech_theme_pct"] if tech_limit is None else tech_limit
     if mode not in ("cash_only", "full"):
         raise ValueError("mode must be 'cash_only' or 'full'")
     accounts = [a for a in accounts if a["tax"] in TAX_GROUPS]
@@ -154,6 +159,12 @@ def plan_trades(accounts: list[dict], prices: dict, target: dict, mode: str = "c
     results = []
     final_pos = {aid: dict(st["pos"]) for aid, st in state.items()}
     final_cash = {}
+    held_back: dict[str, int] = {}
+
+    def tech_room() -> float:
+        """Dollars of tech-theme funds that can still be added across everything tracked."""
+        inside = sum(q * prices[s] for pos in final_pos.values() for s, q in pos.items() if s in TECH_THEME)
+        return limit * (total + outside_total) - outside_tech - inside
     for a in accounts:
         aid, st = a["id"], state[a["id"]]
         price = lambda s: prices[s]
@@ -178,6 +189,11 @@ def plan_trades(accounts: list[dict], prices: dict, target: dict, mode: str = "c
         for s in sorted(need, key=lambda x: -need[x]):
             alloc = need[s] if total_need <= budget else budget * need[s] / total_need
             shares = math.floor(alloc / price(s))
+            if s in TECH_THEME and shares >= 1:
+                allowed = max(0, math.floor(max(tech_room(), 0.0) / price(s)))
+                if shares > allowed:
+                    held_back[s] = held_back.get(s, 0) + shares - allowed
+                    shares = allowed
             if shares >= 1:
                 cost = shares * price(s)
                 trades.append({"symbol": s, "side": "buy", "shares": int(shares), "price": round(price(s), 2),
@@ -186,7 +202,9 @@ def plan_trades(accounts: list[dict], prices: dict, target: dict, mode: str = "c
                 cash -= cost
         for _ in range(50):                              # use leftover cash, most underweight first
             gaps = {s: goal.get(s, 0.0) - final_pos[aid].get(s, 0.0) * price(s) for s in goal}
-            affordable = [s for s in gaps if gaps[s] >= 0.5 * price(s) and price(s) <= cash + 1e-9]
+            room = tech_room()
+            affordable = [s for s in gaps if gaps[s] >= 0.5 * price(s) and price(s) <= cash + 1e-9
+                          and (s not in TECH_THEME or price(s) <= room)]
             if not affordable:
                 break
             s = max(affordable, key=lambda x: gaps[x])
@@ -214,6 +232,12 @@ def plan_trades(accounts: list[dict], prices: dict, target: dict, mode: str = "c
                 after_val[s] = after_val.get(s, 0.0) + q * prices[s]
     after = {s: v / total for s, v in after_val.items()}
     drift = lambda w: max([abs(w.get(s, 0.0) - target.get(s, 0.0)) for s in set(w) | set(target)] or [0.0])
+    if held_back:
+        now = (outside_tech + sum(q * prices[s] for st in state.values() for s, q in st["pos"].items()
+                                  if s in TECH_THEME)) / (total + outside_total)
+        notes.append(f"Held back {', '.join(f'{n} share(s) of {s}' for s, n in sorted(held_back.items()))}: "
+                     f"tech/semiconductor/AI funds are {now:.0%} of everything you track (limit {limit:.0%}). "
+                     "That cash went to your other target funds or stays in cash.")
     no_trades = all(not r["trades"] for r in results)
     if no_trades:
         notes.append("Nothing to do: cash is below the smallest useful trade or you're within the target.")

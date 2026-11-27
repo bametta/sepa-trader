@@ -286,9 +286,23 @@ def trade_plan(db, uid: int, account_ids: list[int] | None, mode: str, target_te
         raise ValueError("Pick at least one Roth or pre-tax retirement account that has holdings.")
     text = (target_text or "").strip() or saved_target_model(db, uid)
     target = st.parse_target_model(text) if text else default_target_for(db, uid)
-    symbols = set(target) | {h["symbol"] for a in accounts for h in a["holdings"]
+    everything = savings.load_accounts(db, uid)                 # for the tech limit: also count accounts not selected
+    virtual = alpaca_account(db, uid)
+    if virtual:
+        everything = [virtual] + everything
+    picked = {a["id"] for a in accounts}
+    outside = [a for a in everything if a["id"] not in picked]
+    symbols = set(target) | {h["symbol"] for a in accounts + outside for h in a["holdings"]
                              if h.get("symbol") and h.get("quantity") is not None}
     prices = fetch_prices(symbols)
+    outside_total = outside_tech = 0.0
+    for a in outside:
+        for h in a["holdings"]:
+            sym = (h.get("symbol") or "").upper() or None
+            val, _ = savings.value_holding(h, prices.get(sym) if sym else None)
+            outside_total += val
+            if sym in savings.TECH_THEME:
+                outside_tech += val
     shaped = []
     for a in accounts:
         holdings = []
@@ -298,7 +312,7 @@ def trade_plan(db, uid: int, account_ids: list[int] | None, mode: str, target_te
             holdings.append({**h, "symbol": sym, "value": val})
         shaped.append({"id": a["id"], "name": f"{a['provider']} · {a['name']}",
                        "tax": savings.tax_bucket(a["account_type"]), "holdings": holdings})
-    plan = st.plan_trades(shaped, prices, target, mode=mode)
+    plan = st.plan_trades(shaped, prices, target, mode=mode, outside_total=outside_total, outside_tech=outside_tech)
     plan["target_text"] = st.format_target(target)
     plan["target_source"] = "typed" if (target_text or "").strip() else ("saved" if text else "age-based default")
     plan["prices_as_of"] = "live quotes (may be delayed); use limit orders"
