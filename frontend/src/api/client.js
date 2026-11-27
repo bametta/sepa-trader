@@ -125,6 +125,12 @@ export const fetchDMConfig          = () => api.get('/strategies/dual-momentum/c
 export const updateDMConfig         = (data) => api.patch('/strategies/dual-momentum/config', data).then(r => r.data)
 export const runDMBacktest          = (params) => api.post('/strategies/dual-momentum/backtest', params).then(r => r.data)
 
+// ── IRA Portfolio Manager ─────────────────────────────────────────────────────
+export const fetchIRAStatus    = () => api.get('/ira/status').then(r => r.data)
+export const fetchIRATarget    = () => api.get('/ira/target').then(r => r.data)
+export const fetchIRAHistory   = (limit = 20) => api.get(`/ira/history?limit=${limit}`).then(r => r.data)
+export const runIRARebalance   = (body) => api.post('/ira/rebalance', body).then(r => r.data)
+
 // ── Market tape check ─────────────────────────────────────────────────────────
 export const fetchTapeCheck         = () => api.get('/market/tape-check').then(r => r.data)
 export const refreshTapeCheck       = () => api.delete('/market/tape-check').then(r => r.data)

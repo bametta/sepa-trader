@@ -195,6 +195,31 @@ const SECTIONS = [
     ],
   },
   {
+    title: 'IRA Portfolio',
+    fields: [
+      { key: 'alpaca_ira_key',    label: 'IRA API Key (separate IRA account)',    type: 'password', span: true },
+      { key: 'alpaca_ira_secret', label: 'IRA API Secret',                         type: 'password', span: true },
+      {
+        key: 'ira_enabled', label: 'Auto-rebalance', type: 'select',
+        options: [
+          { value: 'false', label: 'Off — manual rebalance only' },
+          { value: 'true',  label: 'On — AI rebalances weekly and places orders' },
+        ],
+      },
+      {
+        key: 'ira_rebalance_day', label: 'Rebalance day', type: 'select',
+        options: [
+          { value: '0', label: 'Monday' }, { value: '1', label: 'Tuesday' },
+          { value: '2', label: 'Wednesday' }, { value: '3', label: 'Thursday' },
+          { value: '4', label: 'Friday' },
+        ],
+      },
+      { key: 'ira_rebalance_threshold_pct', label: 'Drift threshold % (default 5)', type: 'text' },
+      { key: 'ira_cash_buffer_pct',         label: 'Cash buffer % (default 2)',     type: 'text' },
+      { key: 'ira_etf_universe', label: 'ETF universe CSV (blank = default VTI,VXUS,QQQ,SCHD,VNQ,BND,TIP,GLD,BIL)', type: 'text', span: true },
+    ],
+  },
+  {
     title: 'AI Analysis',
     fields: [
       {

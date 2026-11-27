@@ -420,6 +420,59 @@ def _check_circuit_breaker(vix_threshold: float, spy_drawdown_threshold: float) 
     return False, ""
 
 
+def _ira_rebalance_user(uid: int) -> None:
+    from . import ira_manager
+    from .database import set_user_setting
+    db = SessionLocal()
+    try:
+        res = ira_manager.run_rebalance(db, uid, execute=True)
+        set_user_setting(db, "ira_last_run", datetime.now(_ET).strftime("%Y-%m-%d"), uid)
+        logger.info("IRA rebalance uid=%s executed=%s trades=%d",
+                    uid, res.get("executed"), len(res.get("plan", [])))
+    except Exception as exc:
+        logger.error("IRA rebalance uid=%s failed: %s", uid, exc)
+        try:
+            from . import telegram_alerts as tg
+            tg.alert_system_error_sync("IRA rebalance", exc)
+        except Exception:
+            pass
+    finally:
+        db.close()
+
+
+async def _ira_watchdog():
+    """
+    Weekdays 10:30 AM ET. For each user with ira_enabled=true, runs the IRA
+    rebalance once on their configured weekday (default Friday), at most once per day.
+    Blocking Alpaca/AI work is offloaded to the thread pool.
+    """
+    now_et = datetime.now(_ET)
+    today  = now_et.strftime("%Y-%m-%d")
+    db = SessionLocal()
+    try:
+        from .database import get_user_setting
+        uids = [r[0] for r in db.execute(text(
+            "SELECT DISTINCT user_id FROM user_settings WHERE key = 'ira_enabled' AND value = 'true'"
+        )).fetchall()]
+        due = []
+        for uid in uids:
+            try:
+                day = int(get_user_setting(db, "ira_rebalance_day", "4", uid) or "4")
+            except ValueError:
+                day = 4
+            if now_et.weekday() != day:
+                continue
+            if get_user_setting(db, "ira_last_run", "", uid) == today:
+                continue
+            due.append(uid)
+    finally:
+        db.close()
+    if not due:
+        return
+    loop = asyncio.get_running_loop()
+    await asyncio.gather(*(loop.run_in_executor(None, _ira_rebalance_user, uid) for uid in due))
+
+
 async def _dm_watchdog():
     """
     Runs daily at 4:30 PM ET on weekdays.
@@ -654,6 +707,15 @@ def start_scheduler():
         _dm_watchdog,
         CronTrigger(day_of_week="mon-fri", hour=15, minute=30, timezone="America/New_York"),
         id="dm_watchdog",
+        replace_existing=True,
+    )
+
+    # IRA Portfolio Manager — weekdays 10:30 AM ET (after the open settles);
+    # the job itself only acts on each user's configured rebalance weekday.
+    scheduler.add_job(
+        _ira_watchdog,
+        CronTrigger(day_of_week="mon-fri", hour=10, minute=30, timezone="America/New_York"),
+        id="ira_watchdog",
         replace_existing=True,
     )
 

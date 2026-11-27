@@ -66,6 +66,9 @@ _PRIVATE_KEYS: frozenset[str] = frozenset({
     "alpaca_paper_secret",
     "alpaca_live_key",
     "alpaca_live_secret",
+    # Alpaca IRA credentials (separate account, Roth IRA)
+    "alpaca_ira_key",
+    "alpaca_ira_secret",
 })
 
 
