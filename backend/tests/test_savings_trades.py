@@ -92,6 +92,72 @@ class TechCapTests(unittest.TestCase):
         self.assertGreaterEqual(self.qqq_shares(plan), 1)
 
 
+class DipAllowanceTests(unittest.TestCase):
+    TGT = {"VTI": 0.40, "QQQ": 0.30, "BND": 0.30}
+
+    def qqq(self, plan):
+        return sum(t["shares"] * t["price"] for a in plan["accounts"] for t in a["trades"] if t["symbol"] == "QQQ")
+
+    def run_plan(self, out_tech, dips, cash=10000, out_total=100000):
+        return st.plan_trades([acct(1, "roth", cash=cash)], PRICES, self.TGT, outside_total=out_total,
+                              outside_tech=out_tech, dip_off_high=dips)
+
+    def test_dip_allows_buying_above_the_normal_cap(self):
+        # tech already 35% (over 30%): without a dip nothing; in a 15% dip some is bought
+        none = self.run_plan(38500, {})
+        dip = self.run_plan(38500, {"QQQ": -0.15})
+        self.assertEqual(self.qqq(none), 0)
+        self.assertGreater(self.qqq(dip), 0)
+        self.assertTrue(any(t.get("dip") for t in dip["accounts"][0]["trades"] if t["symbol"] == "QQQ"))
+        self.assertTrue(any("Dip buys" in n for n in dip["notes"]))
+
+    def test_dip_buying_limited_to_a_quarter_of_the_cash(self):
+        dip = self.run_plan(38500, {"QQQ": -0.15}, cash=10000)
+        self.assertLessEqual(self.qqq(dip), 0.25 * 10000 + 1e-6)
+
+    def test_never_beyond_the_hard_ceiling(self):
+        for out_tech in (20000, 38000, 41000, 50000):
+            with self.subTest(out_tech=out_tech):
+                plan = self.run_plan(out_tech, {"QQQ": -0.30}, cash=50000, out_total=100000)
+                self.assertLessEqual(out_tech + self.qqq(plan), max(0.40 * 150000, out_tech) + 1e-6)
+
+    def test_shallow_pullback_is_not_a_dip(self):
+        plan = self.run_plan(38500, {"QQQ": -0.05})
+        self.assertEqual(self.qqq(plan), 0)
+
+    def test_no_dip_data_means_no_extra_buying(self):
+        self.assertEqual(self.qqq(self.run_plan(38500, None)), 0)
+
+    def test_under_the_normal_cap_nothing_is_labelled_a_dip(self):
+        plan = self.run_plan(10000, {"QQQ": -0.20})
+        self.assertGreater(self.qqq(plan), 0)
+        self.assertFalse(any(t.get("dip") for t in plan["accounts"][0]["trades"]))
+
+
+class NoOverweightBuysTests(unittest.TestCase):
+    def test_cash_only_skips_a_fund_that_is_over_target_across_accounts(self):
+        # VTI is $25k of $30k (83%) against a 50% target; the Roth's cash must not buy more of it
+        accts = [acct(1, "pre_tax", positions=[("VTI", 100)]), acct(2, "roth", cash=5000)]
+        plan = st.plan_trades(accts, PRICES, TARGET, mode="cash_only")
+        bought = {(t["symbol"]) for a in plan["accounts"] for t in a["trades"] if t["side"] == "buy"}
+        self.assertNotIn("VTI", bought)
+        self.assertTrue({"VXUS", "BND"} & bought)
+
+    def test_underweight_funds_are_still_bought(self):
+        accts = [acct(1, "pre_tax", positions=[("VTI", 10)]), acct(2, "roth", cash=20000)]
+        plan = st.plan_trades(accts, PRICES, TARGET, mode="cash_only")
+        bought = {t["symbol"] for a in plan["accounts"] for t in a["trades"] if t["side"] == "buy"}
+        self.assertEqual(bought, {"VTI", "VXUS", "BND"})
+
+    def test_never_pushes_a_fund_past_its_target(self):
+        accts = [acct(1, "pre_tax", positions=[("VTI", 55), ("BND", 30)]), acct(2, "roth", cash=8000)]
+        plan = st.plan_trades(accts, PRICES, TARGET, mode="cash_only")
+        total = plan["total"]
+        for s, w in plan["after"].items():
+            if plan["before"].get(s, 0.0) < TARGET.get(s, 0.0):
+                self.assertLessEqual(w, TARGET[s] + 0.5 * PRICES[s] / total + 1e-6)
+
+
 class CashOnlyTests(unittest.TestCase):
     def test_new_cash_is_deployed_in_whole_shares_without_overspending(self):
         plan = st.plan_trades([acct(1, "roth", cash=10000)], PRICES, TARGET)

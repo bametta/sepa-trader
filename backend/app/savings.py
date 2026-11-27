@@ -376,6 +376,52 @@ def update_reminder(accounts: list[dict], today: date | None = None, max_age: in
             "concentration checks stay accurate.\n" + "\n".join(lines))
 
 
+def is_last_business_day(d: date) -> bool:
+    """Last Mon-Fri of the month. Market holidays are not modelled, so a holiday-shortened month may be a day off."""
+    if d.weekday() >= 5:
+        return False
+    nxt = d + timedelta(days=1)
+    while nxt.weekday() >= 5:
+        nxt += timedelta(days=1)
+    return nxt.month != d.month
+
+
+def month_end_reminder(accounts: list[dict], today: date | None = None, min_cash: float = 25.0) -> str | None:
+    """Month-end buy day: how much cash is waiting in each hand-traded account. None when there is nothing to buy."""
+    today = today or date.today()
+    lines, total = [], 0.0
+    for a in accounts:
+        if a.get("read_only"):
+            continue
+        cash = sum(float(h.get("manual_value") or 0.0) for h in a.get("holdings", [])
+                   if h.get("asset_class") == "cash")
+        if cash >= min_cash:
+            lines.append(f"- {a['provider']} / {a['name']}: ${cash:,.0f}")
+            total += cash
+    if not lines:
+        return None
+    return (f"Month-end buy day. ${total:,.0f} is waiting in your accounts:\n" + "\n".join(lines) +
+            "\nUpdate the balances (re-import the files), then run the trade helper in cash-only mode.")
+
+
+def dip_alert_text(dips: dict, tech_pct: float, cash: float, today: date, last_alerted: dict | None = None,
+                   hard: float = 0.40, threshold: float = 0.10, cooldown_days: int = 7) -> tuple[str | None, list[str]]:
+    """Mid-month nudge: a tech fund is in a dip AND the trade helper would allow buying it (tech share under the hard
+    ceiling). Each fund is mentioned at most once per `cooldown_days`. Returns (message, funds mentioned)."""
+    if tech_pct >= hard or cash <= 0:
+        return None, []
+    last_alerted = last_alerted or {}
+    fresh = sorted(s for s, off in dips.items()
+                   if off is not None and off <= -threshold
+                   and (last_alerted.get(s) is None or (today - last_alerted[s]).days >= cooldown_days))
+    if not fresh:
+        return None, []
+    funds = ", ".join(f"{s} ({-dips[s]:.0%} below its 52-week high)" for s in fresh)
+    return (f"Dip watch: {funds}. Tech funds are {tech_pct:.0%} of everything you track (the helper allows dip buys "
+            f"up to {hard:.0%}, using at most 25% of the run's cash) and ${cash:,.0f} is sitting in your accounts. "
+            "A dip can keep falling. Run the trade helper if you want to act."), fresh
+
+
 # ── Database ──────────────────────────────────────────────────────────────────
 
 def _holding_row(r) -> dict:

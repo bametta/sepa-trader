@@ -312,7 +312,17 @@ def trade_plan(db, uid: int, account_ids: list[int] | None, mode: str, target_te
             holdings.append({**h, "symbol": sym, "value": val})
         shaped.append({"id": a["id"], "name": f"{a['provider']} · {a['name']}",
                        "tax": savings.tax_bucket(a["account_type"]), "holdings": holdings})
-    plan = st.plan_trades(shaped, prices, target, mode=mode, outside_total=outside_total, outside_tech=outside_tech)
+    dip_off_high = {}
+    try:                                             # how far each tech fund is below its 52-week high
+        from . import ira_data
+        for sym, stats in ira_data.market_stats([s for s in target if s in savings.TECH_THEME]).items():
+            if stats and stats.get("pct_off_52w_high") is not None and not stats.get("stale"):
+                dip_off_high[sym] = float(stats["pct_off_52w_high"])
+    except Exception as exc:                         # no dip data means no dip buys, never extra buying
+        logger.warning("dip data unavailable: %s", exc)
+    plan = st.plan_trades(shaped, prices, target, mode=mode, outside_total=outside_total, outside_tech=outside_tech,
+                          dip_off_high=dip_off_high)
+    plan["dip_off_high"] = {s: round(v, 4) for s, v in dip_off_high.items()}
     plan["target_text"] = st.format_target(target)
     plan["target_source"] = "typed" if (target_text or "").strip() else ("saved" if text else "age-based default")
     plan["prices_as_of"] = "live quotes (may be delayed); use limit orders"
