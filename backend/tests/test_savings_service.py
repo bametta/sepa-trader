@@ -93,6 +93,15 @@ class ServiceTests(unittest.TestCase):
         self.assertLess(low["p10"], low["p50"])
         self.assertLess(low["p50"], low["p90"])
 
+    def test_accounts_that_follow_the_irs_limit_get_catch_up_in_the_projection(self):
+        SETTINGS["ira_birth_year"] = str(date.today().year - 45)        # catch-up starts in 5 years
+        flat = self.plan(self.summary(accounts=[{"annual_contribution": 24500, "retirement": True}]))
+        maxed = self.plan(self.summary(accounts=[{"annual_contribution": 24500, "retirement": True,
+                                                  "max_deferral": True}]))
+        self.assertEqual(flat["annual_contribution"], maxed["annual_contribution"])      # same first year
+        self.assertGreater(maxed["avg_annual_contribution"], flat["avg_annual_contribution"])
+        self.assertGreater(maxed["p50"], flat["p50"])
+
     def test_non_retirement_accounts_do_not_add_contributions(self):
         accts = [{"annual_contribution": 10000, "retirement": True}, {"annual_contribution": 50000, "retirement": False}]
         self.assertEqual(self.plan(self.summary(accounts=accts))["annual_contribution"], 10000)
