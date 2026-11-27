@@ -43,6 +43,15 @@ def money(raw) -> float | None:
     return -v if negative else v
 
 
+def _fuzzy(key: str, cell: str) -> bool:
+    """Headers like Schwab's 'Qty (Quantity)' and 'Mkt Val (Market Value)' carry the plain name in brackets."""
+    if key == "quantity":
+        return "quantity" in cell or cell.startswith("qty")
+    if key == "value":
+        return "market value" in cell or "mkt val" in cell
+    return False
+
+
 def _find_header(rows: list[list[str]]) -> tuple[int, dict]:
     for i, row in enumerate(rows):
         cells = [_norm(c) for c in row]
@@ -51,7 +60,7 @@ def _find_header(rows: list[list[str]]) -> tuple[int, dict]:
         mapping = {}
         for key, names in SYNONYMS.items():
             for j, c in enumerate(cells):
-                if c in names and key not in mapping:
+                if key not in mapping and (c in names or _fuzzy(key, c)):
                     mapping[key] = j
         if "symbol" in mapping and ("quantity" in mapping or "value" in mapping):
             return i, mapping
