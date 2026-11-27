@@ -630,6 +630,63 @@ class TechThemeTests(unittest.TestCase):
         self.assertNotIn("TECH_THEME", {w["code"] for w in s["warnings"]})
 
 
+class MonthEndTests(unittest.TestCase):
+    def test_last_business_day(self):
+        yes = [date(2026, 7, 31), date(2026, 5, 29), date(2026, 11, 30), date(2026, 2, 27), date(2026, 12, 31)]
+        no = [date(2026, 11, 27), date(2026, 5, 28), date(2026, 5, 30), date(2026, 5, 31), date(2026, 7, 30),
+              date(2026, 6, 1)]
+        for d in yes:
+            with self.subTest(d=d):
+                self.assertTrue(sv.is_last_business_day(d))
+        for d in no:
+            with self.subTest(d=d):
+                self.assertFalse(sv.is_last_business_day(d))
+
+    def test_exactly_one_last_business_day_per_month(self):
+        d = date(2026, 1, 1)
+        hits = {}
+        while d.year == 2026:
+            if sv.is_last_business_day(d):
+                hits[d.month] = hits.get(d.month, 0) + 1
+            d += timedelta(days=1)
+        self.assertEqual(hits, {m: 1 for m in range(1, 13)})
+
+    def test_reminder_lists_cash_per_account(self):
+        msg = sv.month_end_reminder([
+            acct("Schwab", "roth_ira", [hold("Cash", val=1554, cls="cash"), hold("x", "VTI", qty=5)], aid=1),
+            acct("Schwab", "401k", [hold("Cash", val=389, cls="cash")], aid=2),
+            acct("Fidelity", "roth_ira", [hold("Cash", val=4, cls="cash")], aid=3)], TODAY)
+        self.assertIn("$1,943", msg)
+        self.assertIn("$1,554", msg)
+        self.assertNotIn("Fidelity", msg)                      # $4 is below the minimum worth mentioning
+
+    def test_no_reminder_without_cash_or_for_read_only(self):
+        a = acct("Alpaca", "roth_ira", [hold("Cash", val=9000, cls="cash")])
+        a["read_only"] = True
+        self.assertIsNone(sv.month_end_reminder([a], TODAY))
+        self.assertIsNone(sv.month_end_reminder([acct("S", "roth_ira", [hold("x", "VTI", qty=5)])], TODAY))
+
+
+class DipAlertTests(unittest.TestCase):
+    def test_alerts_when_dip_and_under_ceiling(self):
+        msg, funds = sv.dip_alert_text({"SMH": -0.16, "QQQM": -0.04}, 0.35, 1900, TODAY)
+        self.assertEqual(funds, ["SMH"])
+        self.assertIn("16% below", msg)
+        self.assertNotIn("QQQM", msg)
+
+    def test_silent_when_the_helper_would_not_buy(self):
+        self.assertEqual(sv.dip_alert_text({"SMH": -0.3}, 0.56, 1900, TODAY), (None, []))      # tech over the ceiling
+        self.assertEqual(sv.dip_alert_text({"SMH": -0.3}, 0.20, 0, TODAY), (None, []))         # no cash to use
+
+    def test_cooldown_per_fund(self):
+        last = {"SMH": TODAY - timedelta(days=3), "BOTZ": TODAY - timedelta(days=9)}
+        msg, funds = sv.dip_alert_text({"SMH": -0.2, "BOTZ": -0.2}, 0.30, 1000, TODAY, last)
+        self.assertEqual(funds, ["BOTZ"])
+
+    def test_missing_data_is_ignored(self):
+        self.assertEqual(sv.dip_alert_text({"SMH": None}, 0.30, 1000, TODAY), (None, []))
+
+
 class ReminderTests(unittest.TestCase):
     def test_flags_old_and_empty_accounts(self):
         old = TODAY - timedelta(days=100)
