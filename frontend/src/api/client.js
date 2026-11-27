@@ -163,7 +163,7 @@ export const deleteSavingsAccount  = (id) => api.delete(`/savings/accounts/${id}
 export const fetchHoldingsCsv      = (id) => api.get(`/savings/accounts/${id}/holdings.csv`).then(r => r.data)
 export const saveHoldingsCsv       = ({ id, csv }) => api.put(`/savings/accounts/${id}/holdings`, { csv }).then(r => r.data)
 export const fetchSavingsChanges   = () => api.get('/savings/changes').then(r => r.data)
-export const importSavingsPositions = ({ id, text, apply }) =>
-  api.post(`/savings/accounts/${id}/import`, { text, apply: !!apply }).then(r => r.data)
+export const importSavingsPositions = ({ id, text, apply, account_key }) =>
+  api.post(`/savings/accounts/${id}/import`, { text, apply: !!apply, account_key: account_key || null }).then(r => r.data)
 export const fetchTargetModel = () => api.get('/savings/target-model').then(r => r.data)
 export const runTradePlan = (body) => api.post('/savings/trade-plan', body, { timeout: 90000 }).then(r => r.data)

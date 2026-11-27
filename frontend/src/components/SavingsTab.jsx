@@ -70,42 +70,58 @@ function Sparkline({ points }) {
 
 function ImportPanel({ accountId, onDone, onCancel }) {
   const [text, setText] = useState('')
+  const [accountKey, setAccountKey] = useState(null)
   const preview = useMutation(importSavingsPositions)
   const apply = useMutation(importSavingsPositions, { onSuccess: onDone })
   const p = preview.data
+  const ready = p && !p.needs_choice
   const readFile = async e => {
     const f = e.target.files?.[0]
     if (!f) return
     setText(await f.text())
+    setAccountKey(null)
     preview.reset()
   }
   return (
     <div className="space-y-2 rounded-lg border border-white/[0.08] p-3">
       <div className="text-[11px] text-slate-500">
-        On Schwab, open the account's Positions page and use Export, then choose that file here (or paste it below).
-        You'll see what would change before anything is saved.
+        Download your positions from the broker (Schwab: Positions → Export. Fidelity: Positions → Download, the arrow icon),
+        then choose that file here or paste it below. If the file holds several accounts you'll pick one. You'll see what
+        would change before anything is saved.
       </div>
       <input type="file" accept=".csv,text/csv,text/plain" onChange={readFile} className="text-xs text-slate-400" />
       <textarea className="input w-full font-mono text-xs" rows={5} placeholder="…or paste the file contents here"
-                value={text} onChange={e => { setText(e.target.value); preview.reset() }} spellCheck={false} />
+                value={text} onChange={e => { setText(e.target.value); setAccountKey(null); preview.reset() }} spellCheck={false} />
       <div className="flex gap-2">
         <button className="btn-ghost" disabled={!text.trim() || preview.isLoading}
-                onClick={() => preview.mutate({ id: accountId, text, apply: false })}>
+                onClick={() => preview.mutate({ id: accountId, text, apply: false, account_key: accountKey })}>
           {preview.isLoading ? 'Reading…' : 'Preview changes'}
         </button>
-        {p && (
+        {ready && (
           <button className="btn-primary" disabled={apply.isLoading}
-                  onClick={() => apply.mutate({ id: accountId, text, apply: true })}>
+                  onClick={() => apply.mutate({ id: accountId, text, apply: true, account_key: accountKey })}>
             {apply.isLoading ? 'Saving…' : `Save ${p.holdings} holdings`}
           </button>
         )}
         <button className="btn-ghost" onClick={onCancel}>Cancel</button>
       </div>
       {(preview.isError || apply.isError) && <div className="text-sm text-red-400">{errMsg(preview.error || apply.error)}</div>}
-      {p && (
+      {p?.needs_choice && (
+        <div className="space-y-1 text-xs">
+          <div className="text-slate-300">This file contains {p.choices.length} accounts. Which one is this?</div>
+          {p.choices.map(c => (
+            <button key={c.key} className="block w-full text-left rounded border border-white/[0.08] px-2 py-1 hover:bg-white/[0.04]"
+                    onClick={() => { setAccountKey(c.key); preview.mutate({ id: accountId, text, apply: false, account_key: c.key }) }}>
+              <span className="text-slate-200">{c.label}</span>
+              <span className="text-slate-500"> · {c.holdings} holdings · {usd0(c.total)}</span>
+            </button>
+          ))}
+        </div>
+      )}
+      {ready && (
         <div className="space-y-1 text-xs">
           <div className="text-slate-300">
-            {p.source === 'schwab' ? 'Schwab export' : 'CSV'}{p.title ? ` · ${p.title}` : ''}: {p.holdings} holdings, {usd0(p.parsed_total)} at live prices
+            {p.source === 'broker' ? 'Broker export' : 'CSV'}{p.title ? ` · ${p.title}` : ''}: {p.holdings} holdings, {usd0(p.parsed_total)} at live prices
             {p.file_total != null && ` (the file's own total is ${usd0(p.file_total)}, from the time you exported it)`}.
             Currently stored: {usd0(p.stored_total)}.
           </div>

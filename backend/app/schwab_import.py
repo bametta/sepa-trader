@@ -1,24 +1,30 @@
 """
-Schwab positions CSV importer (the "Export" on a Schwab positions page, including PCRAs).
+Broker positions CSV importer (Schwab, Fidelity and similar "Download/Export positions" files).
 
-Tolerant by design: finds the header row wherever it sits (Schwab prepends a title line), maps columns by
-name, ignores columns it doesn't know, and handles "$1,234.56", "(12.5)", "--" and "N/A". It reads only; it
-never contacts Schwab. If a real export doesn't parse, the error says what it was looking for.
+Tolerant by design: finds the header row wherever it sits, maps columns by name, ignores columns it doesn't
+know, ignores footer/disclaimer lines, and handles "$1,234.56", "+$12.34", "(12.5)", "--" and "N/A".
+Files that contain several accounts (Fidelity's "Account Number" column) are grouped, and you pick one.
+It only reads a file you give it and never contacts a broker. If a real export doesn't parse, the error says
+what it was looking for.
 """
 import csv
 import io
 import re
 from datetime import date
 
+# Deliberately no bare "type": in Fidelity's file that column means Cash/Margin account, not security type.
 SYNONYMS = {
     "symbol": ("symbol",),
     "name": ("description", "name", "security name"),
     "quantity": ("quantity", "qty", "shares"),
     "value": ("market value", "mkt val (market value)", "current value", "value"),
-    "type": ("security type", "asset type", "type"),
+    "type": ("security type", "asset type"),
+    "acct_number": ("account number", "account #", "acct number"),
+    "acct_name": ("account name", "account nickname"),
 }
 SYMBOL_RE = re.compile(r"^[A-Z0-9][A-Z0-9.\-/]{0,11}$")
 TOTAL_LABELS = ("account total", "totals", "total")
+CASH_WORDS = ("money market", "cash reserves", "held in")
 
 
 def _norm(text: str) -> str:
@@ -26,7 +32,7 @@ def _norm(text: str) -> str:
 
 
 def money(raw) -> float | None:
-    s = (raw or "").strip().replace("$", "").replace(",", "")
+    s = (raw or "").strip().replace("$", "").replace(",", "").replace("+", "")
     if s in ("", "--", "-", "n/a", "N/A"):
         return None
     negative = s.startswith("(") and s.endswith(")")
@@ -49,68 +55,108 @@ def _find_header(rows: list[list[str]]) -> tuple[int, dict]:
                     mapping[key] = j
         if "symbol" in mapping and ("quantity" in mapping or "value" in mapping):
             return i, mapping
-    raise ValueError("could not find a header row with a 'Symbol' column plus 'Quantity' or 'Market Value'. "
-                     "Is this Schwab's positions export? Send the first few lines (without account numbers) "
-                     "and I'll adapt the importer.")
+    raise ValueError("could not find a header row with a 'Symbol' column plus 'Quantity' or 'Market Value' / "
+                     "'Current Value'. Is this a positions export? Send the first few lines (without account "
+                     "numbers) and I'll adapt the importer.")
 
 
-def parse_schwab_positions(raw: str, today: date | None = None) -> dict:
-    """Returns {holdings, file_total, parsed_total, warnings, title}. Raises ValueError if unreadable."""
+def looks_like_broker_export(raw: str) -> bool:
+    """A positions file from a broker, as opposed to this app's own CSV (which has an asset_class column)."""
+    first = next((ln for ln in (raw or "").splitlines() if ln.strip()), "").lower()
+    if "asset_class" in first:
+        return False
+    try:
+        _find_header(list(csv.reader(io.StringIO((raw or "").strip().lstrip("﻿")))))
+        return True
+    except ValueError:
+        return False
+
+
+def _label(number: str, name: str) -> str:
+    tail = f"...{re.sub(r'[^0-9A-Za-z]', '', number)[-4:]}" if number else ""
+    return " ".join(p for p in (name, tail) if p) or "Account"
+
+
+def parse_positions(raw: str, today: date | None = None, account_key: str | None = None) -> dict:
+    """Returns {holdings, file_total, parsed_total, warnings, title, groups, needs_choice}.
+    If the file holds several accounts and `account_key` is not given, needs_choice is True and holdings is []."""
     today = today or date.today()
     text = (raw or "").strip().lstrip("﻿")
     if not text:
         raise ValueError("the file is empty")
     rows = [r for r in csv.reader(io.StringIO(text))]
     header_idx, col = _find_header(rows)
-    title = next((" ".join(r).strip() for r in rows[:header_idx] if any(c.strip() for c in r)), None)
+    title = next((" ".join(r).strip() for r in rows[:header_idx] if sum(1 for c in r if c.strip()) == 1), None)
 
     def cell(row, key):
         j = col.get(key)
         return row[j].strip() if j is not None and j < len(row) else ""
 
-    holdings, warnings, file_total = [], [], None
+    groups: dict[str, dict] = {}
     for row in rows[header_idx + 1:]:
-        if not any(c.strip() for c in row):
+        if sum(1 for c in row if c.strip()) < 2:          # blank lines and one-cell footer/disclaimer lines
             continue
+        number, acct_name = cell(row, "acct_number"), cell(row, "acct_name")
+        key = number or acct_name or ""
+        g = groups.setdefault(key, {"key": key, "label": _label(number, acct_name), "holdings": [], "warnings": [],
+                                    "file_total": None})
         sym_raw = cell(row, "symbol")
         low = _norm(sym_raw)
         value = money(cell(row, "value"))
         if low in TOTAL_LABELS:
-            file_total = value if value is not None else file_total
+            g["file_total"] = value if value is not None else g["file_total"]
             continue
         name = cell(row, "name") or sym_raw
         sec_type = _norm(cell(row, "type"))
-        if low.startswith("cash"):
-            if value:
-                holdings.append({"symbol": None, "name": sym_raw or "Cash", "quantity": None,
-                                 "manual_value": value, "asset_class": "cash", "illiquid": False, "as_of": today})
+        if low == "pending activity":
+            g["warnings"].append(f"skipped 'Pending Activity' ({value if value is not None else 'no value'}): "
+                                 "pending trades aren't holdings yet")
             continue
-        symbol = sym_raw.upper()
+        core_cash = sym_raw.endswith("*")                  # e.g. Fidelity's SPAXX**
+        symbol = sym_raw.rstrip("*").upper()
+        if low.startswith("cash") and " " in low:          # Schwab's "Cash & Cash Investments" row
+            if value:
+                g["holdings"].append({"symbol": None, "name": sym_raw or "Cash", "quantity": None,
+                                      "manual_value": value, "asset_class": "cash", "illiquid": False,
+                                      "as_of": today})
+            continue
         if not SYMBOL_RE.match(symbol):
             if sym_raw:
-                warnings.append(f"skipped a row with an unreadable symbol: '{sym_raw[:20]}'")
+                g["warnings"].append(f"skipped a row with an unreadable symbol: '{sym_raw[:20]}'")
             continue
         qty = money(cell(row, "quantity"))
         if qty is not None and qty <= 0:
-            warnings.append(f"skipped {symbol}: quantity {qty} is not a long position")
+            g["warnings"].append(f"skipped {symbol}: quantity {qty} is not a long position")
             continue
         if qty is None and value is None:
-            warnings.append(f"skipped {symbol}: no quantity and no market value")
+            g["warnings"].append(f"skipped {symbol}: no quantity and no market value")
             continue
-        is_cash_like = "money market" in sec_type or "money market" in _norm(name) or sec_type == "cash"
-        holdings.append({"symbol": symbol, "name": name[:120], "quantity": qty, "manual_value": value,
-                         "asset_class": "cash" if is_cash_like else "auto", "illiquid": False, "as_of": today})
+        low_name = _norm(name)
+        is_cash = (core_cash or "money market" in sec_type or sec_type == "cash"
+                   or any(w in low_name for w in CASH_WORDS))
+        g["holdings"].append({"symbol": symbol, "name": name[:120], "quantity": qty, "manual_value": value,
+                              "asset_class": "cash" if is_cash else "auto", "illiquid": False, "as_of": today})
 
-    if not holdings:
+    groups = {k: g for k, g in groups.items() if g["holdings"] or g["file_total"]}
+    if not groups:
         raise ValueError("found the header but no holdings below it")
+    summary = [{"key": k, "label": g["label"], "holdings": len(g["holdings"]),
+                "total": round(sum(h["manual_value"] or 0.0 for h in g["holdings"]), 2)} for k, g in groups.items()]
+    if len(groups) > 1 and account_key is None:
+        return {"holdings": [], "file_total": None, "parsed_total": 0.0, "warnings": [], "title": title,
+                "groups": summary, "needs_choice": True}
+    if account_key is None:
+        account_key = next(iter(groups))
+    if account_key not in groups:
+        raise ValueError("that account is not in the file")
+    g = groups[account_key]
+    holdings, warnings = g["holdings"], list(g["warnings"])
+    if not holdings:
+        raise ValueError("no holdings found for that account")
     parsed_total = round(sum(h["manual_value"] or 0.0 for h in holdings), 2)
+    file_total = g["file_total"]
     if file_total and parsed_total and abs(parsed_total - file_total) / file_total > 0.01:
         warnings.append(f"holdings add up to ${parsed_total:,.2f} but the file's account total is "
                         f"${file_total:,.2f}; some rows may have been skipped")
-    return {"holdings": holdings, "file_total": file_total, "parsed_total": parsed_total,
-            "warnings": warnings, "title": title}
-
-
-def looks_like_schwab(raw: str) -> bool:
-    low = (raw or "").lower()
-    return "market value" in low or "positions for account" in low
+    return {"holdings": holdings, "file_total": file_total, "parsed_total": parsed_total, "warnings": warnings,
+            "title": title or g["label"], "groups": summary, "needs_choice": False}

@@ -190,13 +190,22 @@ def _valued(holdings: list[dict], prices: dict) -> list[dict]:
     return out
 
 
-def import_positions(db, uid: int, account_id: int, text: str, apply: bool = False) -> dict:
-    """Parse a Schwab positions export (or our own CSV), show what would change, and save only if `apply`."""
+def import_positions(db, uid: int, account_id: int, text: str, apply: bool = False,
+                     account_key: str | None = None) -> dict:
+    """Parse a broker positions export (Schwab, Fidelity...) or our own CSV, show what would change, and save
+    only if `apply`. A file with several accounts first returns needs_choice and the list to pick from."""
+    import csv
     from . import schwab_import
     account = _own_account(db, uid, account_id)
-    if schwab_import.looks_like_schwab(text):
-        parsed = schwab_import.parse_schwab_positions(text)
-        source = "schwab"
+    first = next((ln for ln in text.splitlines() if ln.strip()), "")
+    header = {c.strip().lower() for c in next(csv.reader([first]), [])}
+    ours = bool(header) and header <= set(savings.CSV_COLUMNS)      # a file made from this app's own columns
+    if not ours and schwab_import.looks_like_broker_export(text):
+        parsed = schwab_import.parse_positions(text, account_key=account_key)
+        source = "broker"
+        if parsed["needs_choice"]:
+            return {"source": source, "needs_choice": True, "choices": parsed["groups"], "title": parsed["title"],
+                    "warnings": [], "applied": False}
     else:
         parsed = {"holdings": savings.parse_holdings_csv(text), "file_total": None, "warnings": [], "title": None}
         source = "csv"

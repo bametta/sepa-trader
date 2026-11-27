@@ -177,6 +177,30 @@ class ServiceTests(unittest.TestCase):
         out = self.svc.import_positions(MagicMock(), 1, 1, self.SCHWAB)
         self.assertTrue(any("50%" in w for w in out["warnings"]))
 
+    FIDELITY = ("Account Number,Account Name,Symbol,Description,Quantity,Current Value,Type\n"
+                "Z111,Rollover IRA,VOO,S&P 500 ETF,20,\"$13,000.00\",Cash\n"
+                "Z111,Rollover IRA,SPAXX**,HELD IN MONEY MARKET,,$500.00,Cash\n"
+                "Z222,Joint Brokerage,AAPL,APPLE,10,\"$3,000.00\",Margin\n"
+                "\n\"Date downloaded 11/27/2026\"\n")
+
+    def test_fidelity_file_with_several_accounts_asks_which_one_and_saves_nothing(self):
+        self.patched([self.acct(holdings=[])], {"VOO": 650.0, "AAPL": 300.0})
+        first = self.svc.import_positions(MagicMock(), 1, 1, self.FIDELITY, apply=True)
+        self.assertTrue(first["needs_choice"])
+        self.assertFalse(first["applied"])
+        self.assertEqual(self.replaced, [])
+        self.assertEqual({c["key"] for c in first["choices"]}, {"Z111", "Z222"})
+        self.assertNotIn("diff", first)
+
+    def test_choosing_the_account_previews_then_saves_only_its_holdings(self):
+        self.patched([self.acct(holdings=[])], {"VOO": 650.0, "AAPL": 300.0})
+        prev = self.svc.import_positions(MagicMock(), 1, 1, self.FIDELITY, apply=False, account_key="Z111")
+        self.assertEqual((prev["source"], prev["holdings"]), ("broker", 2))
+        done = self.svc.import_positions(MagicMock(), 1, 1, self.FIDELITY, apply=True, account_key="Z111")
+        self.assertTrue(done["applied"])
+        saved = sorted(h["symbol"] for h in self.replaced[0][1])
+        self.assertEqual(saved, ["SPAXX", "VOO"])
+
     def test_import_accepts_this_apps_own_csv_and_rejects_foreign_accounts(self):
         self.patched([self.acct()], {"VTI": 250.0})
         out = self.svc.import_positions(MagicMock(), 1, 1, "symbol,quantity\nVTI,4\n")
