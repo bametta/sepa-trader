@@ -705,6 +705,31 @@ def _ira_rebalance_user(uid: int) -> None:
         db.close()
 
 
+def _ira_contribution_reminders() -> None:
+    """Monthly: for users who intend to max the IRA every year, report room left and pace."""
+    from . import ira_contributions
+    from . import telegram_alerts as tg
+    today = datetime.now(_ET).date()
+    db = SessionLocal()
+    try:
+        uids = [r[0] for r in db.execute(text(
+            "SELECT DISTINCT user_id FROM user_settings WHERE key = 'ira_contribute_max' AND value = 'true'"
+        )).fetchall()]
+        for uid in uids:
+            try:
+                msg = ira_contributions.reminder_text(ira_contributions.summary(db, uid, today), today)
+                if msg:
+                    tg.send_sync(msg, level="INFO")
+            except Exception as exc:
+                logger.error("IRA contribution reminder uid=%s failed: %s", uid, exc)
+    finally:
+        db.close()
+
+
+async def _ira_contribution_reminder_job():
+    await asyncio.get_running_loop().run_in_executor(None, _ira_contribution_reminders)
+
+
 async def _ira_watchdog():
     """
     Weekdays 10:30 AM ET. For each user with ira_enabled=true, runs the IRA
@@ -1161,6 +1186,14 @@ def start_scheduler():
         _ira_watchdog,
         CronTrigger(day_of_week="mon-fri", hour=10, minute=30, timezone="America/New_York"),
         id="ira_watchdog",
+        replace_existing=True,
+    )
+
+    # IRA contribution check-in: 1st of every month, 9:00 AM ET (only for users with ira_contribute_max on).
+    scheduler.add_job(
+        _ira_contribution_reminder_job,
+        CronTrigger(day=1, hour=9, minute=0, timezone="America/New_York"),
+        id="ira_contribution_reminder",
         replace_existing=True,
     )
 

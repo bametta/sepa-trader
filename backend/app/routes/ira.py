@@ -38,12 +38,14 @@ def ira_status(current_user: dict = Depends(get_current_user), db: Session = Dep
 
 
 @router.get("/target")
-def ira_target(current_user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
+def ira_target(refresh: bool = False, current_user: dict = Depends(get_current_user),
+               db: Session = Depends(get_db)):
+    """Today's target. The AI tilt is cached per US-Eastern day; pass refresh=true to recompute it."""
     uid = current_user["id"]
     _need_creds(db, uid)
     try:
         snap = ira.get_snapshot(db, uid)
-        tgt  = ira.build_target(db, uid, snap["holdings"])
+        tgt  = ira.build_target(db, uid, snap["holdings"], refresh=refresh)
     except HTTPException:
         raise
     except Exception as exc:
@@ -63,6 +65,7 @@ class RebalanceBody(BaseModel):
     execute: bool = False
     force: bool = False
     proposal_id: int | None = None
+    refresh_target: bool = False   # preview only: recompute today's AI tilt instead of reusing it
 
 
 @router.post("/rebalance")
@@ -80,7 +83,7 @@ def ira_rebalance(body: RebalanceBody, current_user: dict = Depends(get_current_
             if body.proposal_id is None:
                 raise HTTPException(400, "proposal_id_required: preview first, then confirm that proposal")
             return ira.execute_proposal(db, uid, body.proposal_id)
-        return ira.run_rebalance(db, uid, execute=False, force=body.force)
+        return ira.run_rebalance(db, uid, execute=False, force=body.force, refresh_target=body.refresh_target)
     except HTTPException:
         raise
     except ValueError as exc:
@@ -235,4 +238,5 @@ def ira_stress_historical(current_user: dict = Depends(get_current_user), db: Se
         raise HTTPException(400, "plan_not_ready: set birth year, retirement age and a goal in Settings first.")
     return ira_stress.historical_replay(
         plan["glidepath_equity"], plan["profile"]["years_to_retire"],
-        plan["stress"]["contribution_assumed"], balance, plan["target"]["amount"])
+        plan["stress"].get("contribution_avg", plan["stress"]["contribution_assumed"]), balance,
+        plan["target"]["amount"])

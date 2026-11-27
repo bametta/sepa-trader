@@ -28,6 +28,15 @@ class StressTests(unittest.TestCase):
         want = 1000.0 * ((1 + r) ** 10 - 1) / r * (1 + r)
         self.assertAlmostEqual(got, want, places=4)
 
+    def test_projection_accepts_a_per_year_contribution_path(self):
+        const = self.s.project(0.0, 7500.0, 10, self.mix)
+        same = self.s.project(0.0, [7500.0] * 10, 10, self.mix)
+        more = self.s.project(0.0, [7500.0] * 5 + [8600.0] * 5, 10, self.mix)
+        self.assertAlmostEqual(const, same, places=6)
+        self.assertGreater(more, const)
+        rows = self.s.scenario_projection(0.0, [7500.0] * 10, 10, self.mix, 100_000)
+        self.assertEqual(len(rows), 5)
+
     def test_every_shock_scenario_ends_below_expected(self):
         rows = self.s.scenario_projection(10000.0, 7500.0, 30, self.mix, 1_000_000)
         base = rows[0]["final"]

@@ -579,7 +579,14 @@ const SECTIONS = [
       },
       { key: 'ira_target_amount',       label: 'Retirement target $ (today\'s dollars)', type: 'text' },
       { key: 'ira_target_income',       label: 'or target yearly income $ (4% rule)',     type: 'text' },
-      { key: 'ira_annual_contribution', label: 'Planned yearly IRA contribution $',       type: 'text' },
+      {
+        key: 'ira_contribute_max', label: 'Contribution goal', type: 'select',
+        options: [
+          { value: 'true',  label: 'Max the IRS limit every year (incl. catch-up at 50) + monthly check-ins' },
+          { value: 'false', label: 'Use the planned amount below' },
+        ],
+      },
+      { key: 'ira_annual_contribution', label: 'Planned yearly IRA contribution $ (used when not maxing)', type: 'text' },
       { key: 'ira_annual_income',       label: 'Yearly income $ (optional, for % advice)', type: 'text' },
       {
         key: 'ira_filing_status', label: 'Tax filing status (Roth income limit)', type: 'select',
