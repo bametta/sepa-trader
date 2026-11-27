@@ -119,6 +119,86 @@ class ServiceTests(unittest.TestCase):
         self.assertGreater(p["prob_reach_target"], 0.8)
         self.assertNotIn("extra_saving_for_80pct", p)
 
+    # ── import + manual-trade helper ──────────────────────────────────────────
+    SCHWAB = ('"Positions for account PCRA ...1234"\n"Symbol","Description","Quantity","Market Value","Security Type"\n'
+              '"VTI","TOTAL MARKET ETF","12","$3,000.00","ETFs"\n"BND","BOND ETF","10","$700.00","ETFs"\n'
+              '"Cash & Cash Investments","--","--","$500.00","Cash"\n"Account Total","--","--","$4,200.00","--"\n')
+
+    def patched(self, accounts, prices):
+        svc, saved = self.svc, {}
+        saved["load"], saved["replace"], saved["prices"] = svc.savings.load_accounts, svc.savings.replace_holdings, svc.fetch_prices
+        self.replaced = []
+        svc.savings.load_accounts = lambda db, uid: accounts
+        svc.savings.replace_holdings = lambda db, uid, aid, h: self.replaced.append((aid, h)) or len(h)
+        svc.fetch_prices = lambda syms: {s: p for s, p in prices.items() if s in set(syms)}
+        self.addCleanup(lambda: (setattr(svc.savings, "load_accounts", saved["load"]),
+                                 setattr(svc.savings, "replace_holdings", saved["replace"]),
+                                 setattr(svc, "fetch_prices", saved["prices"])))
+
+    def acct(self, aid=1, atype="roth_401k", holdings=()):
+        return {"id": aid, "provider": "Schwab", "name": f"PCRA {aid}", "account_type": atype,
+                "annual_contribution": 0, "retirement": True, "contribution_source": "employee",
+                "holdings": list(holdings)}
+
+    def held(self, symbol, qty):
+        return {"id": 1, "symbol": symbol, "name": symbol, "quantity": qty, "manual_value": None,
+                "asset_class": "auto", "illiquid": False, "as_of": date.today()}
+
+    def test_import_preview_saves_nothing_and_apply_saves(self):
+        self.patched([self.acct(holdings=[self.held("VTI", 10)])], {"VTI": 250.0, "BND": 70.0})
+        prev = self.svc.import_positions(MagicMock(), 1, 1, self.SCHWAB, apply=False)
+        self.assertFalse(prev["applied"])
+        self.assertEqual(self.replaced, [])
+        kinds = {e["key"]: e["type"] for e in prev["diff"]["events"]}
+        self.assertEqual(kinds["VTI"], "bought")                      # 10 -> 12 shares
+        self.assertEqual(kinds["BND"], "added")
+        done = self.svc.import_positions(MagicMock(), 1, 1, self.SCHWAB, apply=True)
+        self.assertTrue(done["applied"])
+        self.assertEqual(len(self.replaced), 1)
+        self.assertEqual(self.replaced[0][0], 1)
+        self.assertEqual(len(self.replaced[0][1]), 3)                 # VTI, BND, cash
+
+    def test_import_into_an_empty_account_lists_everything_as_new(self):
+        self.patched([self.acct()], {"VTI": 250.0, "BND": 70.0})
+        out = self.svc.import_positions(MagicMock(), 1, 1, self.SCHWAB)
+        self.assertEqual(len(out["diff"]["events"]), 3)
+
+    def test_import_warns_when_the_file_looks_like_a_different_account(self):
+        self.patched([self.acct(holdings=[self.held("VTI", 1000)])], {"VTI": 250.0, "BND": 70.0})
+        out = self.svc.import_positions(MagicMock(), 1, 1, self.SCHWAB)
+        self.assertTrue(any("50%" in w for w in out["warnings"]))
+
+    def test_import_accepts_this_apps_own_csv_and_rejects_foreign_accounts(self):
+        self.patched([self.acct()], {"VTI": 250.0})
+        out = self.svc.import_positions(MagicMock(), 1, 1, "symbol,quantity\nVTI,4\n")
+        self.assertEqual((out["source"], out["holdings"]), ("csv", 1))
+        with self.assertRaises(ValueError):
+            self.svc.import_positions(MagicMock(), 1, 99, self.SCHWAB)
+
+    def test_trade_plan_uses_typed_then_saved_then_default_target(self):
+        accounts = [self.acct(1, "roth_401k", [
+            self.held("VTI", 10), {"id": 2, "symbol": None, "name": "Cash", "quantity": None, "manual_value": 5000.0,
+                                  "asset_class": "cash", "illiquid": False, "as_of": date.today()}])]
+        self.patched(accounts, {"VTI": 250.0, "BND": 70.0, "VXUS": 80.0})
+        typed = self.svc.trade_plan(MagicMock(), 1, None, "cash_only", "VTI:60, BND:40")
+        self.assertEqual(typed["target_source"], "typed")
+        SETTINGS["savings_target_model"] = "VTI:50, VXUS:50"
+        saved = self.svc.trade_plan(MagicMock(), 1, None, "cash_only", None)
+        self.assertEqual(saved["target_source"], "saved")
+        SETTINGS.pop("savings_target_model")
+        default = self.svc.trade_plan(MagicMock(), 1, None, "cash_only", None)
+        self.assertEqual(default["target_source"], "age-based default")
+        self.assertIn("VTI", default["target"])
+
+    def test_trade_plan_ignores_taxable_accounts_and_needs_a_target(self):
+        self.patched([self.acct(1, "taxable", [self.held("VTI", 10)])], {"VTI": 250.0, "BND": 70.0})
+        with self.assertRaises(ValueError):
+            self.svc.trade_plan(MagicMock(), 1, None, "cash_only", "VTI:100")
+        self.patched([self.acct(1, "roth_401k", [self.held("VTI", 10)])], {"VTI": 250.0})
+        SETTINGS.pop("ira_birth_year")
+        with self.assertRaises(ValueError):
+            self.svc.trade_plan(MagicMock(), 1, None, "cash_only", None)
+
     def test_bad_target_setting_is_ignored(self):
         SETTINGS["savings_total_target"] = "lots"
         self.assertIsNone(self.plan()["target"])

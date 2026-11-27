@@ -71,6 +71,7 @@ EDITABLE_KEYS = {
     "ira_filing_status", "ira_magi",                  # Roth income phase-out estimate
     "ira_contribute_max",       # "true": plan assumes the IRS max every year (incl. catch-up) and sends monthly check-ins
     "savings_total_target",     # total retirement goal across all accounts, today's dollars
+    "savings_target_model",     # manual-trade helper target, e.g. "VTI:50, VXUS:25, BND:25"
     "ira_target_amount", "ira_target_income",          # today's dollars; income uses 4% rule
     "ira_annual_contribution", "ira_annual_income",
     "ira_max_expense_pct", "ira_max_turnover_pct", "ira_max_stock_pct",   # AI gate hard limits

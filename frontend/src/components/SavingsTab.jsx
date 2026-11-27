@@ -5,6 +5,7 @@ import { useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from 'react-query'
 import {
   fetchSavingsSummary, fetchSavingsPlan, fetchSavingsHistory, fetchSavingsChanges, createSavingsAccount, patchSavingsAccount,
+  importSavingsPositions, fetchTargetModel, runTradePlan, updateSetting,
   deleteSavingsAccount, fetchHoldingsCsv, saveHoldingsCsv,
 } from '../api/client'
 
@@ -67,10 +68,61 @@ function Sparkline({ points }) {
   )
 }
 
+function ImportPanel({ accountId, onDone, onCancel }) {
+  const [text, setText] = useState('')
+  const preview = useMutation(importSavingsPositions)
+  const apply = useMutation(importSavingsPositions, { onSuccess: onDone })
+  const p = preview.data
+  const readFile = async e => {
+    const f = e.target.files?.[0]
+    if (!f) return
+    setText(await f.text())
+    preview.reset()
+  }
+  return (
+    <div className="space-y-2 rounded-lg border border-white/[0.08] p-3">
+      <div className="text-[11px] text-slate-500">
+        On Schwab, open the account's Positions page and use Export, then choose that file here (or paste it below).
+        You'll see what would change before anything is saved.
+      </div>
+      <input type="file" accept=".csv,text/csv,text/plain" onChange={readFile} className="text-xs text-slate-400" />
+      <textarea className="input w-full font-mono text-xs" rows={5} placeholder="…or paste the file contents here"
+                value={text} onChange={e => { setText(e.target.value); preview.reset() }} spellCheck={false} />
+      <div className="flex gap-2">
+        <button className="btn-ghost" disabled={!text.trim() || preview.isLoading}
+                onClick={() => preview.mutate({ id: accountId, text, apply: false })}>
+          {preview.isLoading ? 'Reading…' : 'Preview changes'}
+        </button>
+        {p && (
+          <button className="btn-primary" disabled={apply.isLoading}
+                  onClick={() => apply.mutate({ id: accountId, text, apply: true })}>
+            {apply.isLoading ? 'Saving…' : `Save ${p.holdings} holdings`}
+          </button>
+        )}
+        <button className="btn-ghost" onClick={onCancel}>Cancel</button>
+      </div>
+      {(preview.isError || apply.isError) && <div className="text-sm text-red-400">{errMsg(preview.error || apply.error)}</div>}
+      {p && (
+        <div className="space-y-1 text-xs">
+          <div className="text-slate-300">
+            {p.source === 'schwab' ? 'Schwab export' : 'CSV'}{p.title ? ` · ${p.title}` : ''}: {p.holdings} holdings, {usd0(p.parsed_total)} at live prices
+            {p.file_total != null && ` (the file's own total is ${usd0(p.file_total)}, from the time you exported it)`}.
+            Currently stored: {usd0(p.stored_total)}.
+          </div>
+          {p.warnings.map((w, i) => <div key={i} className="text-amber-400">{w}</div>)}
+          {p.diff.events.length === 0 && <div className="text-slate-500">No holdings changes: the same positions as stored.</div>}
+          {p.diff.events.map((e, i) => <div key={i} className="text-slate-400">• {(EVENT_TEXT[e.type] || (() => e.type))(e)}</div>)}
+        </div>
+      )}
+    </div>
+  )
+}
+
 function AccountCard({ a, onChanged }) {
   const [editing, setEditing] = useState(false)
   const [csv, setCsv] = useState('')
   const [contrib, setContrib] = useState(a.annual_contribution)
+  const [importing, setImporting] = useState(false)
   const load = useMutation(fetchHoldingsCsv, { onSuccess: d => { setCsv(d.csv); setEditing(true) } })
   const save = useMutation(saveHoldingsCsv, { onSuccess: () => { setEditing(false); onChanged() } })
   const patch = useMutation(patchSavingsAccount, { onSuccess: onChanged })
@@ -141,11 +193,17 @@ function AccountCard({ a, onChanged }) {
         <div className="flex gap-3 text-xs">
           <button className="underline text-slate-400 hover:text-slate-200" disabled={load.isLoading}
                   onClick={() => load.mutate(a.id)}>Edit holdings</button>
+          <button className="underline text-slate-400 hover:text-slate-200" onClick={() => setImporting(v => !v)}>
+            Import Schwab export
+          </button>
           <button className="underline text-slate-600 hover:text-red-400"
                   onClick={() => window.confirm(`Delete ${a.provider} ${a.name} and all its holdings?`) && del.mutate(a.id)}>
             Delete account
           </button>
         </div>
+      )}
+      {importing && !a.read_only && (
+        <ImportPanel accountId={a.id} onDone={() => { setImporting(false); onChanged() }} onCancel={() => setImporting(false)} />
       )}
       {(load.isError || patch.isError || del.isError) && (
         <div className="text-sm text-red-400">{errMsg(load.error || patch.error || del.error)}</div>
@@ -230,6 +288,115 @@ function ChangesCard() {
           </div>
         </div>
       ))}
+    </div>
+  )
+}
+
+function planText(plan) {
+  const lines = [`Trade worksheet (${plan.mode === 'full' ? 'full rebalance' : 'cash only'}), target ${plan.target_text}`]
+  plan.accounts.forEach(a => {
+    lines.push('', `${a.name} (${a.tax === 'roth' ? 'Roth' : 'pre-tax'}), cash ${usd0(a.cash_before)}:`)
+    if (!a.trades.length) lines.push('  no trades')
+    a.trades.forEach(t => lines.push(`  ${t.side.toUpperCase()} ${t.shares} ${t.symbol} @ ~$${t.price.toFixed(2)} (~${usd0(t.value)})`))
+  })
+  return lines.join('\n')
+}
+
+function TradeHelper({ accounts }) {
+  const eligible = accounts.filter(a => !a.read_only && ['roth', 'pre_tax'].includes(a.tax))
+  const info = useQuery('savings-target-model', fetchTargetModel, { retry: false })
+  const [picked, setPicked] = useState(null)
+  const [mode, setMode] = useState('cash_only')
+  const [target, setTarget] = useState(null)
+  const plan = useMutation(runTradePlan)
+  const save = useMutation(() => updateSetting('savings_target_model', target ?? info.data?.effective ?? ''))
+  if (eligible.length === 0) return null
+  const ids = picked ?? eligible.map(a => a.id)
+  const text = target ?? info.data?.effective ?? ''
+  const p = plan.data
+
+  return (
+    <div className="card space-y-3">
+      <div className="text-slate-100 font-semibold">Trade helper</div>
+      <div className="text-xs text-slate-500">
+        A worksheet of whole-share trades for the accounts you pick, so together they move toward your target. It uses only each
+        account's own cash and holdings and places nothing: you place the orders yourself.
+      </div>
+      <div className="flex flex-wrap gap-4 text-sm">
+        {eligible.map(a => (
+          <label key={a.id} className="flex items-center gap-2 text-slate-300">
+            <input type="checkbox" checked={ids.includes(a.id)}
+                   onChange={e => setPicked(e.target.checked ? [...ids, a.id] : ids.filter(i => i !== a.id))} />
+            {a.provider} · {a.name} <span className="text-slate-500">({a.tax === 'roth' ? 'Roth' : 'pre-tax'}, {usd0(a.value)})</span>
+          </label>
+        ))}
+      </div>
+      <div className="grid md:grid-cols-3 gap-3 items-end">
+        <label className="text-[10px] uppercase tracking-wider text-slate-500 md:col-span-2">
+          Target allocation (symbol:percent)
+          <input className="input w-full font-mono text-xs" value={text} placeholder="VTI:50, VXUS:25, BND:25"
+                 onChange={e => setTarget(e.target.value)} />
+        </label>
+        <label className="text-[10px] uppercase tracking-wider text-slate-500">Mode
+          <select className="input w-full" value={mode} onChange={e => setMode(e.target.value)}>
+            <option value="cash_only">Use new cash only (no sells)</option>
+            <option value="full">Full rebalance (may sell)</option>
+          </select>
+        </label>
+      </div>
+      <div className="text-[11px] text-slate-500">
+        {info.data?.saved ? 'Using your saved target.' : info.data?.default
+          ? 'Starting from a plain three-fund mix based on your age and risk. Edit it freely.' : ''}
+        {' '}Bonds and cash are placed in the pre-tax account and growth funds in the Roth where room allows.
+      </div>
+      <div className="flex gap-2">
+        <button className="btn-primary" disabled={plan.isLoading || ids.length === 0}
+                onClick={() => plan.mutate({ account_ids: ids, mode, target: text })}>
+          {plan.isLoading ? 'Calculating…' : 'Build worksheet'}
+        </button>
+        <button className="btn-ghost" disabled={save.isLoading || !text} onClick={() => save.mutate()}>
+          {save.isLoading ? 'Saving…' : save.isSuccess ? 'Saved as default ✓' : 'Save target as default'}
+        </button>
+      </div>
+      {plan.isError && <div className="text-sm text-red-400">{errMsg(plan.error)}</div>}
+      {p && (
+        <div className="space-y-3">
+          {p.accounts.map(a => (
+            <div key={a.id} className="rounded-lg border border-white/[0.08] p-3 space-y-1">
+              <div className="flex justify-between text-sm">
+                <span className="text-slate-200 font-semibold">{a.name} <span className="text-slate-500 font-normal">({a.tax === 'roth' ? 'Roth' : 'pre-tax'})</span></span>
+                <span className="text-slate-500 num">cash {usd0(a.cash_before)} → {usd0(a.cash_after)}</span>
+              </div>
+              {a.trades.length === 0 && <div className="text-xs text-slate-500">No trades.</div>}
+              {a.trades.map((t, i) => (
+                <div key={i} className="flex justify-between text-sm num">
+                  <span className={t.side === 'buy' ? 'text-emerald-400' : 'text-red-400'}>
+                    {t.side.toUpperCase()} {t.shares} {t.symbol}
+                  </span>
+                  <span className="text-slate-400">@ ~${t.price.toFixed(2)} · ~{usd0(t.value)}</span>
+                </div>
+              ))}
+            </div>
+          ))}
+          <div className="text-xs text-slate-400">
+            Biggest gap from target: {pct(p.max_drift_before, 1)} before, {pct(p.max_drift_after, 1)} after.
+            {' '}After: {Object.entries(p.after).slice(0, 6).map(([s, w]) => `${s} ${pct(w, 1)}`).join(' · ')}
+            {' '}(target {Object.entries(p.target).map(([s, w]) => `${s} ${pct(w, 0)}`).join(' · ')}).
+          </div>
+          {p.notes.map((n, i) => <div key={i} className="text-xs text-amber-400">{n}</div>)}
+          {p.excluded.length > 0 && (
+            <div className="text-xs text-slate-500">
+              Not traded here (no ticker/price): {p.excluded.map(e => `${e.name} ${usd0(e.value)}`).join(', ')}.
+            </div>
+          )}
+          <div className="flex items-center gap-3">
+            <button className="btn-ghost" onClick={() => navigator.clipboard?.writeText(planText(p))}>Copy worksheet</button>
+            <span className="text-[11px] text-slate-600">
+              {p.prices_as_of}. Check your plan's trading rules and fees first. Planning aid, not financial advice.
+            </span>
+          </div>
+        </div>
+      )}
     </div>
   )
 }
@@ -338,6 +505,7 @@ export default function SavingsTab() {
             </div>
           )}
 
+          <TradeHelper accounts={s.accounts} />
           <PlanCard />
           <ChangesCard />
 
