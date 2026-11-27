@@ -14,13 +14,15 @@ import DualMomentumTab from './components/DualMomentumTab'
 import IRAPortfolio from './components/IRAPortfolio'
 import SavingsTab from './components/SavingsTab'
 import PreTradeLog from './components/PreTradeLog'
+import Overview from './components/Overview'
 import { fetchPositions, updateSetting, fetchSettings } from './api/client'
 
 const POSITIONS_INTERVAL = 5000
 const ACCOUNT_INTERVAL   = 5000
 
 const TAB_CONFIG = [
-  { id: 'Positions',      icon: '⬡', label: 'Positions' },
+  { id: 'Overview',       icon: '◎', label: 'Overview' },
+  { id: 'Positions',     icon: '⬡', label: 'Positions' },
   { id: 'Orders',         icon: '↕', label: 'Orders' },
   { id: 'Weekly Plan',    icon: '✦', label: 'Weekly Plan' },
   { id: 'Dual Momentum',  icon: '⟳', label: 'Dual Momentum' },
@@ -39,7 +41,7 @@ function Dashboard() {
     ...TAB_CONFIG,
     ...(user?.role === 'admin' ? [{ id: 'Admin', icon: '⛭', label: 'Admin' }] : []),
   ]
-  const [tab, setTab] = useState('Positions')
+  const [tab, setTab] = useState('Overview')
 
   const { data: positions = [], isLoading: posLoading, isError: posError } = useQuery(
     'positions',
@@ -165,6 +167,7 @@ function Dashboard() {
 
         {/* Tab content */}
         <div className="animate-fade-in" key={tab}>
+          {tab === 'Overview' && <Overview onNavigate={setTab} />}
           {tab === 'Positions' && (
             posLoading ? (
               <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
