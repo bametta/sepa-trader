@@ -18,9 +18,90 @@ STANDARD = '''"Positions for account PCRA Roth ...1234 as of 04:20 PM ET, 11/26/
 '''
 
 
+FID_HEADER = ("Account Number,Account Name,Symbol,Description,Quantity,Last Price,Last Price Change,Current Value,"
+              "Today's Gain/Loss Dollar,Today's Gain/Loss Percent,Total Gain/Loss Dollar,Total Gain/Loss Percent,"
+              "Percent Of Account,Cost Basis Total,Average Cost Basis,Type\n")
+FID_FOOTER = '''
+"The data and information in this spreadsheet is provided to you solely for your use and is not for distribution."
+"Brokerage services are provided by Fidelity Brokerage Services LLC (FBS), 900 Salem Street, Smithfield, RI 02917."
+"Date downloaded 11/27/2026 1:00 PM ET"
+'''
+# Type=Cash here is the ACCOUNT type (cash vs margin), and must not make every holding look like cash.
+FIDELITY_ONE = (FID_HEADER +
+    'Z12345678,Rollover IRA,SPAXX**,HELD IN MONEY MARKET,,,,$1234.56,,,,,5.2%,,,Cash\n'
+    'Z12345678,Rollover IRA,VOO,VANGUARD S&P 500 ETF,20,$650.00,+$1.25,"$13,000.00",+$25.00,+0.2%,"+$3,000.00",+30%,55%,'
+    '"$10,000.00",$500.00,Cash\n'
+    'Z12345678,Rollover IRA,FXAIX,FIDELITY 500 INDEX FUND,15.5,$250.00,-$0.50,"$3,875.00",-$7.75,-0.2%,+$875.00,+29%,'
+    '17%,"$3,000.00",$193.55,Cash\n'
+    'Z12345678,Rollover IRA,Pending Activity,,,,,-$200.00,,,,,,,,\n' + FID_FOOTER)
+FIDELITY_TWO = (FID_HEADER +
+    'Z11111111,Rollover IRA,VOO,VANGUARD S&P 500 ETF,20,$650.00,+$1.25,"$13,000.00",,,,,,,,Cash\n'
+    'Z22222222,Joint Brokerage,AAPL,APPLE INC,10,$300.00,+$2.00,"$3,000.00",,,,,,,,Margin\n'
+    'Z22222222,Joint Brokerage,SPAXX**,HELD IN MONEY MARKET,,,,$500.00,,,,,,,,Margin\n' + FID_FOOTER)
+
+
+class FidelityTests(unittest.TestCase):
+    def parse(self, text, key=None):
+        return si.parse_positions(text, TODAY, key)
+
+    def test_single_account_file_is_recognised(self):
+        out = self.parse(FIDELITY_ONE)
+        by = {h["symbol"]: h for h in out["holdings"]}
+        self.assertEqual(set(by), {"SPAXX", "VOO", "FXAIX"})
+        self.assertEqual((by["VOO"]["quantity"], by["VOO"]["manual_value"]), (20.0, 13000.0))
+        self.assertEqual(by["FXAIX"]["quantity"], 15.5)
+        self.assertFalse(out["needs_choice"])
+
+    def test_account_type_column_does_not_turn_holdings_into_cash(self):
+        by = {h["symbol"]: h for h in self.parse(FIDELITY_ONE)["holdings"]}
+        self.assertEqual(by["VOO"]["asset_class"], "auto")
+        self.assertEqual(by["FXAIX"]["asset_class"], "auto")
+
+    def test_core_cash_with_asterisks_is_cash_and_keeps_its_value(self):
+        spaxx = [h for h in self.parse(FIDELITY_ONE)["holdings"] if h["symbol"] == "SPAXX"][0]
+        self.assertEqual((spaxx["asset_class"], spaxx["manual_value"]), ("cash", 1234.56))
+        self.assertIsNone(spaxx["quantity"])
+
+    def test_pending_activity_is_skipped_with_a_note_and_footers_are_silent(self):
+        out = self.parse(FIDELITY_ONE)
+        self.assertEqual(len(out["warnings"]), 1)
+        self.assertIn("Pending Activity", out["warnings"][0])
+
+    def test_signed_dollar_formats(self):
+        for raw, want in (("+$12.34", 12.34), ("-$1.00", -1.0), ("$1,000.50", 1000.5)):
+            self.assertEqual(si.money(raw), want)
+
+    def test_several_accounts_require_a_choice_and_labels_are_masked(self):
+        out = self.parse(FIDELITY_TWO)
+        self.assertTrue(out["needs_choice"])
+        self.assertEqual(out["holdings"], [])
+        labels = {g["key"]: g for g in out["groups"]}
+        self.assertEqual(set(labels), {"Z11111111", "Z22222222"})
+        self.assertIn("...1111", labels["Z11111111"]["label"])
+        self.assertNotIn("Z11111111", labels["Z11111111"]["label"])        # only the last four characters show
+        self.assertEqual((labels["Z22222222"]["holdings"], labels["Z22222222"]["total"]), (2, 3500.0))
+
+    def test_choosing_an_account_imports_only_that_account(self):
+        out = self.parse(FIDELITY_TWO, "Z22222222")
+        self.assertEqual(sorted(h["symbol"] for h in out["holdings"]), ["AAPL", "SPAXX"])
+        self.assertEqual(self.parse(FIDELITY_TWO, "Z11111111")["holdings"][0]["symbol"], "VOO")
+        with self.assertRaises(ValueError):
+            self.parse(FIDELITY_TWO, "Z99999999")
+
+    def test_schwab_files_are_unaffected_by_the_group_logic(self):
+        out = si.parse_positions(STANDARD, TODAY)
+        self.assertFalse(out["needs_choice"])
+        self.assertEqual(len(out["holdings"]), 4)
+
+    def test_unknown_header_still_raises_a_helpful_error(self):
+        with self.assertRaises(ValueError) as cm:
+            self.parse("Name,Amount\nA,1\n")
+        self.assertIn("first few lines", str(cm.exception))
+
+
 class ParseTests(unittest.TestCase):
     def parse(self, text):
-        return si.parse_schwab_positions(text, TODAY)
+        return si.parse_positions(text, TODAY)
 
     def test_standard_export(self):
         out = self.parse(STANDARD)
@@ -81,8 +162,10 @@ class ParseTests(unittest.TestCase):
         self.assertIn("first few lines", str(cm.exception))
 
     def test_detection(self):
-        self.assertTrue(si.looks_like_schwab(STANDARD))
-        self.assertFalse(si.looks_like_schwab("symbol,name,quantity,value\nVTI,,10,\n"))
+        self.assertTrue(si.looks_like_broker_export(STANDARD))
+        self.assertTrue(si.looks_like_broker_export(FIDELITY_ONE))
+        self.assertFalse(si.looks_like_broker_export("symbol,name,quantity,value,asset_class\nVTI,,10,,auto\n"))
+        self.assertFalse(si.looks_like_broker_export("hello,world\n1,2\n"))
 
     def test_output_matches_the_holdings_shape_the_tracker_stores(self):
         for h in self.parse(STANDARD)["holdings"]:

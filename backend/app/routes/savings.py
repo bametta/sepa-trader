@@ -127,6 +127,7 @@ def put_holdings(account_id: int, body: HoldingsBody, current_user: dict = Depen
 class ImportBody(BaseModel):
     text: str
     apply: bool = False        # false = preview only (nothing saved)
+    account_key: str | None = None   # which account to import when the file holds several
 
 
 class TradePlanBody(BaseModel):
@@ -142,7 +143,8 @@ def import_positions(account_id: int, body: ImportBody, current_user: dict = Dep
     if len(body.text) > savings.MAX_CSV_CHARS:
         raise HTTPException(400, "file is too large")
     try:
-        return savings_service.import_positions(db, current_user["id"], account_id, body.text, body.apply)
+        return savings_service.import_positions(db, current_user["id"], account_id, body.text, body.apply,
+                                                body.account_key)
     except ValueError as exc:
         if str(exc) == "account_not_found":
             raise HTTPException(404, "account_not_found")
