@@ -137,6 +137,10 @@ export const fetchIRAHistory   = (limit = 20) => api.get(`/ira/history?limit=${l
 export const runIRARebalance   = (body) => api.post('/ira/rebalance', body).then(r => r.data)
 export const setIRAHalt        = (body) => api.post('/ira/halt', body).then(r => r.data)
 export const fetchIRAPlan      = () => api.get('/ira/plan').then(r => r.data)
+export const fetchIRAContributions    = () => api.get('/ira/contributions').then(r => r.data)
+export const addIRAContribution       = (body) => api.post('/ira/contributions', body).then(r => r.data)
+export const deleteIRAContribution    = (id) => api.delete(`/ira/contributions/${id}`).then(r => r.data)
+export const fetchIRAHistoricalStress = () => api.get('/ira/stress/historical', { timeout: 120000 }).then(r => r.data)
 export const fetchIRAReference = () => api.get('/ira/reference').then(r => r.data)
 export const runIRABacktest    = (body) => api.post('/ira/backtest', body, { timeout: 180000 }).then(r => r.data)
 

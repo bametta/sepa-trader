@@ -581,6 +581,15 @@ const SECTIONS = [
       { key: 'ira_target_income',       label: 'or target yearly income $ (4% rule)',     type: 'text' },
       { key: 'ira_annual_contribution', label: 'Planned yearly IRA contribution $',       type: 'text' },
       { key: 'ira_annual_income',       label: 'Yearly income $ (optional, for % advice)', type: 'text' },
+      {
+        key: 'ira_filing_status', label: 'Tax filing status (Roth income limit)', type: 'select',
+        options: [
+          { value: '',       label: 'Not set' },
+          { value: 'single', label: 'Single / head of household' },
+          { value: 'joint',  label: 'Married filing jointly' },
+        ],
+      },
+      { key: 'ira_magi', label: 'MAGI $ (optional; defaults to yearly income)', type: 'text' },
       { key: 'ira_max_expense_pct',     label: 'Gate: max blended expense % (default 0.25)', type: 'text' },
       { key: 'ira_max_turnover_pct',    label: 'Gate: max one-way turnover % (default 30)',  type: 'text' },
       { key: 'ira_max_stock_pct',       label: 'Gate: max single-stock look-through % (default 8)', type: 'text' },

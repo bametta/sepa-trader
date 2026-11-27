@@ -171,3 +171,68 @@ def ira_backtest_run(body: BacktestBody, current_user: dict = Depends(get_curren
         raise HTTPException(502, f"Backtest failed: {str(exc)[:200]}")
     _backtest_cache[key] = (time.time(), res)
     return res
+
+
+# ── Contributions ledger and stress tests ─────────────────────────────────────
+
+from datetime import date as _date
+
+
+class ContribBody(BaseModel):
+    amount: float
+    contributed_on: _date | None = None
+    tax_year: int | None = None
+    note: str = ""
+
+
+@router.get("/contributions")
+def ira_contributions(current_user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
+    from .. import ira_contributions as ic
+    return ic.summary(db, current_user["id"])
+
+
+@router.post("/contributions")
+def ira_add_contribution(body: ContribBody, current_user: dict = Depends(get_current_user),
+                         db: Session = Depends(get_db)):
+    from .. import ira_contributions as ic
+    uid = current_user["id"]
+    on = body.contributed_on or _date.today()
+    try:
+        ic.add_contribution(db, uid, body.amount, on, body.tax_year or on.year, body.note)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    summary = ic.summary(db, uid)
+    over = [y for y in summary["years"] if y["excess"] > 0]
+    if over:
+        ira._alert("IRA contribution limit exceeded for " + ", ".join(
+            f"{y['year']} (by ${y['excess']:,.2f})" for y in over) + ". Excess is taxed 6% per year until withdrawn.",
+            "URGENT")
+    return summary
+
+
+@router.delete("/contributions/{cid}")
+def ira_delete_contribution(cid: int, current_user: dict = Depends(get_current_user),
+                            db: Session = Depends(get_db)):
+    from .. import ira_contributions as ic
+    if not ic.delete_contribution(db, current_user["id"], cid):
+        raise HTTPException(404, "contribution_not_found")
+    return ic.summary(db, current_user["id"])
+
+
+@router.get("/stress/historical")
+def ira_stress_historical(current_user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Replay real 1996+ return sequences against the plan (needs market data; cached 24h)."""
+    from .. import ira_planner, ira_stress
+    uid = current_user["id"]
+    balance = 0.0
+    if ira.has_credentials(db, uid):
+        try:
+            balance = ira.get_snapshot(db, uid)["equity"]
+        except Exception as exc:
+            logger.warning("ira stress: snapshot failed: %s", exc)
+    plan = ira_planner.build_plan(db, uid, balance)
+    if not plan.get("ready") or not plan.get("stress"):
+        raise HTTPException(400, "plan_not_ready: set birth year, retirement age and a goal in Settings first.")
+    return ira_stress.historical_replay(
+        plan["glidepath_equity"], plan["profile"]["years_to_retire"],
+        plan["stress"]["contribution_assumed"], balance, plan["target"]["amount"])

@@ -171,6 +171,16 @@ def build_plan(db, uid: int, balance: float, tactical_equity: float | None = Non
             r["note"] = ("Maxing the IRA is not enough for an 80% chance. Close the gap with savings in a "
                          "401(k)/taxable account, a later retirement age, or a lower target.")
         out["recommendation"] = r
+        try:
+            from . import ira_stress
+            assumed = p["planned_contribution"] if p["planned_contribution"] else r["annual"]
+            out["stress"] = {
+                "contribution_assumed": round(assumed),
+                "scenarios": ira_stress.scenario_projection(balance, assumed, years, mix, target),
+                "withdrawal": ira_stress.withdrawal_test(target, p["retire_age"], p["risk"], 0.04),
+            }
+        except Exception as exc:  # stress output is supplementary; never break the plan
+            out["stress"] = {"error": str(exc)[:120]}
     out["ready"] = True
     out["missing"] = [m for m in out["missing"] if not (m.startswith("ira_target") and target)]
     out["disclaimer"] = ("Planning aid, not financial advice. Real (inflation-adjusted) dollars; "
