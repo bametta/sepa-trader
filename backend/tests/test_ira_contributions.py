@@ -12,6 +12,43 @@ fake_db.get_user_setting = lambda db, k, d="", u=None: SETTINGS.get(k, d)
 ic = load("ira_contributions", {**sql_stub(), "app.database": fake_db})
 
 
+def summary_for(year, contributed, today):
+    return {"years": [ic.summarize_year(year, today, 1990, 150000.0, "joint", contributed)]}
+
+
+class NudgeTests(unittest.TestCase):
+    def test_each_scheduled_day_has_a_message_with_the_amount_left(self):
+        for d in (date(2026, 12, 15), date(2026, 12, 18), date(2026, 12, 22), date(2026, 12, 29)):
+            with self.subTest(d=d):
+                msg = ic.deadline_nudge(summary_for(2026, 1000.0, d), d)
+                self.assertIn("$6,500", msg)
+                self.assertIn("2026", msg)
+                self.assertIn("ledger", msg)
+
+    def test_april_first_refers_to_the_prior_tax_year_and_its_deadline(self):
+        d = date(2027, 4, 1)
+        msg = ic.deadline_nudge(summary_for(2026, 1000.0, d), d)
+        self.assertIn("2026", msg)
+        self.assertIn("2027-04-15", msg)
+
+    def test_silent_when_the_year_is_filled(self):
+        d = date(2026, 12, 15)
+        self.assertIsNone(ic.deadline_nudge(summary_for(2026, 7500.0, d), d))
+
+    def test_silent_on_other_days(self):
+        for d in (date(2026, 12, 16), date(2026, 12, 25), date(2026, 11, 28), date(2027, 4, 2)):
+            with self.subTest(d=d):
+                self.assertIsNone(ic.deadline_nudge(summary_for(2026, 1000.0, d), d))
+
+    def test_silent_when_the_relevant_year_is_missing(self):
+        self.assertIsNone(ic.deadline_nudge({"years": []}, date(2026, 12, 15)))
+
+    def test_phase_out_reduced_room_is_respected(self):
+        d = date(2026, 12, 15)
+        s = {"years": [ic.summarize_year(2026, d, 1990, 247000.0, "joint", 0.0)]}      # mid phase-out
+        self.assertIn("$3,750", ic.deadline_nudge(s, d))
+
+
 class LimitTests(unittest.TestCase):
     def test_catch_up_depends_on_age_at_year_end(self):
         self.assertEqual(ic.limit_for(2026, 1976)["limit"], 7500 + 1100)   # turns 50 in 2026

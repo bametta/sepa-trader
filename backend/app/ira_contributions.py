@@ -120,6 +120,33 @@ def reminder_text(summary: dict, today: date) -> str | None:
     return ("IRA contribution check:\n" + "\n".join(lines)) if lines else None
 
 
+def deadline_nudge(summary: dict, today: date) -> str | None:
+    """One-off year-end / deadline messages for an unfilled IRA year, sent on fixed dates:
+    Dec 15 (start the ACH), Dec 18 (last good day to start), Dec 22 (check it landed), Dec 29 (last day for the
+    default year) and Apr 1 (final stretch before the Apr 15 deadline). None on other days or when nothing is left."""
+    key = (today.month, today.day)
+    year = today.year - 1 if key == (4, 1) else today.year
+    y = next((x for x in summary["years"] if x["year"] == year), None)
+    if not y or y["remaining"] <= 0:
+        return None
+    left = f"${y['remaining']:,.0f}"
+    msgs = {
+        (12, 15): f"IRA catch-up: {left} of {year} Roth IRA room is still open. Start the ACH deposit to your IRA now: "
+                  "ACH takes several business days and December holidays slow it.",
+        (12, 18): f"IRA catch-up: {left} of {year} room still open. Today is about the last good day to START the ACH "
+                  f"so it lands before Dec 31 and defaults to {year}. If you start later, designate {year} explicitly "
+                  "when you deposit.",
+        (12, 22): f"IRA catch-up: if your deposit has not posted yet, check its status and contact the broker. "
+                  f"{left} of {year} room is still open.",
+        (12, 29): f"IRA catch-up: last days for a deposit to count as {year} by default. {left} of {year} room is "
+                  f"still open. After Dec 31 you must designate {year} yourself, and that choice cannot be changed.",
+        (4, 1): f"IRA catch-up: {left} of {year} room is still open and the deadline is {y['deadline']}. Any deposit "
+                f"must be designated as a {year} contribution, and cannot be changed afterward.",
+    }
+    text = msgs.get(key)
+    return (text + " Record it in the IRA ledger once it posts.") if text else None
+
+
 # ── Ledger (database) ─────────────────────────────────────────────────────────
 
 def validate(amount, contributed_on: date, tax_year: int, today: date) -> None:

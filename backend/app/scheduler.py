@@ -730,6 +730,33 @@ async def _ira_contribution_reminder_job():
     await asyncio.get_running_loop().run_in_executor(None, _ira_contribution_reminders)
 
 
+def _ira_deadline_nudges() -> None:
+    """Daily: on the fixed year-end / April dates, nudge users who intend to max the IRA and still have room."""
+    from . import ira_contributions
+    from . import telegram_alerts as tg
+    today = datetime.now(_ET).date()
+    if (today.month, today.day) not in {(12, 15), (12, 18), (12, 22), (12, 29), (4, 1)}:
+        return
+    db = SessionLocal()
+    try:
+        uids = [r[0] for r in db.execute(text(
+            "SELECT DISTINCT user_id FROM user_settings WHERE key = 'ira_contribute_max' AND value = 'true'"
+        )).fetchall()]
+        for uid in uids:
+            try:
+                msg = ira_contributions.deadline_nudge(ira_contributions.summary(db, uid, today), today)
+                if msg:
+                    tg.send_sync(msg, level="INFO")
+            except Exception as exc:
+                logger.error("IRA deadline nudge uid=%s failed: %s", uid, exc)
+    finally:
+        db.close()
+
+
+async def _ira_deadline_nudge_job():
+    await asyncio.get_running_loop().run_in_executor(None, _ira_deadline_nudges)
+
+
 def _savings_update_reminders() -> None:
     """Quarterly: ask users who track savings accounts by hand to refresh them."""
     from . import savings
@@ -1296,6 +1323,14 @@ def start_scheduler():
         _ira_contribution_reminder_job,
         CronTrigger(day=1, hour=9, minute=0, timezone="America/New_York"),
         id="ira_contribution_reminder",
+        replace_existing=True,
+    )
+
+    # IRA deadline nudges: daily 9:10 AM ET; the job itself only acts on Dec 15/18/22/29 and Apr 1.
+    scheduler.add_job(
+        _ira_deadline_nudge_job,
+        CronTrigger(hour=9, minute=10, timezone="America/New_York"),
+        id="ira_deadline_nudge",
         replace_existing=True,
     )
 
