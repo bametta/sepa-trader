@@ -25,6 +25,10 @@ class Settings(BaseSettings):
     # Set to true in production (HTTPS only) to mark auth cookies Secure
     secure_cookies: bool = False
 
+    # Contact address sent in the User-Agent to SEC EDGAR (their fair-access policy asks for one).
+    # Set SEC_CONTACT_EMAIL in .env; it is intentionally not in the source.
+    sec_contact_email: str = ""
+
     # Self-registration is off by default (this app controls real-money accounts). Set ALLOW_REGISTRATION=true
     # in .env only while you intentionally want new sign-ups.
     allow_registration: bool = False
