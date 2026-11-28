@@ -205,5 +205,71 @@ class ParseTests(unittest.TestCase):
             self.assertEqual(h["as_of"], TODAY)
 
 
+# Equity Trust "Portfolio Positions" layout: real header and Asset Type names; the rows are invented sample data.
+ET_HEADER = "Asset Type\tAsset Number\tDescription\tAsset Value\tTicker Symbol\tUnits\tPrice\tLocation"
+ET_TAB = "\n".join([
+    "Portfolio Positions 11-27-2026", ET_HEADER,
+    "Digital Currency\t9001\tBitcoin\t$12,500.00\t\t0.15\t\t",
+    "Digital Currency\t9002\tEthereum\t$3,100.50\t\t\t\t",
+    "Brokerage Accounts\t9003\tOther broker account\t$8,000.00\t\t\t\t",
+    "Limited Liability Company\t9004\tSmith Holdings LLC\t$45,000.00\t\t\t\tTexas",
+    "Real Estate\t9005\tRental duplex\t$310,000.00\t\t\t\t",
+    "Mutual Fund\t9006\tVanguard Total Stock\t$5,000.00\tVTI\t20\t250.00\t",
+    "Total\t\t\t$383,600.50\t\t\t\t",
+])
+ET_CSV = "\n".join([
+    "Portfolio Positions", ET_HEADER.replace("\t", ","),
+    'Digital Currency,9001,Bitcoin,"$12,500.00",,0.15,,',
+    'Limited Liability Company,9004,Smith Holdings LLC,"$45,000.00",,,,Texas',
+])
+ET_NOW = date(2026, 11, 28)
+
+
+class EquityTrustTests(unittest.TestCase):
+    def parse(self, raw, today=ET_NOW):
+        return si.parse_positions(raw, today=today)
+
+    def test_header_is_recognised_in_tab_and_comma_form(self):
+        self.assertTrue(si.looks_like_broker_export(ET_TAB))
+        self.assertTrue(si.looks_like_broker_export(ET_CSV))
+
+    def test_asset_types_map_to_classes_and_liquidity(self):
+        by = {h["name"]: h for h in self.parse(ET_TAB)["holdings"]}
+        self.assertEqual((by["Bitcoin"]["asset_class"], by["Bitcoin"]["illiquid"]), ("crypto", False))
+        self.assertEqual(by["Ethereum"]["asset_class"], "crypto")
+        self.assertEqual((by["Other broker account"]["asset_class"], by["Other broker account"]["illiquid"]), ("auto", False))
+        self.assertEqual((by["Smith Holdings LLC"]["asset_class"], by["Smith Holdings LLC"]["illiquid"]), ("alt_private", True))
+        self.assertEqual((by["Rental duplex"]["asset_class"], by["Rental duplex"]["illiquid"]), ("alt_real_estate", True))
+
+    def test_values_and_total_match_with_no_mismatch_warning(self):
+        p = self.parse(ET_TAB)
+        self.assertEqual(len(p["holdings"]), 6)
+        self.assertAlmostEqual(p["parsed_total"], 383600.50)
+        self.assertEqual(p["file_total"], 383600.50)
+        self.assertFalse(any("add up" in w for w in p["warnings"]))
+
+    def test_a_ticker_row_keeps_its_symbol_and_units(self):
+        vti = next(h for h in self.parse(ET_TAB)["holdings"] if h["symbol"] == "VTI")
+        self.assertEqual((vti["quantity"], vti["manual_value"]), (20.0, 5000.0))
+
+    def test_rows_are_dated_by_the_file_and_future_dates_fall_back_to_today(self):
+        self.assertTrue(all(h["as_of"] == date(2026, 11, 27) for h in self.parse(ET_TAB)["holdings"]))
+        early = self.parse(ET_TAB, today=date(2026, 6, 1))                 # file date is in the future -> today
+        self.assertTrue(all(h["as_of"] == date(2026, 6, 1) for h in early["holdings"]))
+
+    def test_title_without_a_date_uses_today(self):
+        self.assertTrue(all(h["as_of"] == ET_NOW for h in self.parse(ET_CSV)["holdings"]))
+
+    def test_tickerless_rows_are_not_imported_from_other_brokers(self):
+        raw = STANDARD.replace('"Account Total"', '"","UNKNOWN THING","1","$1.00","--","--","$777.00","--","--","--","--","--","--","--","--","--","Other"\n"Account Total"')
+        self.assertFalse(any(h["manual_value"] == 777.0 for h in si.parse_positions(raw, today=TODAY)["holdings"]))
+
+    def test_zero_or_missing_value_rows_are_skipped_with_a_warning(self):
+        raw = ET_TAB.replace("$310,000.00", "")
+        p = self.parse(raw)
+        self.assertEqual(len(p["holdings"]), 5)
+        self.assertTrue(any("Rental duplex" in w for w in p["warnings"]))
+
+
 if __name__ == "__main__":
     unittest.main()
