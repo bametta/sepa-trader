@@ -14,10 +14,10 @@ from datetime import date
 
 # Deliberately no bare "type": in Fidelity's file that column means Cash/Margin account, not security type.
 SYNONYMS = {
-    "symbol": ("symbol",),
+    "symbol": ("symbol", "ticker symbol", "ticker"),
     "name": ("description", "name", "security name"),
-    "quantity": ("quantity", "qty", "shares"),
-    "value": ("market value", "mkt val (market value)", "current value", "value"),
+    "quantity": ("quantity", "qty", "shares", "units"),
+    "value": ("market value", "mkt val (market value)", "current value", "asset value", "value"),
     "type": ("security type", "asset type"),
     "acct_number": ("account number", "account #", "acct number"),
     "acct_name": ("account name", "account nickname"),
@@ -52,10 +52,52 @@ def _fuzzy(key: str, cell: str) -> bool:
     return False
 
 
+def _read_rows(text: str) -> list[list[str]]:
+    """CSV rows. Pasted spreadsheet cells are tab-separated, real exports are comma-separated."""
+    delim = "\t" if text.count("\t") > text.count(",") else ","
+    return [r for r in csv.reader(io.StringIO(text), delimiter=delim)]
+
+
+DATE_RE = re.compile(r"\b(\d{1,2})[-/](\d{1,2})[-/](\d{4})\b")
+
+
+def _file_date(lines: list[str], today: date) -> date:
+    """The 'as of' date printed above the header (mm-dd-yyyy or mm/dd/yyyy); today if absent or not plausible."""
+    for ln in lines:
+        m = DATE_RE.search(ln)
+        if m:
+            try:
+                d = date(int(m.group(3)), int(m.group(1)), int(m.group(2)))
+            except ValueError:
+                continue
+            if d <= today:
+                return d
+    return today
+
+
+def _untickered_class(asset_type: str, description: str) -> tuple[str, bool]:
+    """(asset_class, illiquid) for an asset with no ticker, from the custodian's Asset Type text (Equity Trust:
+    Digital Currency, Brokerage Accounts, Limited Liability Company, real estate, notes...). Unknown types stay
+    unclassified so the app asks you to classify them instead of guessing."""
+    t = _norm(f"{asset_type} {description}")
+    if re.search(r"\b(cash|money market)\b", t):
+        return "cash", False
+    if re.search(r"digital currenc|crypto|bitcoin|ethereum", t):
+        return "crypto", False
+    if re.search(r"real estate|property|rental|\bland\b|mortgage|trust deed|\blien\b", t):
+        return "alt_real_estate", True
+    if re.search(r"limited liability|\bllc\b|\bl\.l\.c|partnership|\blp\b|private|placement|syndication|"
+                 r"promissory|\bnote\b|business", t):
+        return "alt_private", True
+    if re.search(r"brokerage account", t):
+        return "auto", False                  # money held at another broker: value is real, its mix is unknown
+    return "alt_other", True
+
+
 def _find_header(rows: list[list[str]]) -> tuple[int, dict]:
     for i, row in enumerate(rows):
         cells = [_norm(c) for c in row]
-        if "symbol" not in cells:
+        if not any(c in SYNONYMS["symbol"] for c in cells):
             continue
         mapping = {}
         for key, names in SYNONYMS.items():
@@ -75,7 +117,7 @@ def looks_like_broker_export(raw: str) -> bool:
     if "asset_class" in first:
         return False
     try:
-        _find_header(list(csv.reader(io.StringIO((raw or "").strip().lstrip("﻿")))))
+        _find_header(_read_rows((raw or "").strip().lstrip("﻿")))
         return True
     except ValueError:
         return False
@@ -93,9 +135,14 @@ def parse_positions(raw: str, today: date | None = None, account_key: str | None
     text = (raw or "").strip().lstrip("﻿")
     if not text:
         raise ValueError("the file is empty")
-    rows = [r for r in csv.reader(io.StringIO(text))]
+    rows = _read_rows(text)
     header_idx, col = _find_header(rows)
     title = next((" ".join(r).strip() for r in rows[:header_idx] if sum(1 for c in r if c.strip()) == 1), None)
+    # Ticker-less assets (real estate, LLCs, digital currency...) are only accepted from exports whose symbol column
+    # is called "Ticker Symbol" (Equity Trust style); Schwab/Fidelity rows with an empty symbol stay skipped.
+    untickered_ok = _norm(rows[header_idx][col["symbol"]]) in ("ticker symbol", "ticker")
+    # Those hand-valued rows are dated by the 'as of' date printed on the file; other brokers keep using today.
+    as_of = _file_date([" ".join(r) for r in rows[:header_idx]], today) if untickered_ok else today
 
     def cell(row, key):
         j = col.get(key)
@@ -115,6 +162,20 @@ def parse_positions(raw: str, today: date | None = None, account_key: str | None
         if low in TOTAL_LABELS:
             g["file_total"] = value if value is not None else g["file_total"]
             continue
+        if untickered_ok and not sym_raw:
+            desc, raw_type = cell(row, "name"), cell(row, "type")
+            label = _norm(desc or raw_type)
+            if label in TOTAL_LABELS or label.startswith("total") or _norm(raw_type) in TOTAL_LABELS:
+                g["file_total"] = value if value is not None else g["file_total"]
+                continue
+            if value is None or value <= 0:
+                if desc or raw_type:
+                    g["warnings"].append(f"skipped '{(desc or raw_type)[:40]}': no positive value")
+                continue
+            cls, illiquid = _untickered_class(raw_type, desc)
+            g["holdings"].append({"symbol": None, "name": (desc or raw_type)[:120], "quantity": None,
+                                  "manual_value": value, "asset_class": cls, "illiquid": illiquid, "as_of": as_of})
+            continue
         name = cell(row, "name") or sym_raw
         sec_type = _norm(cell(row, "type"))
         if low == "pending activity":
@@ -127,7 +188,7 @@ def parse_positions(raw: str, today: date | None = None, account_key: str | None
             if value:
                 g["holdings"].append({"symbol": None, "name": sym_raw or "Cash", "quantity": None,
                                       "manual_value": value, "asset_class": "cash", "illiquid": False,
-                                      "as_of": today})
+                                      "as_of": as_of})
             continue
         if not SYMBOL_RE.match(symbol):
             if sym_raw:
@@ -144,7 +205,7 @@ def parse_positions(raw: str, today: date | None = None, account_key: str | None
         is_cash = (core_cash or "money market" in sec_type or sec_type == "cash"
                    or any(w in low_name for w in CASH_WORDS))
         g["holdings"].append({"symbol": symbol, "name": name[:120], "quantity": qty, "manual_value": value,
-                              "asset_class": "cash" if is_cash else "auto", "illiquid": False, "as_of": today})
+                              "asset_class": "cash" if is_cash else "auto", "illiquid": False, "as_of": as_of})
 
     groups = {k: g for k, g in groups.items() if g["holdings"] or g["file_total"]}
     if not groups:
