@@ -58,6 +58,8 @@ def _read_rows(text: str) -> list[list[str]]:
     return [r for r in csv.reader(io.StringIO(text), delimiter=delim)]
 
 
+CRYPTO_ALIASES = {"XBT": "BTC"}          # ISO-style code some custodians use for bitcoin
+
 DATE_RE = re.compile(r"\b(\d{1,2})[-/](\d{1,2})[-/](\d{4})\b")
 
 
@@ -204,8 +206,15 @@ def parse_positions(raw: str, today: date | None = None, account_key: str | None
         low_name = _norm(name)
         is_cash = (core_cash or "money market" in sec_type or sec_type == "cash"
                    or any(w in low_name for w in CASH_WORDS))
+        asset_class = "cash" if is_cash else "auto"
+        if untickered_ok and re.search(r"digital currenc|crypto", sec_type):
+            # The custodian's own code (DCXBT, DCSOL) is not a market ticker. Use the matching USD pair for live
+            # pricing; if it has no price the statement value is used, so this can only help.
+            base = symbol[2:] if symbol.startswith("DC") and len(symbol) > 3 else symbol
+            symbol = f"{CRYPTO_ALIASES.get(base, base)}-USD"
+            asset_class = "crypto"
         g["holdings"].append({"symbol": symbol, "name": name[:120], "quantity": qty, "manual_value": value,
-                              "asset_class": "cash" if is_cash else "auto", "illiquid": False, "as_of": as_of})
+                              "asset_class": asset_class, "illiquid": False, "as_of": as_of})
 
     groups = {k: g for k, g in groups.items() if g["holdings"] or g["file_total"]}
     if not groups:
