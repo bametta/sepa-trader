@@ -25,10 +25,14 @@ from datetime import datetime, timezone, timedelta
 
 import httpx
 
+from .config import settings
+
 logger = logging.getLogger(__name__)
 
-# SEC requires a User-Agent with contact info
-_UA = "sepa-trader/1.0 (contact: njohbillie@gmail.com)"
+# SEC requires a User-Agent with contact info. The contact comes from SEC_CONTACT_EMAIL in .env (never hard-code a
+# personal address in a public repo). Without it we still identify the tool, but SEC may throttle anonymous clients.
+_CONTACT = (settings.sec_contact_email or "").strip()
+_UA = f"sepa-trader/1.0 (contact: {_CONTACT})" if _CONTACT else "sepa-trader/1.0 (self-hosted; no contact configured)"
 _HEADERS = {"User-Agent": _UA, "Accept-Encoding": "gzip"}
 _TIMEOUT = 8.0       # seconds per request
 _MAX_FILINGS = 5     # max Form 4 docs to parse (keeps gate latency low)
