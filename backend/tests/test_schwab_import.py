@@ -248,6 +248,25 @@ class EquityTrustTests(unittest.TestCase):
         self.assertEqual(p["file_total"], 383600.50)
         self.assertFalse(any("add up" in w for w in p["warnings"]))
 
+    def test_digital_currency_with_custodian_codes_becomes_priced_crypto(self):
+        raw = "\n".join([
+            "Portfolio Positions 11-27-2026", ET_HEADER,
+            "Digital Currency\t9001\tBitcoin\t$1,234.56\tDCXBT\t0.02\t\t",
+            "Digital Currency\t9002\tSolana\t$987.65\tDCSOL\t5.5\t\t",
+            "Digital Currency\t9003\tEthereum\t$1,000.00\tETH\t0.3\t\t",
+        ])
+        by = {h["name"]: h for h in self.parse(raw)["holdings"]}
+        self.assertEqual((by["Bitcoin"]["symbol"], by["Bitcoin"]["asset_class"]), ("BTC-USD", "crypto"))
+        self.assertEqual(by["Solana"]["symbol"], "SOL-USD")
+        self.assertEqual(by["Ethereum"]["symbol"], "ETH-USD")                 # no DC prefix: used as is
+        self.assertEqual(by["Bitcoin"]["quantity"], 0.02)
+        self.assertEqual(by["Bitcoin"]["manual_value"], 1234.56)               # statement value kept as fallback
+        self.assertFalse(by["Bitcoin"]["illiquid"])
+
+    def test_non_crypto_ticker_rows_are_not_touched_by_the_crypto_rule(self):
+        vti = next(h for h in self.parse(ET_TAB)["holdings"] if h["symbol"] == "VTI")
+        self.assertEqual(vti["asset_class"], "auto")
+
     def test_a_ticker_row_keeps_its_symbol_and_units(self):
         vti = next(h for h in self.parse(ET_TAB)["holdings"] if h["symbol"] == "VTI")
         self.assertEqual((vti["quantity"], vti["manual_value"]), (20.0, 5000.0))
