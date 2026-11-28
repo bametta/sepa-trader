@@ -46,6 +46,9 @@ services:
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
       TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID}
       SECRET_KEY: ${SECRET_KEY}
+      SECURE_COOKIES: ${SECURE_COOKIES:-false}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
+      SEC_CONTACT_EMAIL: ${SEC_CONTACT_EMAIL:-}
     networks:
       - internal
       - npm_network
